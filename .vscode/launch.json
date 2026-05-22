@@ -1,0 +1,81 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Detect blur – directory (medium)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/detect_blur.py",
+            "args": [
+                "${input:imagePath}",
+                "--showbox"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Detect blur – directory (high sensitivity)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/detect_blur.py",
+            "args": [
+                "${input:imagePath}",
+                "--sensitivity", "high",
+                "--showbox"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Detect blur – directory (low sensitivity)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/detect_blur.py",
+            "args": [
+                "${input:imagePath}",
+                "--sensitivity", "low",
+                "--showbox"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Detect blur – medium + showbox",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/detect_blur.py",
+            "args": [
+                "${input:imagePath}",
+                "--showbox"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Detect blur – high sensitivity + showbox",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/detect_blur.py",
+            "args": [
+                "${input:imagePath}",
+                "--sensitivity", "high",
+                "--showbox"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "imagePath",
+            "type": "promptString",
+            "description": "Path to an image file or a directory of images",
+            "default": "C:/Repos/BlurPictureDetector/TestImg"
+        }
+    ]
+}

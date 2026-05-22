@@ -1,0 +1,15 @@
+# Downloaded model weights (large binaries — auto-downloaded on first run)
+*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Output artefacts
+annotated/
+blurry.csv
+blur.lst
+
+# Test images (local only)
+TestImg/
