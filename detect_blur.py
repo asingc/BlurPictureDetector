@@ -115,11 +115,11 @@ class AppConfig:
     annotation_face_box_color:        tuple[int, int, int] = field(default=(0, 255, 255))  # yellow
     annotation_face_box_thickness:    int                  = 2
     # Blur score label drawn below each face bounding box.
-    annotation_score_font_size_px:    int   = 25   # target text height in pixels
+    annotation_score_font_size_px:    int   = 20   # target text height in pixels
     annotation_score_font_thickness:  int   = 3
     # Face landmark circle.
     annotation_face_kp_radius:        int   = 6    # circle radius (px)
-    annotation_face_kp_thickness:     int   = 3    # circle line thickness
+    annotation_face_kp_thickness:     int   = 2    # circle line thickness
     # Body keypoint square.
     annotation_body_kp_size:          int   = 5    # square side (px)
     annotation_body_kp_thickness:     int   = 2    # square line thickness
