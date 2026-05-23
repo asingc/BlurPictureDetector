@@ -7,8 +7,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/detect_blur.py",
             "args": [
-                "${input:imagePath}",
-                "--showbox"
+                "${input:imagePath}"
             ],
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
@@ -21,8 +20,7 @@
             "program": "${workspaceFolder}/detect_blur.py",
             "args": [
                 "${input:imagePath}",
-                "--sensitivity", "high",
-                "--showbox"
+                "--sensitivity", "high"
             ],
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
@@ -35,35 +33,32 @@
             "program": "${workspaceFolder}/detect_blur.py",
             "args": [
                 "${input:imagePath}",
-                "--sensitivity", "low",
-                "--showbox"
+                "--sensitivity", "low"
             ],
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
             "justMyCode": true
         },
         {
-            "name": "Detect blur – medium + showbox",
+            "name": "Detect blur – medium",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/detect_blur.py",
             "args": [
-                "${input:imagePath}",
-                "--showbox"
+                "${input:imagePath}"
             ],
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
             "justMyCode": true
         },
         {
-            "name": "Detect blur – high sensitivity + showbox",
+            "name": "Detect blur – high sensitivity",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/detect_blur.py",
             "args": [
                 "${input:imagePath}",
-                "--sensitivity", "high",
-                "--showbox"
+                "--sensitivity", "high"
             ],
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
