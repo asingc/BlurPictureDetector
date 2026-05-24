@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ApplyChanges.py
----------------
+2_apply_changes.py
 Apply the classification results from a 1_prep_review.py output directory to the
 original source directory by moving files into Blur/ and Skipped/ sub-folders.
 
 Usage:
-    python ApplyChanges.py <ref_dir>
+    python 2_apply_changes.py <ref_dir>
 
 ref_dir : output directory produced by 1_prep_review.py (must contain info.json).
 
@@ -28,7 +27,7 @@ import shutil
 import sys
 from pathlib import Path
 
-log = logging.getLogger("ApplyChanges")
+log = logging.getLogger("2_apply_changes")
 
 
 _FMT = "%(asctime)s [%(levelname)-8s] %(message)s"

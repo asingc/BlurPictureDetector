@@ -68,7 +68,7 @@
             "name": "Apply changes",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/ApplyChanges.py",
+            "program": "${workspaceFolder}/2_apply_changes.py",
             "args": [
                 "${input:refDir}"
             ],
