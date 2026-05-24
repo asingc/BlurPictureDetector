@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import sys
 import urllib.request
@@ -311,6 +312,13 @@ class Box:
     def as_ints(self) -> tuple[int, int, int, int]:
         return self.x1, self.y1, self.x2, self.y2
 
+    def overlaps(self, other: "Box") -> bool:
+        """Return True if this box and *other* share any area."""
+        return (
+            self.x1 < other.x2 and self.x2 > other.x1 and
+            self.y1 < other.y2 and self.y2 > other.y1
+        )
+
 
 @dataclass
 class Face:
@@ -453,17 +461,37 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
     return faces
 
 
+_HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)  # nose, eyes, ears
+
+
+def _head_region(body: Body, conf_threshold: float = 0.3) -> Box | None:
+    """Return the bounding box of confident head keypoints (indices 0-4),
+    or None if fewer than 2 are detected."""
+    xs = []
+    ys = []
+    for i in _HEAD_KP_INDICES:
+        if i >= len(body.keypoints):
+            continue
+        if body.kp_confidences[i] >= conf_threshold:
+            xs.append(body.keypoints[i].x)
+            ys.append(body.keypoints[i].y)
+    if len(xs) < 2:
+        return None
+    return Box(min(xs), min(ys), max(xs), max(ys))
+
+
 def match_faces_to_bodies(bodies: list[Body], faces: list[Face]) -> None:
-    """Assign each face to every body whose bbox contains the face's centre.
+    """Assign each face to every body whose head-keypoint region overlaps the
+    face bbox.  Falls back to the body bbox when head keypoints are absent.
     Mutates *bodies* in place by appending to each body's faces list."""
     for face in faces:
-        fc = face.bbox.centre
         for body in bodies:
-            if body.bbox.contains(fc):
+            region = _head_region(body) or body.bbox
+            if region.overlaps(face.bbox):
                 body.faces.append(face)
-                log.debug("[match]   face conf=%.3f → body bbox=(%d,%d,%d,%d)",
+                log.debug("[match]   face conf=%.3f → body head_region=(%d,%d,%d,%d)",
                           face.confidence,
-                          body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2)
+                          region.x1, region.y1, region.x2, region.y2)
 
 
 def detect_qualified_persons(
@@ -928,6 +956,30 @@ def write_blur_lst(blurry: list[dict], lst_path: Path) -> None:
     log.info("Blur list written to:     %s", lst_path)
 
 
+def write_info_json(
+    all_results: list[dict],
+    input_path: Path,
+    timestamp: str,
+    json_path: Path,
+) -> None:
+    """Write a run-summary JSON file."""
+    blur_files    = [Path(r["file"]).name for r in all_results if r["status"] == "blurry"]
+    sharp_files   = [Path(r["file"]).name for r in all_results if r["status"] == "sharp"]
+    skipped_files = [Path(r["file"]).name for r in all_results if r["status"] in ("skipped", "error")]
+
+    payload = {
+        "SrcDir":      str(input_path.resolve()),
+        "SrcType":     "File" if input_path.is_file() else "Directory",
+        "Timestamp":   timestamp,
+        "Anno_Blur":   blur_files,
+        "Anno_Sharp":  sharp_files,
+        "Anno_Skipped": skipped_files,
+    }
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=4)
+    log.info("Info JSON written to:     %s", json_path)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -977,6 +1029,7 @@ def main() -> None:
 
     if all_results:
         write_csv(all_results, output_dir / "blurry.csv")
+        write_info_json(all_results, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"), output_dir / "info.json")
     if blurry:
         write_blur_lst(blurry, output_dir / "blur.lst")
     else:
