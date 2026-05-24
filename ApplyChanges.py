@@ -31,14 +31,23 @@ from pathlib import Path
 log = logging.getLogger("ApplyChanges")
 
 
+_FMT = "%(asctime)s [%(levelname)-8s] %(message)s"
+
+
 def _setup_logging() -> None:
     log.setLevel(logging.DEBUG)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG)
-    ch.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S"
-    ))
+    ch.setFormatter(logging.Formatter(_FMT, datefmt="%H:%M:%S"))
     log.addHandler(ch)
+
+
+def _add_file_logging(log_path: Path) -> None:
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(_FMT))
+    log.addHandler(fh)
+    log.debug("Log file: %s", log_path.resolve())
 
 
 def _move(src: Path, dest_dir: Path) -> bool:
@@ -99,6 +108,8 @@ def main() -> None:
     if src_type != "Directory":
         log.error("SrcType is '%s' — only 'Directory' is supported.", src_type)
         sys.exit(1)
+
+    _add_file_logging(ref_dir / "apply.log")
 
     log.info("Source      : %s", src_dir)
     log.info("Reference   : %s", ref_dir)

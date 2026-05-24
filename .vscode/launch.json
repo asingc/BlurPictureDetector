@@ -63,6 +63,18 @@
             "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Apply changes",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/ApplyChanges.py",
+            "args": [
+                "${input:refDir}"
+            ],
+            "python": "C:/Users/asing/.conda/envs/blurpicturedetector.1/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ],
     "inputs": [
@@ -71,6 +83,12 @@
             "type": "promptString",
             "description": "Path to an image file or a directory of images",
             "default": "C:/Repos/BlurPictureDetector/TestImg"
+        },
+        {
+            "id": "refDir",
+            "type": "promptString",
+            "description": "Path to the detect_blur.py output directory (contains info.json)",
+            "default": "C:/Repos/BlurPictureDetector/output"
         }
     ]
 }
