@@ -2,13 +2,13 @@
 """
 ApplyChanges.py
 ---------------
-Apply the classification results from a detect_blur.py output directory to the
+Apply the classification results from a 1_prep_review.py output directory to the
 original source directory by moving files into Blur/ and Skipped/ sub-folders.
 
 Usage:
     python ApplyChanges.py <ref_dir>
 
-ref_dir : output directory produced by detect_blur.py (must contain info.json).
+ref_dir : output directory produced by 1_prep_review.py (must contain info.json).
 
 Rules applied
 -------------
@@ -72,12 +72,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Move source images into Blur/ and Skipped/ based on "
-            "detect_blur.py results stored in info.json."
+            "1_prep_review.py results stored in info.json."
         ),
     )
     parser.add_argument(
         "ref_dir",
-        help="Path to the detect_blur.py output directory (must contain info.json).",
+        help="Path to the 1_prep_review.py output directory (must contain info.json).",
     )
     args = parser.parse_args()
 

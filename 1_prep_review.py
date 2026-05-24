@@ -5,7 +5,7 @@ BlurPictureDetector
 Detect blurry sport images by analysing the sharpness of the main subject.
 
 Usage:
-    python detect_blur.py <image_or_directory> [--sensitivity low|medium|high]
+    python 1_prep_review.py <image_or_directory> [--sensitivity low|medium|high]
 
 How it works:
     1. YOLOv8n detects persons in the image (model auto-downloaded on first run).

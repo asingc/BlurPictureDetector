@@ -5,7 +5,7 @@
             "name": "Detect blur – directory (medium)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/detect_blur.py",
+            "program": "${workspaceFolder}/1_prep_review.py",
             "args": [
                 "${input:imagePath}"
             ],
@@ -17,7 +17,7 @@
             "name": "Detect blur – directory (high sensitivity)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/detect_blur.py",
+            "program": "${workspaceFolder}/1_prep_review.py",
             "args": [
                 "${input:imagePath}",
                 "--sensitivity", "high"
@@ -30,7 +30,7 @@
             "name": "Detect blur – directory (low sensitivity)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/detect_blur.py",
+            "program": "${workspaceFolder}/1_prep_review.py",
             "args": [
                 "${input:imagePath}",
                 "--sensitivity", "low"
@@ -43,7 +43,7 @@
             "name": "Detect blur – medium",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/detect_blur.py",
+            "program": "${workspaceFolder}/1_prep_review.py",
             "args": [
                 "${input:imagePath}"
             ],
@@ -55,7 +55,7 @@
             "name": "Detect blur – high sensitivity",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/detect_blur.py",
+            "program": "${workspaceFolder}/1_prep_review.py",
             "args": [
                 "${input:imagePath}",
                 "--sensitivity", "high"
@@ -87,7 +87,7 @@
         {
             "id": "refDir",
             "type": "promptString",
-            "description": "Path to the detect_blur.py output directory (contains info.json)",
+            "description": "Path to the 1_prep_review.py output directory (contains info.json)",
             "default": "C:/Repos/BlurPictureDetector/output"
         }
     ]
