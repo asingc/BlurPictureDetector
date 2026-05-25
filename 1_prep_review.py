@@ -88,7 +88,7 @@ class AppConfig:
     # Colors are BGR (OpenCV convention).
     annotation_box_color_pass: tuple[int, int, int] = field(default=(255, 0, 0))  # blue  – sharp
     annotation_box_color_fail: tuple[int, int, int] = field(default=(0,   0, 255))  # red   – blurry
-    annotation_box_thickness:  int                  = 5
+    annotation_box_thickness:  int                  = 3
     annotation_icon_size:      int                  = 50  # px, drawn on the resized preview
 
     # Subject selection: prefer the largest person whose face is at least
@@ -112,20 +112,30 @@ class AppConfig:
     # Set to 0 to disable.
     face_min_size_fraction: float = 0.025
 
+    # If True, sharpness is scored on the minimal bbox enclosing the 5 face
+    # landmarks rather than the face model's full detection bbox.
+    # Falls back to the full bbox when fewer than 2 landmarks are detected.
+    use_narrow_face_box: bool = True
+
     # Face bounding box drawn on annotated previews (separate from the body box).
     annotation_face_box_color:        tuple[int, int, int] = field(default=(0, 255, 255))  # yellow
     annotation_face_box_thickness:    int                  = 2
+    # Narrow face bbox: minimal box enclosing the 5 face landmarks.
+    annotation_narrow_face_box_color:     tuple[int, int, int] = field(default=(0, 255, 0))  # green
+    annotation_narrow_face_box_thickness: int                  = 2
     # Blur score label drawn below each face bounding box.
     annotation_score_font_size_px:    int   = 20   # target text height in pixels
     annotation_score_font_thickness:  int   = 3
     # Face landmark circle.
-    annotation_face_kp_radius:        int   = 6    # circle radius (px)
-    annotation_face_kp_thickness:     int   = 2    # circle line thickness
+    annotation_face_kp_radius:        int   = 3    # circle radius (px)
+    annotation_face_kp_thickness:     int   = 1    # circle line thickness
     # Body keypoint square.
-    annotation_body_kp_size:          int   = 5    # square side (px)
-    annotation_body_kp_thickness:     int   = 2    # square line thickness
+    annotation_body_kp_size:          int   = 3    # square side (px)
+    annotation_body_kp_thickness:     int   = 1    # square line thickness
     # Body skeleton line.
     annotation_skeleton_thickness:    int   = 1    # line thickness (px)
+    # Annotation opacity: 1.0 = fully opaque, 0.0 = invisible.
+    annotation_alpha:                 float = 0.35
 
     # Annotated preview / processing image scaling.
     # Images are downsized so the long edge equals normalized_img_max_long_edge.
@@ -480,6 +490,27 @@ def _head_region(body: Body, conf_threshold: float = 0.3) -> Box | None:
     return Box(min(xs), min(ys), max(xs), max(ys))
 
 
+def _narrow_face_box(
+    face: Face,
+    conf_threshold: float = 0.3,
+    pad: int = 0,
+    img_w: int | None = None,
+    img_h: int | None = None,
+) -> Box | None:
+    """Return the minimal bounding box enclosing the confident face landmarks,
+    expanded by *pad* pixels on every side and clamped to the image bounds.
+    Returns None if fewer than 2 landmarks are detected."""
+    xs = [pt.x for pt, c in zip(face.points, face.confidences) if c >= conf_threshold]
+    ys = [pt.y for pt, c in zip(face.points, face.confidences) if c >= conf_threshold]
+    if len(xs) < 2:
+        return None
+    x1 = max(0, min(xs) - pad)
+    y1 = max(0, min(ys) - pad)
+    x2 = min(img_w - 1, max(xs) + pad) if img_w is not None else max(xs) + pad
+    y2 = min(img_h - 1, max(ys) + pad) if img_h is not None else max(ys) + pad
+    return Box(x1, y1, x2, y2)
+
+
 def match_faces_to_bodies(bodies: list[Body], faces: list[Face]) -> None:
     """Assign each face to every body whose head-keypoint region overlaps the
     face bbox.  Falls back to the body bbox when head keypoints are absent.
@@ -620,9 +651,14 @@ def analyse_image(
         best_lap:   float       = 0.0
         best_ten:   float       = 0.0
         best_face:  Face | None = None
+        best_narrow: Box | None = None
 
+        h_proc, w_proc = normalized_img.shape[:2]
+        narrow_pad = round(0.005 * max(h_proc, w_proc))
         for face in person.faces:
-            fx1, fy1, fx2, fy2 = face.bbox.as_ints()
+            narrow_box = _narrow_face_box(face, pad=narrow_pad, img_w=w_proc, img_h=h_proc) if app_config.use_narrow_face_box else None
+            score_box  = narrow_box or face.bbox
+            fx1, fy1, fx2, fy2 = score_box.as_ints()
             crop = normalized_img[fy1:fy2, fx1:fx2]
             if crop.size == 0:
                 continue
@@ -632,6 +668,7 @@ def analyse_image(
                       image_path.name, face.confidence, s, lv, t)
             if s > best_score:
                 best_score, best_lap, best_ten, best_face = s, lv, t, face
+                best_narrow = narrow_box
 
         is_blurry = best_score <= threshold
         log.debug("[analyse] %s — person bbox=%s best_score=%.4f blurry=%s",
@@ -641,6 +678,7 @@ def analyse_image(
             "body_keypoints":      person.keypoints,
             "body_kp_confidences": person.kp_confidences,
             "face_bbox":           best_face.bbox if best_face else None,
+            "narrow_face_bbox":    best_narrow,
             "face_kps":            best_face      if best_face else None,
             "sharpness_score":     best_score,
             "lap_var":             best_lap,
@@ -679,6 +717,7 @@ def analyse_image(
         # coordinates from processing space (resized) back up to original dimensions.
         h_proc, w_proc = normalized_img.shape[:2]
         annotated = image_orig.copy()
+        overlay   = annotated.copy()   # all drawing goes here; blended back at the end
         h_out, w_out = annotated.shape[:2]
         sx = w_out / w_proc
         sy = h_out / h_proc
@@ -692,12 +731,14 @@ def analyse_image(
         body_kp_size    = max(2, round(app_config.annotation_body_kp_size         * ann_scale))
         body_kp_thick   = max(1, round(app_config.annotation_body_kp_thickness    * ann_scale))
         skeleton_thick  = max(1, round(app_config.annotation_skeleton_thickness   * ann_scale))
+        narrow_thick    = max(1, round(app_config.annotation_narrow_face_box_thickness * ann_scale))
         font          = cv2.FONT_HERSHEY_SIMPLEX
         font_thick  = app_config.annotation_score_font_thickness
         # Compute font scale so text height == annotation_score_font_size_px scaled to image.
         (_, _base_h), _ = cv2.getTextSize("Mg", font, 1.0, font_thick)
         font_scale = app_config.annotation_score_font_size_px * ann_scale / max(_base_h, 1)
 
+        score_labels: list[tuple] = []  # (text, x, y, color) — drawn opaquely after blend
         for i, p in enumerate(evaluated):
             b: Box = p["body_bbox"]
             rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
@@ -708,12 +749,12 @@ def analyse_image(
                 if p["is_blurry"] else
                 app_config.annotation_box_color_pass
             )
-            cv2.rectangle(annotated, (rbx1, rby1), (rbx2, rby2),
+            cv2.rectangle(overlay, (rbx1, rby1), (rbx2, rby2),
                           body_color, box_thick)
 
             # Every person gets its own pass/fail status icon.
             _draw_status_icon(
-                annotated, rbx1, rby1,
+                overlay, rbx1, rby1,
                 icon_size,
                 body_color,
                 passed=not p["is_blurry"],
@@ -727,7 +768,7 @@ def analyse_image(
                 pa, pb = kps[ka], kps[kb]
                 if (pa.x == 0 and pa.y == 0) or (pb.x == 0 and pb.y == 0):
                     continue
-                cv2.line(annotated,
+                cv2.line(overlay,
                          (int(pa.x * sx), int(pa.y * sy)),
                          (int(pb.x * sx), int(pb.y * sy)),
                          body_color, skeleton_thick, cv2.LINE_AA)
@@ -739,24 +780,34 @@ def analyse_image(
                     continue  # undetected keypoint
                 rkpx = int(pt.x * sx)
                 rkpy = int(pt.y * sy)
-                cv2.rectangle(annotated,
+                cv2.rectangle(overlay,
                               (rkpx - half, rkpy - half),
                               (rkpx + half, rkpy + half),
                               body_color, body_kp_thick, cv2.LINE_AA)
 
             # Face bbox + sharpness score label — color mirrors the sharpness pass/fail.
+            # use_narrow_face_box selects which box to draw and anchors the score label.
             if p["face_bbox"] is not None:
                 fb: Box = p["face_bbox"]
                 rfx1 = int(fb.x1 * sx); rfy1 = int(fb.y1 * sy)
                 rfx2 = int(fb.x2 * sx); rfy2 = int(fb.y2 * sy)
-                cv2.rectangle(annotated, (rfx1, rfy1), (rfx2, rfy2),
-                              body_color, face_thick)
+
+                nfb: Box | None = p["narrow_face_bbox"]
+                if app_config.use_narrow_face_box and nfb is not None:
+                    rnx1 = int(nfb.x1 * sx); rny1 = int(nfb.y1 * sy)
+                    rnx2 = int(nfb.x2 * sx); rny2 = int(nfb.y2 * sy)
+                    cv2.rectangle(overlay, (rnx1, rny1), (rnx2, rny2),
+                                  app_config.annotation_narrow_face_box_color, narrow_thick)
+                    label_x, label_bottom = rnx1, rny2
+                else:
+                    cv2.rectangle(overlay, (rfx1, rfy1), (rfx2, rfy2),
+                                  body_color, face_thick)
+                    label_x, label_bottom = rfx1, rfy2
 
                 label = f"{p['sharpness_score']:.2f}"
                 (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
-                text_y = min(rfy2 + th + baseline + 2, h_out - 1)
-                cv2.putText(annotated, label, (rfx1, text_y),
-                            font, font_scale, body_color, font_thick, cv2.LINE_AA)
+                text_y = min(label_bottom + th + baseline + 2, h_out - 1)
+                score_labels.append((label, label_x, text_y, body_color))
 
             # Face model keypoint circles: diameter 12 (radius 6), line 3 px.
             # Confident points (>= threshold) use pass color; others use fail color.
@@ -771,7 +822,16 @@ def analyse_image(
                         if kpc >= kp_conf_thresh else
                         app_config.annotation_box_color_fail
                     )
-                    cv2.circle(annotated, (rkpx, rkpy), kp_radius, kp_color, kp_thick, cv2.LINE_AA)
+                    cv2.circle(overlay, (rkpx, rkpy), kp_radius, kp_color, kp_thick, cv2.LINE_AA)
+
+        # Blend annotations onto the clean image.
+        cv2.addWeighted(overlay, app_config.annotation_alpha,
+                        annotated, 1.0 - app_config.annotation_alpha, 0, annotated)
+
+        # Draw score labels opaquely on top of the blended result.
+        for label, lx, ly, lcolor in score_labels:
+            cv2.putText(annotated, label, (lx, ly),
+                        font, font_scale, lcolor, font_thick, cv2.LINE_AA)
 
         out_name    = image_path.stem + ".jpg"
         anno_subdir = boxes_dir / ("anno_blur" if overall_blurry else "anno_sharp")
