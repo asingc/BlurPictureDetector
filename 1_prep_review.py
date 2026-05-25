@@ -1095,6 +1095,19 @@ def main() -> None:
     else:
         log.info("No blurry images detected — blur.lst not written.")
 
+    if all_results:
+        log.info("")
+        log.info("Annotated previews saved to:")
+        log.info("  %s", output_dir / "anno_blur")
+        log.info("  %s", output_dir / "anno_sharp")
+        log.info("  %s", output_dir / "anno_skipped")
+        log.info("")
+        log.info("Review the previews, then delete images you want to override:")
+        log.info("  anno_blur/   delete a preview → keep that original (not blurry after all)")
+        log.info("  anno_sharp/  delete a preview → exclude that original (move to Unselected/)")
+        log.info("")
+        log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)
+
 
 if __name__ == "__main__":
     main()

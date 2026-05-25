@@ -2,20 +2,30 @@
 """
 2_apply_changes.py
 Apply the classification results from a 1_prep_review.py output directory to the
-original source directory by moving files into Blur/ and Skipped/ sub-folders.
+original source directory based on which annotated preview images you kept.
 
 Usage:
     python 2_apply_changes.py <ref_dir>
 
 ref_dir : output directory produced by 1_prep_review.py (must contain info.json).
 
-Rules applied
--------------
-Anno_Blur   : original exists in SrcDir                  → move to <SrcDir>/Blur
-Anno_Sharp  : annotated copy NOT found in ref_dir/anno_sharp  → move to <SrcDir>/Blur
-Anno_Sharp  : annotated copy     found in ref_dir/anno_sharp  → leave in place
-Anno_Skipped: annotated copy     found in ref_dir/anno_skipped → move to <SrcDir>/Skipped
-Anno_Skipped: annotated copy NOT found in ref_dir/anno_skipped → leave in place
+Review workflow
+---------------
+After running 1_prep_review.py, open the three anno_* folders and delete any
+preview images you want to override:
+
+  anno_blur/   — delete a preview → KEEP the original (not blurry after all)
+  anno_sharp/  — delete a preview → EXCLUDE the original (don't want this photo)
+
+Then run this script.  It compares what previews remain against info.json:
+
+  anno_blur  preview present  → move original to <SrcDir>/Blur/
+  anno_blur  preview deleted  → leave original in place
+  anno_sharp preview present  → leave original in place (confirmed keeper)
+  anno_sharp preview deleted  → move original to <SrcDir>/Unselected/
+  anno_skipped               → always left in place
+
+No files are ever deleted.
 """
 
 from __future__ import annotations
@@ -115,14 +125,14 @@ def main() -> None:
     log.info("Timestamp   : %s", info.get("Timestamp", ""))
 
     blur_dest        = src_dir / "Blur"
-    skipped_dest     = src_dir / "Skipped"
+    unselected_dest  = src_dir / "Unselected"
+    anno_blur_dir    = ref_dir / "anno_blur"
     anno_sharp_dir   = ref_dir / "anno_sharp"
-    anno_skipped_dir = ref_dir / "anno_skipped"
 
-    moved_blur = moved_skipped = left_in_place = skipped_missing = 0
+    moved_blur = moved_unselected = left_in_place = skipped_missing = 0
 
     # ------------------------------------------------------------------
-    # Anno_Blur — move originals to <SrcDir>/Blur
+    # Anno_Blur — preview kept → Blur/;  preview deleted → leave in place
     # ------------------------------------------------------------------
     blur_list = info.get("Anno_Blur", [])
     log.info("--- Anno_Blur (%d file(s)) ---", len(blur_list))
@@ -132,11 +142,15 @@ def main() -> None:
             log.debug("  Not found in SrcDir, skipping: %s", name)
             skipped_missing += 1
             continue
-        if _move(src_file, blur_dest):
-            moved_blur += 1
+        if _anno_exists(anno_blur_dir, name):
+            if _move(src_file, blur_dest):
+                moved_blur += 1
+        else:
+            log.info("  Preview deleted — leaving in place: %s", name)
+            left_in_place += 1
 
     # ------------------------------------------------------------------
-    # Anno_Sharp — leave in place if confirmed; move to Blur if not
+    # Anno_Sharp — preview kept → leave in place;  preview deleted → Unselected/
     # ------------------------------------------------------------------
     sharp_list = info.get("Anno_Sharp", [])
     log.info("--- Anno_Sharp (%d file(s)) ---", len(sharp_list))
@@ -147,38 +161,27 @@ def main() -> None:
             skipped_missing += 1
             continue
         if _anno_exists(anno_sharp_dir, name):
-            log.debug("  Confirmed in anno_sharp — leaving in place: %s", name)
+            log.debug("  Preview present — leaving in place: %s", name)
             left_in_place += 1
         else:
-            log.info("  Not confirmed in anno_sharp — moving to Blur: %s", name)
-            if _move(src_file, blur_dest):
-                moved_blur += 1
+            log.info("  Preview deleted — moving to Unselected: %s", name)
+            if _move(src_file, unselected_dest):
+                moved_unselected += 1
 
     # ------------------------------------------------------------------
-    # Anno_Skipped — move to <SrcDir>/Skipped only when confirmed
+    # Anno_Skipped — always left in place (no person detected, nothing to sort)
     # ------------------------------------------------------------------
     skipped_list = info.get("Anno_Skipped", [])
-    log.info("--- Anno_Skipped (%d file(s)) ---", len(skipped_list))
-    for name in skipped_list:
-        src_file = src_dir / name
-        if not src_file.exists():
-            log.debug("  Not found in SrcDir, skipping: %s", name)
-            skipped_missing += 1
-            continue
-        if _anno_exists(anno_skipped_dir, name):
-            if _move(src_file, skipped_dest):
-                moved_skipped += 1
-        else:
-            log.debug("  Not confirmed in anno_skipped — leaving in place: %s", name)
-            left_in_place += 1
+    log.info("--- Anno_Skipped (%d file(s) — left in place) ---", len(skipped_list))
+    left_in_place += len([n for n in skipped_list if (src_dir / n).exists()])
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     log.info(
-        "Done — moved to Blur: %d  |  moved to Skipped: %d  "
+        "Done — moved to Blur: %d  |  moved to Unselected: %d  "
         "|  left in place: %d  |  source not found: %d",
-        moved_blur, moved_skipped, left_in_place, skipped_missing,
+        moved_blur, moved_unselected, left_in_place, skipped_missing,
     )
 
 

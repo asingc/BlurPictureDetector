@@ -31,21 +31,21 @@ The two raw values are normalized to a **sharpness score in [0 – 1]** (1 = sha
 
 ## Workflow
 
-The tool is split into two steps so you can review annotations before committing to any file moves.
+The tool is split into two steps so you can review and override the automatic classifications before any files are moved.
 
-### Step 1 — Review
+### Step 1 — Score and annotate
 
 ```
 python 1_prep_review.py <image_or_directory> [--sensitivity low|medium|high] [--output <dir>]
 ```
 
-Reads images, scores each one, and writes an output folder containing:
+Scores every image and writes an output folder:
 
 ```
 <output_dir>/
-    anno_blur/        ← annotated copies of blurry images
-    anno_sharp/       ← annotated copies of sharp images
-    anno_skipped/     ← annotated copies where no person was detected
+    anno_blur/        ← annotated previews of images scored as blurry
+    anno_sharp/       ← annotated previews of images scored as sharp
+    anno_skipped/     ← annotated previews where no person was detected
     info.json         ← full classification results (used by step 2)
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
@@ -69,25 +69,32 @@ Reads images, scores each one, and writes an output folder containing:
 - **Score label** — sharpness score printed below the face box
 - All annotation is semi-transparent (`annotation_alpha = 0.35`); score text is opaque
 
-### Step 2 — Apply
+### Step 2 — Review
 
-Once you are happy with the review:
+Open the `anno_blur/` and `anno_sharp/` folders in your photo viewer and **delete any preview images you want to override**:
+
+| Folder | Delete a preview when… | Effect on the original |
+|---|---|---|
+| `anno_blur/` | The photo isn't actually blurry — you want to keep it | Left in place |
+| `anno_sharp/` | The photo is sharp but you don't want it | Moved to `Unselected/` |
+
+Leave previews you agree with untouched. Skipped images are always left in place.
+
+### Step 3 — Apply
 
 ```
 python 2_apply_changes.py <ref_dir>
 ```
 
-Reads `info.json` from `<ref_dir>` and moves original source files:
+Compares what previews remain against `info.json` and moves original source files accordingly:
 
-| Classification | Action |
-|---|---|
-| Blurry | Move original → `<SrcDir>/Blur/` |
-| Sharp (annotated copy found) | Leave original in place |
-| Sharp (annotated copy missing) | Move original → `<SrcDir>/Blur/` |
-| Skipped (annotated copy found) | Move original → `<SrcDir>/Skipped/` |
-| Skipped (annotated copy missing) | Leave original in place |
+| Preview in | Preview present | Preview deleted |
+|---|---|---|
+| `anno_blur/` | Move original → `<SrcDir>/Blur/` | Leave original in place |
+| `anno_sharp/` | Leave original in place | Move original → `<SrcDir>/Unselected/` |
+| `anno_skipped/` | Leave original in place | Leave original in place |
 
-Writes an `apply.log` to `<ref_dir>` when done.
+No files are ever deleted. Writes an `apply.log` to `<ref_dir>` when done.
 
 ---
 
