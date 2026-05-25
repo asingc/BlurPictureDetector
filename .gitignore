@@ -14,3 +14,6 @@ blur.lst
 
 # Test images (local only)
 TestImg/
+
+# VS Code debug launch config (personal, not shared)
+.vscode/launch.json
