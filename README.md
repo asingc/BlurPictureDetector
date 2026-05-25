@@ -76,9 +76,10 @@ Open the `anno_blur/` and `anno_sharp/` folders in your photo viewer and **delet
 | Folder | Delete a preview when… | Effect on the original |
 |---|---|---|
 | `anno_blur/` | The photo isn't actually blurry — you want to keep it | Left in place |
-| `anno_sharp/` | The photo is sharp but you don't want it | Moved to `Unselected/` |
+| `anno_sharp/` | The photo is sharp but you don't want it | Moved to `Blur/` |
+| `anno_skipped/` | You want to leave the original untouched | Left in place |
 
-Leave previews you agree with untouched. Skipped images are always left in place.
+Leave previews you agree with untouched.
 
 ### Step 3 — Apply
 
@@ -91,8 +92,8 @@ Compares what previews remain against `info.json` and moves original source file
 | Preview in | Preview present | Preview deleted |
 |---|---|---|
 | `anno_blur/` | Move original → `<SrcDir>/Blur/` | Leave original in place |
-| `anno_sharp/` | Leave original in place | Move original → `<SrcDir>/Unselected/` |
-| `anno_skipped/` | Leave original in place | Leave original in place |
+| `anno_sharp/` | Leave original in place | Move original → `<SrcDir>/Blur/` |
+| `anno_skipped/` | Move original → `<SrcDir>/Skipped/` | Leave original in place |
 
 No files are ever deleted. Writes an `apply.log` to `<ref_dir>` when done.
 
