@@ -73,11 +73,6 @@ def _move(src: Path, dest_dir: Path) -> bool:
     return True
 
 
-def _anno_exists(anno_dir: Path, original_name: str) -> bool:
-    """Check whether the annotated copy (saved as <stem>.jpg) exists in *anno_dir*."""
-    anno_name = Path(original_name).stem + ".jpg"
-    return (anno_dir / anno_name).exists()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -139,17 +134,18 @@ def main() -> None:
     # ------------------------------------------------------------------
     blur_list = info.get("Anno_Blur", [])
     log.info("--- Anno_Blur (%d file(s)) ---", len(blur_list))
-    for name in blur_list:
-        src_file = src_dir / name
+    for entry in blur_list:
+        src_name, anno_name = entry["src"], entry["anno"]
+        src_file = src_dir / src_name
         if not src_file.exists():
-            log.debug("  Not found in SrcDir, skipping: %s", name)
+            log.debug("  Not found in SrcDir, skipping: %s", src_name)
             skipped_missing += 1
             continue
-        if _anno_exists(anno_blur_dir, name):
+        if (anno_blur_dir / anno_name).exists():
             if _move(src_file, blur_dest):
                 moved_blur += 1
         else:
-            log.info("  Preview deleted — leaving in place: %s", name)
+            log.info("  Preview deleted — leaving in place: %s", src_name)
             left_in_place += 1
 
     # ------------------------------------------------------------------
@@ -157,17 +153,18 @@ def main() -> None:
     # ------------------------------------------------------------------
     sharp_list = info.get("Anno_Sharp", [])
     log.info("--- Anno_Sharp (%d file(s)) ---", len(sharp_list))
-    for name in sharp_list:
-        src_file = src_dir / name
+    for entry in sharp_list:
+        src_name, anno_name = entry["src"], entry["anno"]
+        src_file = src_dir / src_name
         if not src_file.exists():
-            log.debug("  Not found in SrcDir, skipping: %s", name)
+            log.debug("  Not found in SrcDir, skipping: %s", src_name)
             skipped_missing += 1
             continue
-        if _anno_exists(anno_sharp_dir, name):
-            log.debug("  Preview present — leaving in place: %s", name)
+        if (anno_sharp_dir / anno_name).exists():
+            log.debug("  Preview present — leaving in place: %s", src_name)
             left_in_place += 1
         else:
-            log.info("   Preview deleted — moving to Blur: %s", name)
+            log.info("   Preview deleted — moving to Blur: %s", src_name)
             if _move(src_file, blur_dest):
                 moved_blur += 1
 
@@ -176,17 +173,18 @@ def main() -> None:
     # ------------------------------------------------------------------
     skipped_list = info.get("Anno_Skipped", [])
     log.info("--- Anno_Skipped (%d file(s)) ---", len(skipped_list))
-    for name in skipped_list:
-        src_file = src_dir / name
+    for entry in skipped_list:
+        src_name, anno_name = entry["src"], entry["anno"]
+        src_file = src_dir / src_name
         if not src_file.exists():
-            log.debug("  Not found in SrcDir, skipping: %s", name)
+            log.debug("  Not found in SrcDir, skipping: %s", src_name)
             skipped_missing += 1
             continue
-        if _anno_exists(anno_skipped_dir, name):
+        if (anno_skipped_dir / anno_name).exists():
             if _move(src_file, skipped_dest):
                 moved_skipped += 1
         else:
-            log.debug("  Not confirmed in anno_skipped — leaving in place: %s", name)
+            log.debug("  Not confirmed in anno_skipped — leaving in place: %s", src_name)
             left_in_place += 1
 
     # ------------------------------------------------------------------

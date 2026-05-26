@@ -40,6 +40,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import rawpy
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,10 @@ from ultralytics import YOLO
 IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 )
+
+# RAW formats decoded via rawpy rather than OpenCV.
+_RAW_EXTENSIONS: frozenset[str] = frozenset({".cr3", ".cr2"})
+IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
 
 # sharpness_score threshold per sensitivity level.
 # A file is flagged as blurry when  sharpness_score <= threshold.
@@ -389,6 +394,26 @@ class Body:
     kp_confidences: list[float]  # per-keypoint confidence scores
 
 
+def _read_image(path: Path) -> np.ndarray | None:
+    """Read *path* as a BGR numpy array.
+    RAW formats (CR3, CR2) are decoded via rawpy; all others via OpenCV.
+    Returns None when the file cannot be decoded.
+    """
+    if path.suffix.lower() in _RAW_EXTENSIONS:
+        try:
+            with rawpy.imread(str(path)) as raw:
+                rgb = raw.postprocess(
+                    use_camera_wb=True,
+                    output_bps=8,
+                    half_size=True,   # 2× faster decode; still >>1800 px for Canon RAW
+                )
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            log.debug("[read] rawpy failed for %s: %s", path.name, exc)
+            return None
+    return cv2.imread(str(path))
+
+
 # ---------------------------------------------------------------------------
 # Subject detection
 # ---------------------------------------------------------------------------
@@ -644,7 +669,7 @@ def analyse_image(
     Returns a dict with at minimum the keys 'file' and 'status'.
     status is one of: 'blurry', 'sharp', 'skipped', 'error'.
     """
-    image_orig = cv2.imread(str(image_path))
+    image_orig = _read_image(image_path)
     if image_orig is None:
         log.error("[analyse] %s — cannot read image file", image_path.name)
         return {"file": str(image_path), "status": "error", "error": "Cannot read image file", "persons_detail": []}
@@ -1059,9 +1084,13 @@ def write_info_json(
     json_path: Path,
 ) -> None:
     """Write a run-summary JSON file."""
-    blur_files    = [Path(r["file"]).name for r in all_results if r["status"] == "blurry"]
-    sharp_files   = [Path(r["file"]).name for r in all_results if r["status"] == "sharp"]
-    skipped_files = [Path(r["file"]).name for r in all_results if r["status"] in ("skipped", "error")]
+    def _entry(r: dict) -> dict:
+        src = Path(r["file"]).name
+        return {"src": src, "anno": Path(src).stem + ".jpg"}
+
+    blur_files    = [_entry(r) for r in all_results if r["status"] == "blurry"]
+    sharp_files   = [_entry(r) for r in all_results if r["status"] == "sharp"]
+    skipped_files = [_entry(r) for r in all_results if r["status"] in ("skipped", "error")]
 
     payload = {
         "SrcDir":      str(input_path.resolve()),
