@@ -18,14 +18,22 @@ Image → normalize size (long edge = 1800 px)
       → write info.json / blurry.csv / blur.lst
 ```
 
-Sharpness is a weighted combination of two classical metrics:
+Sharpness is computed by a pluggable `SharpnessEvaluator`. The active implementation is `GeometricMeanEvaluator`, which uses two classical metrics:
 
-| Metric | Weight | What it measures |
-|---|---|---|
-| Laplacian variance | 60 % | Fine detail / high-frequency content |
-| Tenengrad | 40 % | Gradient energy — robust to noise |
+| Metric | What it measures |
+|---|---|
+| Laplacian variance | Fine detail / high-frequency content |
+| Tenengrad | Gradient energy — robust to noise |
 
-The two raw values are normalized to a **sharpness score in [0 – 1]** (1 = sharp, 0 = blurry).
+Each metric is normalised to a sharpness component in [0 – 1], then combined as a **geometric mean**:
+
+```
+score = sqrt(lap_sharp × ten_sharp)
+```
+
+The geometric mean only scores high when *both* metrics agree, which avoids false "sharp" results caused by noise, compression artefacts, or over-sharpening that inflate one metric while the other stays low.
+
+The raw values are still available in the CSV output. To switch back to the previous weighted-average formula, change the active evaluator in `1_prep_review.py` to `LaplacianTenengradEvaluator`.
 
 ---
 
