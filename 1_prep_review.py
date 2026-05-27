@@ -296,16 +296,23 @@ def _draw_status_icon(
         cv2.line(image, p1, p2, (255, 255, 255), lw, cv2.LINE_AA)
         cv2.line(image, p3, p4, (255, 255, 255), lw, cv2.LINE_AA)
 
+def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:
+    """
+    Downsize *image* so its long edge is at most *max_long_edge* pixels.
+    Never upscales — returns the original array when it is already smaller.
+    """
+    h, w = image.shape[:2]
+    scale = min(1.0, max_long_edge / max(h, w))
+    if scale >= 1.0:
+        return image
+    return cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
 def normalize_img_size(image: np.ndarray) -> np.ndarray:
     """
     Downsize *image* so its long edge equals app_config.normalized_img_max_long_edge.
     Never upscales — returns the original array when it is already smaller.
     """
-    h, w = image.shape[:2]
-    scale = min(1.0, app_config.normalized_img_max_long_edge / max(h, w))
-    if scale >= 1.0:
-        return image
-    return cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return cap_long_edge(image, app_config.normalized_img_max_long_edge)
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +730,7 @@ def analyse_image(
             crop = normalized_img[fy1:fy2, fx1:fx2]
             if crop.size == 0:
                 continue
+            crop = cap_long_edge(crop, max(h_proc, w_proc) * 0.04)
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             s, lv, t = sharpness_evaluator.score(gray)
             log.debug("[analyse] %s — face conf=%.3f score=%.4f (lap=%.2f ten=%.2f)",
