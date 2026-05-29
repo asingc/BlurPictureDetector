@@ -61,9 +61,9 @@ IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
 #   medium → balanced default
 #   high   → flag even slightly blurry images  (low tolerance)
 SENSITIVITY_THRESHOLDS: dict[str, float] = {
-    "low":    0.30,
-    "medium": 0.55,
-    "high":   0.75,
+    "low":    0.45,
+    "medium": 0.60,
+    "high":   0.80,
 }
 
 # COCO 17-keypoint skeleton: pairs of indices to connect with a line.
@@ -965,7 +965,10 @@ def process(
 
     Returns (all_results, blurry_results, output_directory).
     """
-    threshold  = SENSITIVITY_THRESHOLDS[sensitivity]
+    try:
+        threshold = float(sensitivity)
+    except ValueError:
+        threshold = SENSITIVITY_THRESHOLDS[sensitivity]
     files      = collect_images(input_path)
     ts         = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = output_root if output_root is not None else Path("output") / f"{ts}-{input_path.stem}"
@@ -1127,14 +1130,26 @@ def main() -> None:
         "path",
         help="Path to a single image file or a directory of images.",
     )
+    def _sensitivity_type(value: str) -> str:
+        if value in SENSITIVITY_THRESHOLDS:
+            return value
+        try:
+            float(value)
+            return value
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"sensitivity must be low/medium/high or a numeric threshold (0–1), got {value!r}"
+            )
+
     parser.add_argument(
         "--sensitivity",
-        choices=["low", "medium", "high"],
+        type=_sensitivity_type,
         default="medium",
+        metavar="low|medium|high|<threshold>",
         help=(
             "Detection sensitivity (default: medium).  "
-            "high = flag slightly blurry images;  "
-            "low  = flag only severely blurry images."
+            "Use low/medium/high, or supply a numeric threshold directly (0–1, "
+            "e.g. 0.45).  Scores <= threshold are flagged as blurry."
         ),
     )
     parser.add_argument(

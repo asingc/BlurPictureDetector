@@ -15,5 +15,8 @@ blur.lst
 # Test images (local only)
 TestImg/
 
+# Local lightweight working directory
+lw/
+
 # VS Code debug launch config (personal, not shared)
 .vscode/launch.json
