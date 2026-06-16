@@ -22,5 +22,5 @@ lw/
 efc2023/
 efc2025/
 
-# VS Code debug launch config (personal, not shared)
-.vscode/launch.json
+# VS Code workspace settings (personal, not shared)
+.vscode/

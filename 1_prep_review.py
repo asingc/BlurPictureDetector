@@ -412,6 +412,8 @@ class Body:
     best_narrow_box:   Box  | None = None        # narrow landmark bbox for best_face
     lap_var:           float       = 0.0         # Laplacian variance of best face crop
     ten:               float       = 0.0         # Tenengrad of best face crop
+    cloth_color:       str         = "N/A"       # predicted jersey/cloth color
+    cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean HSV
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +907,139 @@ class BodyArrayScorer(BodyArrayScorerBase):
 
 
 # ---------------------------------------------------------------------------
+# Cloth colour prediction
+# ---------------------------------------------------------------------------
+
+class ClothColorPredictor:
+    """
+    Predicts the dominant jersey/cloth color for a sharp body.
+
+    Strategy
+    --------
+    1. Crop the torso region using COCO keypoints 5/6 (shoulders) and 11/12
+       (hips) when at least two are confident.  Falls back to the middle band
+       of the body bbox (skip top 25 % head, bottom 20 % legs).
+    2. Resize the crop to a small 24 × 24 sample grid.
+    3. Convert to HSV and classify every pixel into a basic colour bucket.
+       Skin-tone pixels are skipped to avoid contaminating the vote with bare
+       arms or necks.
+    4. The colour with the most votes is returned.
+
+    Returns one of: Red | Orange | Yellow | Green | Blue | Purple |
+                    White | Black | Gray | Unknown | N/A
+    """
+
+    _TORSO_KP_INDICES: tuple[int, ...] = (5, 6, 11, 12)  # L/R shoulder, L/R hip
+    _TORSO_KP_CONF:    float            = 0.30
+
+    def predict(self, body: Body, normalized_image: np.ndarray) -> tuple[str, dict]:
+        torso = self._torso_crop(body, normalized_image)
+        if torso is None or torso.size == 0:
+            return "N/A", {}
+        sample = cv2.resize(torso, (24, 24), interpolation=cv2.INTER_AREA)
+        hsv    = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        votes: dict[str, int] = {}
+        valid_rows: list[list[int]] = []
+        for row in hsv.tolist():
+            h, s, v = int(row[0]), int(row[1]), int(row[2])
+            color = self._classify(h, s, v)
+            if color.startswith("_"):   # internal filter token (e.g. skin)
+                continue
+            votes[color] = votes.get(color, 0) + 1
+            valid_rows.append([h, s, v])
+        if not votes:
+            return "Unknown", {"votes": {}, "mean_hsv": None}
+        winner = max(votes, key=votes.__getitem__)
+        mean_hsv = (
+            [round(float(np.mean([r[i] for r in valid_rows])), 1) for i in range(3)]
+            if valid_rows else None
+        )
+        detail = {
+            "votes":    votes,
+            "mean_hsv": mean_hsv,  # [H, S, V] averaged over non-filtered pixels
+        }
+        return winner, detail
+
+    def _torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
+        h_img, w_img = image.shape[:2]
+        kps  = body.keypoints
+        pts  = [
+            (kps[i].point.x, kps[i].point.y)
+            for i in self._TORSO_KP_INDICES
+            if i < len(kps) and kps[i].confidence >= self._TORSO_KP_CONF
+        ]
+        if len(pts) >= 2:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x1 = max(0,         min(xs))
+            y1 = max(0,         min(ys))
+            x2 = min(w_img - 1, max(xs))
+            y2 = min(h_img - 1, max(ys))
+        else:
+            b  = body.bbox
+            bh = b.y2 - b.y1
+            x1, x2 = b.x1, b.x2
+            y1 = b.y1 + int(bh * 0.25)   # skip head
+            y2 = b.y2 - int(bh * 0.20)   # skip legs
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image[y1:y2, x1:x2]
+
+    @staticmethod
+    def _classify(h: int, s: int, v: int) -> str:
+        if v < 50:
+            return "Black"
+        # White: generous saturation threshold — white fabric in photos picks up
+        # blue/green reflections raising S to 40-65 while staying very bright.
+        if s < 65 and v > 150:
+            return "White"
+        # Gray: low saturation, medium brightness.
+        if s < 40:
+            return "Gray"
+        # Rough skin-tone filter: skip pixels likely to be bare skin.
+        if h < 22 and 30 <= s <= 150 and v > 80:
+            return "_skin"
+        if h < 10 or h >= 170:
+            return "Red"
+        if h < 25:
+            return "Orange"
+        if h < 35:
+            return "Yellow"
+        if h < 85:
+            return "Green"
+        if h < 130:
+            return "Blue"
+        return "Purple"
+
+
+cloth_color_predictor = ClothColorPredictor()
+
+
+class JerseyColorScorer(BodyScorerBase):
+    """Disqualify bodies whose jersey/cloth color is not in the allowed colour set.
+
+    Must run *after* cloth color has already been predicted for each body.
+    When *allowed_colors* is empty this scorer is a no-op (all bodies pass).
+    """
+
+    def __init__(self, allowed_colors: frozenset[str]) -> None:
+        self.allowed_colors = allowed_colors
+
+    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+        if not self.allowed_colors:
+            return body
+        color = body.cloth_color
+        if color not in self.allowed_colors:
+            body.passed = False
+            log.debug(
+                "[scorer:jersey_color] body bbox=(%d,%d,%d,%d): cloth_color=%s not in %s → fail",
+                body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2,
+                color, sorted(self.allowed_colors),
+            )
+        return body
+
+
+# ---------------------------------------------------------------------------
 # Per-image analysis
 # ---------------------------------------------------------------------------
 
@@ -913,29 +1048,24 @@ def analyse_image(
     pose_model: YOLO,
     face_model: YOLO,
     threshold: float,
-    boxes_dir: Optional[Path] = None,
+    jersey_colors: frozenset[str] = frozenset(),
 ) -> dict:
     """
     Analyse a single image file.
 
-    Evaluates up to 3 qualified persons (largest face-visible body regions).
+    Evaluates up to 8 qualified persons (largest face-visible body regions).
     The image is considered sharp if ANY of them is sharp.
     Reported metrics come from the sharpest (highest sharpness_score) person.
 
-    Parameters
-    ----------
-    boxes_dir : if provided, annotated previews are saved here with:
-                - body bounding box per person (blue = sharp, red = blurry)
-                - status icon on the largest person (overall pass/fail)
-                - face bounding box per person in yellow with blur score label
-
-    Returns a dict with at minimum the keys 'file' and 'status'.
+    Returns a dict with at minimum the keys 'file', 'status', and
+    '_annotation_data'.  '_annotation_data' carries the per-person bounding
+    boxes and keypoints needed by annotate_image() to draw previews.
     status is one of: 'blurry', 'sharp', 'skipped', 'error'.
     """
     image_orig = _read_image(image_path)
     if image_orig is None:
         log.error("[analyse] %s — cannot read image file", image_path.name)
-        return {"file": str(image_path), "status": "error", "error": "Cannot read image file", "persons_detail": []}
+        return {"file": str(image_path), "status": "error", "error": "Cannot read image file", "persons_detail": [], "_annotation_data": None}
 
     log.debug("[analyse] %s — original size: %dx%d", image_path.name, image_orig.shape[1], image_orig.shape[0])
     # Keep the original for annotation; resize a working copy for processing (file untouched).
@@ -947,14 +1077,20 @@ def analyse_image(
               image_path.name, had_persons, len(persons))
     if not had_persons:
         log.debug("[analyse] %s — skipped: no person detected", image_path.name)
-        if boxes_dir is not None:
-            subdir = boxes_dir / "anno_skipped"
-            subdir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(subdir / (image_path.stem + ".jpg")), image_orig, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        return {"file": str(image_path), "status": "skipped", "reason": "No person detected", "persons_detail": []}
+        return {"file": str(image_path), "status": "skipped", "reason": "No person detected", "persons_detail": [], "_annotation_data": None}
 
-    # Run scorer pipeline (all 5 rules + sharpness).
+    # Predict cloth colour for ALL bodies before scoring so the jersey filter
+    # (JerseyColorScorer) can act on the colour during the scorer pipeline.
+    for person in persons:
+        person.cloth_color, person.cloth_color_detail = cloth_color_predictor.predict(person, normalized_img)
+        log.debug("[colour] %s — body bbox=(%d,%d,%d,%d) cloth_color=%s votes=%s",
+                  image_path.name,
+                  person.bbox.x1, person.bbox.y1, person.bbox.x2, person.bbox.y2,
+                  person.cloth_color, person.cloth_color_detail.get("votes", {}))
+
+    # Run scorer pipeline: jersey filter first, then face-based rules + sharpness.
     scorer = BodyArrayScorer([
+        JerseyColorScorer(jersey_colors),
         MatchedFaceScorer(),
         FaceSizeScorer(),
         BodyHeadKPVisibilityScorer(),
@@ -978,6 +1114,8 @@ def analyse_image(
             "lap_var":         person.lap_var,
             "ten":             person.ten,
             "is_blurry":       is_blurry,
+            "cloth_color":     person.cloth_color,
+            "cloth_color_detail": person.cloth_color_detail,
         })
 
     # Image passes if ANY person is sharp.
@@ -1005,134 +1143,6 @@ def analyse_image(
             "facial_boxes": kp_confs,
         })
 
-    # --- annotated preview ---------------------------------------------------
-    if boxes_dir is not None:
-        # Annotate on the original (full-resolution) image; scale all bbox / keypoint
-        # coordinates from processing space (resized) back up to original dimensions.
-        h_proc, w_proc = normalized_img.shape[:2]
-        annotated = image_orig.copy()
-        overlay   = annotated.copy()   # all drawing goes here; blended back at the end
-        h_out, w_out = annotated.shape[:2]
-        sx = w_out / w_proc
-        sy = h_out / h_proc
-        ann_scale = (sx + sy) / 2  # uniform scale factor for annotation sizes
-
-        face_thick = max(1, round(app_config.annotation_face_box_thickness * ann_scale))
-        box_thick  = max(1, round(app_config.annotation_box_thickness * ann_scale))
-        icon_size  = max(20, round(app_config.annotation_icon_size * ann_scale))
-        kp_radius     = max(3, round(app_config.annotation_face_kp_radius    * ann_scale))
-        kp_thick      = max(1, round(app_config.annotation_face_kp_thickness * ann_scale))
-        body_kp_size    = max(2, round(app_config.annotation_body_kp_size         * ann_scale))
-        body_kp_thick   = max(1, round(app_config.annotation_body_kp_thickness    * ann_scale))
-        skeleton_thick  = max(1, round(app_config.annotation_skeleton_thickness   * ann_scale))
-        narrow_thick    = max(1, round(app_config.annotation_narrow_face_box_thickness * ann_scale))
-        font          = cv2.FONT_HERSHEY_SIMPLEX
-        font_thick  = app_config.annotation_score_font_thickness
-        # Compute font scale so text height == annotation_score_font_size_px scaled to image.
-        (_, _base_h), _ = cv2.getTextSize("Mg", font, 1.0, font_thick)
-        font_scale = app_config.annotation_score_font_size_px * ann_scale / max(_base_h, 1)
-
-        score_labels: list[tuple] = []  # (text, x, y, color) — drawn opaquely after blend
-        for i, p in enumerate(evaluated):
-            b: Box = p["body_bbox"]
-            rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
-            rbx2 = int(b.x2 * sx); rby2 = int(b.y2 * sy)
-
-            body_color = (
-                app_config.annotation_box_color_fail
-                if p["is_blurry"] else
-                app_config.annotation_box_color_pass
-            )
-            cv2.rectangle(overlay, (rbx1, rby1), (rbx2, rby2),
-                          body_color, box_thick)
-
-            # Every person gets its own pass/fail status icon.
-            _draw_status_icon(
-                overlay, rbx1, rby1,
-                icon_size,
-                body_color,
-                passed=not p["is_blurry"],
-            )
-
-            # Skeleton lines between connected body keypoints.
-            kps = p["body_keypoints"]
-            for ka, kb in _COCO_SKELETON:
-                if ka >= len(kps) or kb >= len(kps):
-                    continue
-                pa, pb = kps[ka].point, kps[kb].point
-                if (pa.x == 0 and pa.y == 0) or (pb.x == 0 and pb.y == 0):
-                    continue
-                cv2.line(overlay,
-                         (int(pa.x * sx), int(pa.y * sy)),
-                         (int(pb.x * sx), int(pb.y * sy)),
-                         body_color, skeleton_thick, cv2.LINE_AA)
-
-            # Body keypoints as small squares (sharp/blurry color scheme).
-            half = body_kp_size // 2
-            for kp in p["body_keypoints"]:
-                if kp.point.x == 0 and kp.point.y == 0:
-                    continue  # undetected keypoint
-                rkpx = int(kp.point.x * sx)
-                rkpy = int(kp.point.y * sy)
-                cv2.rectangle(overlay,
-                              (rkpx - half, rkpy - half),
-                              (rkpx + half, rkpy + half),
-                              body_color, body_kp_thick, cv2.LINE_AA)
-
-            # Face bbox + sharpness score label — color mirrors the sharpness pass/fail.
-            # use_narrow_face_box selects which box to draw and anchors the score label.
-            if p["face_bbox"] is not None:
-                fb: Box = p["face_bbox"]
-                rfx1 = int(fb.x1 * sx); rfy1 = int(fb.y1 * sy)
-                rfx2 = int(fb.x2 * sx); rfy2 = int(fb.y2 * sy)
-
-                nfb: Box | None = p["narrow_face_bbox"]
-                if app_config.use_narrow_face_box and nfb is not None:
-                    rnx1 = int(nfb.x1 * sx); rny1 = int(nfb.y1 * sy)
-                    rnx2 = int(nfb.x2 * sx); rny2 = int(nfb.y2 * sy)
-                    cv2.rectangle(overlay, (rnx1, rny1), (rnx2, rny2),
-                                  body_color, narrow_thick)
-                    label_x, label_bottom = rnx1, rny2
-                else:
-                    cv2.rectangle(overlay, (rfx1, rfy1), (rfx2, rfy2),
-                                  body_color, face_thick)
-                    label_x, label_bottom = rfx1, rfy2
-
-                label = f"{p['sharpness_score']:.2f}"
-                (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
-                text_y = min(label_bottom + th + baseline + 2, h_out - 1)
-                score_labels.append((label, label_x, text_y, body_color))
-
-            # Face model keypoint circles: diameter 12 (radius 6), line 3 px.
-            # Confident points (>= threshold) use pass color; others use fail color.
-            if p["face_kps"] is not None:
-                kp_conf_thresh = app_config.face_coverage_conf_threshold
-                ann_face: Face = p["face_kps"]
-                for lm in ann_face.landmarks:
-                    rkpx = int(lm.point.x * sx)
-                    rkpy = int(lm.point.y * sy)
-                    kp_color = (
-                        app_config.annotation_box_color_pass
-                        if lm.confidence >= kp_conf_thresh else
-                        app_config.annotation_box_color_fail
-                    )
-                    cv2.circle(overlay, (rkpx, rkpy), kp_radius, kp_color, kp_thick, cv2.LINE_AA)
-
-        # Blend annotations onto the clean image.
-        cv2.addWeighted(overlay, app_config.annotation_alpha,
-                        annotated, 1.0 - app_config.annotation_alpha, 0, annotated)
-
-        # Draw score labels opaquely on top of the blended result.
-        for label, lx, ly, lcolor in score_labels:
-            cv2.putText(annotated, label, (lx, ly),
-                        font, font_scale, lcolor, font_thick, cv2.LINE_AA)
-
-        out_name    = image_path.stem + ".jpg"
-        anno_subdir = boxes_dir / ("anno_blur" if overall_blurry else "anno_sharp")
-        anno_subdir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    # -------------------------------------------------------------------------
-
     return {
         "file":               str(image_path),
         "status":             "blurry" if overall_blurry else "sharp",
@@ -1141,7 +1151,172 @@ def analyse_image(
         "laplacian_variance": round(best["lap_var"], 2),
         "tenengrad_score":    round(best["ten"], 2),
         "persons_detail":     persons_detail,
+        "_annotation_data": {
+            "evaluated":        evaluated,
+            "overall_blurry":   overall_blurry,
+            "processing_shape": normalized_img.shape[:2],
+        },
     }
+
+
+# ---------------------------------------------------------------------------
+# Annotation
+# ---------------------------------------------------------------------------
+
+def annotate_image(result: dict, boxes_dir: Path, jersey_colors: frozenset[str] = frozenset()) -> None:
+    """
+    Write an annotated preview for one image result.
+
+    'skipped' — saves the original (unannotated) image to anno_skipped/.
+    'blurry' / 'sharp' — draws body boxes, face boxes, keypoints, and
+        sharpness scores, then saves to anno_blur/ or anno_sharp/.
+    'error' — does nothing (no image to read).
+    """
+    status = result["status"]
+    if status == "error":
+        return
+
+    image_path = Path(result["file"])
+    image_orig = _read_image(image_path)
+    if image_orig is None:
+        log.warning("[annotate] cannot re-read %s — skipping annotation", image_path.name)
+        return
+
+    if status == "skipped":
+        subdir = boxes_dir / "anno_skipped"
+        subdir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(subdir / (image_path.stem + ".jpg")), image_orig, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        return
+
+    # status is 'blurry' or 'sharp'
+    ann_data       = result["_annotation_data"]
+    evaluated      = ann_data["evaluated"]
+    overall_blurry = ann_data["overall_blurry"]
+    h_proc, w_proc = ann_data["processing_shape"]
+
+    # Annotate on the original (full-resolution) image; scale all bbox / keypoint
+    # coordinates from processing space (resized) back up to original dimensions.
+    annotated = image_orig.copy()
+    overlay   = annotated.copy()   # all drawing goes here; blended back at the end
+    h_out, w_out = annotated.shape[:2]
+    sx = w_out / w_proc
+    sy = h_out / h_proc
+    ann_scale = (sx + sy) / 2  # uniform scale factor for annotation sizes
+
+    face_thick    = max(1, round(app_config.annotation_face_box_thickness * ann_scale))
+    box_thick     = max(1, round(app_config.annotation_box_thickness * ann_scale))
+    icon_size     = max(20, round(app_config.annotation_icon_size * ann_scale))
+    kp_radius     = max(3, round(app_config.annotation_face_kp_radius    * ann_scale))
+    kp_thick      = max(1, round(app_config.annotation_face_kp_thickness * ann_scale))
+    body_kp_size  = max(2, round(app_config.annotation_body_kp_size         * ann_scale))
+    body_kp_thick = max(1, round(app_config.annotation_body_kp_thickness    * ann_scale))
+    skeleton_thick = max(1, round(app_config.annotation_skeleton_thickness   * ann_scale))
+    narrow_thick  = max(1, round(app_config.annotation_narrow_face_box_thickness * ann_scale))
+    font          = cv2.FONT_HERSHEY_SIMPLEX
+    font_thick    = app_config.annotation_score_font_thickness
+    # Compute font scale so text height == annotation_score_font_size_px scaled to image.
+    (_, _base_h), _ = cv2.getTextSize("Mg", font, 1.0, font_thick)
+    font_scale = app_config.annotation_score_font_size_px * ann_scale / max(_base_h, 1)
+
+    score_labels: list[tuple] = []  # (text, x, y, color) — drawn opaquely after blend
+    for p in evaluated:
+        # Requirement: only annotate bodies whose jersey color is in the allowed set.
+        if jersey_colors and p.get("cloth_color") not in jersey_colors:
+            continue
+        b: Box = p["body_bbox"]
+        rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
+        rbx2 = int(b.x2 * sx); rby2 = int(b.y2 * sy)
+
+        body_color = (
+            app_config.annotation_box_color_fail
+            if p["is_blurry"] else
+            app_config.annotation_box_color_pass
+        )
+        cv2.rectangle(overlay, (rbx1, rby1), (rbx2, rby2), body_color, box_thick)
+
+        # Every person gets its own pass/fail status icon.
+        _draw_status_icon(overlay, rbx1, rby1, icon_size, body_color, passed=not p["is_blurry"])
+
+        # Skeleton lines between connected body keypoints.
+        kps = p["body_keypoints"]
+        for ka, kb in _COCO_SKELETON:
+            if ka >= len(kps) or kb >= len(kps):
+                continue
+            pa, pb = kps[ka].point, kps[kb].point
+            if (pa.x == 0 and pa.y == 0) or (pb.x == 0 and pb.y == 0):
+                continue
+            cv2.line(overlay,
+                     (int(pa.x * sx), int(pa.y * sy)),
+                     (int(pb.x * sx), int(pb.y * sy)),
+                     body_color, skeleton_thick, cv2.LINE_AA)
+
+        # Body keypoints as small squares (sharp/blurry color scheme).
+        half = body_kp_size // 2
+        for kp in p["body_keypoints"]:
+            if kp.point.x == 0 and kp.point.y == 0:
+                continue  # undetected keypoint
+            rkpx = int(kp.point.x * sx)
+            rkpy = int(kp.point.y * sy)
+            cv2.rectangle(overlay,
+                          (rkpx - half, rkpy - half),
+                          (rkpx + half, rkpy + half),
+                          body_color, body_kp_thick, cv2.LINE_AA)
+
+        # Face bbox + sharpness score label.
+        if p["face_bbox"] is not None:
+            fb: Box = p["face_bbox"]
+            rfx1 = int(fb.x1 * sx); rfy1 = int(fb.y1 * sy)
+            rfx2 = int(fb.x2 * sx); rfy2 = int(fb.y2 * sy)
+
+            nfb: Box | None = p["narrow_face_bbox"]
+            if app_config.use_narrow_face_box and nfb is not None:
+                rnx1 = int(nfb.x1 * sx); rny1 = int(nfb.y1 * sy)
+                rnx2 = int(nfb.x2 * sx); rny2 = int(nfb.y2 * sy)
+                cv2.rectangle(overlay, (rnx1, rny1), (rnx2, rny2), body_color, narrow_thick)
+                label_x, label_bottom = rnx1, rny2
+            else:
+                cv2.rectangle(overlay, (rfx1, rfy1), (rfx2, rfy2), body_color, face_thick)
+                label_x, label_bottom = rfx1, rfy2
+
+            label = f"{p['sharpness_score']:.2f}"
+            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
+            text_y = min(label_bottom + th + baseline + 2, h_out - 1)
+            score_labels.append((label, label_x, text_y, body_color))
+
+        # Cloth colour label — top-right corner of the body box.
+        cloth = p.get("cloth_color", "N/A")
+        if cloth not in ("N/A", "Unknown"):
+            (clw, clh), _ = cv2.getTextSize(cloth, font, font_scale, font_thick)
+            cl_x = max(rbx1, rbx2 - clw - 4)
+            cl_y = max(clh + 4, rby1 + clh + 4)
+            score_labels.append((cloth, cl_x, cl_y, body_color))
+
+        # Face model keypoint circles.
+        if p["face_kps"] is not None:
+            kp_conf_thresh = app_config.face_coverage_conf_threshold
+            ann_face: Face = p["face_kps"]
+            for lm in ann_face.landmarks:
+                rkpx = int(lm.point.x * sx)
+                rkpy = int(lm.point.y * sy)
+                kp_color = (
+                    app_config.annotation_box_color_pass
+                    if lm.confidence >= kp_conf_thresh else
+                    app_config.annotation_box_color_fail
+                )
+                cv2.circle(overlay, (rkpx, rkpy), kp_radius, kp_color, kp_thick, cv2.LINE_AA)
+
+    # Blend annotations onto the clean image.
+    cv2.addWeighted(overlay, app_config.annotation_alpha,
+                    annotated, 1.0 - app_config.annotation_alpha, 0, annotated)
+
+    # Draw score labels opaquely on top of the blended result.
+    for label, lx, ly, lcolor in score_labels:
+        cv2.putText(annotated, label, (lx, ly), font, font_scale, lcolor, font_thick, cv2.LINE_AA)
+
+    out_name    = image_path.stem + ".jpg"
+    anno_subdir = boxes_dir / ("anno_blur" if overall_blurry else "anno_sharp")
+    anno_subdir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
 
 # ---------------------------------------------------------------------------
@@ -1177,8 +1352,9 @@ def collect_images(input_path: Path) -> list[Path]:
 
 
 def process(
-    input_path: Path, sensitivity: str, output_root: Optional[Path] = None
-) -> tuple[list[dict], list[dict], Path]:
+    input_path: Path, sensitivity: str, output_root: Optional[Path] = None,
+    jersey_colors: frozenset[str] = frozenset(),
+) -> tuple[list[dict], list[dict], Path, str | None]:
     """
     Process all images at *input_path*.
 
@@ -1229,9 +1405,11 @@ def process(
     blurry:      list[dict] = []
     sharp_count = skip_count = error_count = 0
 
+    # ── Phase 1: detect & score all images ──────────────────────────────────
+    log.info("Phase 1/2 — detection & scoring …")
     for idx, image_path in enumerate(files, 1):
         tag = f"[{idx:>{width}}/{len(files)}] {image_path.name}"
-        result = analyse_image(image_path, pose_model, face_model, threshold, boxes_dir)
+        result = analyse_image(image_path, pose_model, face_model, threshold, jersey_colors)
         all_results.append(result)
 
         if result["status"] == "blurry":
@@ -1255,7 +1433,19 @@ def process(
 
     log.info("Summary —  Blurry: %d  |  Sharp: %d  |  Skipped: %d  |  Errors: %d",
              len(blurry), sharp_count, skip_count, error_count)
-    return all_results, blurry, output_dir
+
+    jersey_color_str = ";".join(sorted(jersey_colors)) if jersey_colors else None
+    log.info("Jersey colour filter: %s", jersey_color_str or "(none)")
+
+    write_results_json(all_results, output_dir / "results.json", our_jersey_color=jersey_color_str)
+
+    # ── Phase 2: write annotated previews ────────────────────────────────────
+    log.info("Phase 2/2 — writing annotated previews …")
+    for idx, result in enumerate(all_results, 1):
+        log.debug("[annotate] [%d/%d] %s", idx, len(all_results), Path(result["file"]).name)
+        annotate_image(result, boxes_dir, jersey_colors)
+
+    return all_results, blurry, output_dir, jersey_color_str
 
 
 # ---------------------------------------------------------------------------
@@ -1313,11 +1503,131 @@ def write_blur_lst(blurry: list[dict], lst_path: Path) -> None:
     log.info("Blur list written to:     %s", lst_path)
 
 
+def _serial_box(b: Box) -> dict:
+    return {"x1": b.x1, "y1": b.y1, "x2": b.x2, "y2": b.y2}
+
+
+def _serial_keypoint(kp: PredictedKeyPoint) -> dict:
+    return {"x": kp.point.x, "y": kp.point.y, "conf": kp.confidence, "passed": kp.passed}
+
+
+def _serial_face(f: Face) -> dict:
+    return {
+        "bbox":       _serial_box(f.bbox),
+        "confidence": f.confidence,
+        "landmarks":  [_serial_keypoint(lm) for lm in f.landmarks],
+        "passed":     f.passed,
+    }
+
+
+def _serial_annotation_data(ann: dict) -> dict:
+    return {
+        "processing_shape": list(ann["processing_shape"]),
+        "overall_blurry":   ann["overall_blurry"],
+        "evaluated": [
+            {
+                "body_bbox":        _serial_box(p["body_bbox"]),
+                "body_keypoints":   [_serial_keypoint(kp) for kp in p["body_keypoints"]],
+                "face_bbox":        _serial_box(p["face_bbox"]) if p["face_bbox"] else None,
+                "narrow_face_bbox": _serial_box(p["narrow_face_bbox"]) if p["narrow_face_bbox"] else None,
+                "face_kps":         _serial_face(p["face_kps"]) if p["face_kps"] else None,
+                "sharpness_score":  p["sharpness_score"],
+                "lap_var":          p["lap_var"],
+                "ten":              p["ten"],
+                "is_blurry":        p["is_blurry"],
+                "cloth_color":      p.get("cloth_color", "N/A"),
+                "cloth_color_detail": p.get("cloth_color_detail", {}),
+            }
+            for p in ann["evaluated"]
+        ],
+    }
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Encode numpy scalar types as their Python equivalents."""
+    def default(self, obj: object) -> object:
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+def write_results_json(all_results: list[dict], json_path: Path, *, our_jersey_color: str | None = None) -> None:
+    """Write full per-image analytic results (scores, bboxes, keypoints) to JSON."""
+    serializable = []
+    for r in all_results:
+        entry = {k: v for k, v in r.items() if k != "_annotation_data"}
+        ann = r.get("_annotation_data")
+        if ann is not None:
+            entry["annotation_data"] = _serial_annotation_data(ann)
+        serializable.append(entry)
+    payload = {
+        "our_jersey_color": our_jersey_color,
+        "results": serializable,
+    }
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, cls=_NumpyEncoder)
+    log.info("Results JSON written to:  %s", json_path)
+
+
+def _compute_jersey_color(all_results: list[dict]) -> str:
+    """
+    Tally cloth colors across all sharp bodies and return the most common one.
+    Results labeled 'Unknown' or 'N/A' are excluded from the tally.
+    Returns 'Unknown' when no sharp body has a usable color.
+    """
+    counts: dict[str, int] = {}
+    for r in all_results:
+        ann = r.get("_annotation_data")
+        if ann is None:
+            continue
+        for p in ann["evaluated"]:
+            color = p.get("cloth_color", "N/A")
+            if not p["is_blurry"] and color not in ("N/A", "Unknown"):
+                counts[color] = counts.get(color, 0) + 1
+    if not counts:
+        return "Unknown"
+    summary = "  ".join(f"{c}={n}" for c, n in sorted(counts.items(), key=lambda x: -x[1]))
+    log.info("Jersey colour distribution (sharp persons): %s", summary)
+    return max(counts, key=counts.__getitem__)
+
+
+def _recompute_verdicts(all_results: list[dict], our_jersey_color: str) -> list[dict]:
+    """
+    Re-evaluate image-level verdicts: an image is considered sharp only when
+    at least one sharp body wears our_jersey_color.  Mutates all_results in
+    place and returns the updated blurry list.
+    """
+    blurry: list[dict] = []
+    for r in all_results:
+        if r["status"] not in ("blurry", "sharp"):
+            continue
+        ann = r.get("_annotation_data")
+        if ann is None:
+            continue
+        has_our_player = any(
+            not p["is_blurry"] and p.get("cloth_color") == our_jersey_color
+            for p in ann["evaluated"]
+        )
+        new_blurry = not has_our_player
+        ann["overall_blurry"] = new_blurry
+        r["status"] = "blurry" if new_blurry else "sharp"
+        r.pop("star_rating", None)
+        if new_blurry:
+            r["star_rating"] = 1
+            blurry.append(r)
+    return blurry
+
+
 def write_info_json(
     all_results: list[dict],
     input_path: Path,
     timestamp: str,
     json_path: Path,
+    our_jersey_color: str | None = None,
 ) -> None:
     """Write a run-summary JSON file."""
     def _entry(r: dict) -> dict:
@@ -1329,12 +1639,13 @@ def write_info_json(
     skipped_files = [_entry(r) for r in all_results if r["status"] in ("skipped", "error")]
 
     payload = {
-        "SrcDir":      str(input_path.resolve()),
-        "SrcType":     "File" if input_path.is_file() else "Directory",
-        "Timestamp":   timestamp,
-        "Anno_Blur":   blur_files,
-        "Anno_Sharp":  sharp_files,
-        "Anno_Skipped": skipped_files,
+        "SrcDir":           str(input_path.resolve()),
+        "SrcType":          "File" if input_path.is_file() else "Directory",
+        "Timestamp":        timestamp,
+        "OurJerseyColor":   our_jersey_color,
+        "Anno_Blur":        blur_files,
+        "Anno_Sharp":       sharp_files,
+        "Anno_Skipped":     skipped_files,
     }
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
@@ -1386,23 +1697,47 @@ def main() -> None:
             "Defaults to output/<timestamp>-<input_name>/."
         ),
     )
+    parser.add_argument(
+        "--jerseycolor",
+        default="blue;white;purple;orange",
+        metavar="COLOR[;COLOR...]",
+        help=(
+            "Semicolon-separated list of jersey colours that qualify for "
+            "evaluation and annotation (case-insensitive).  "
+            "Only persons wearing one of these colours are scored for sharpness "
+            "and drawn in preview images.  "
+            "Default: blue;white;purple;orange.  "
+            "Pass an empty string to disable jersey filtering."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_console_logging()
-    log.debug("Arguments: path=%s sensitivity=%s output=%s",
-              args.path, args.sensitivity, args.output)
+    log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s",
+              args.path, args.sensitivity, args.output, args.jerseycolor)
 
     input_path = Path(args.path).resolve()
     if not input_path.exists():
         log.error("Path does not exist: %s", input_path)
         sys.exit(1)
 
+    # Parse the semicolon-separated jersey colour list, normalise to title-case.
+    jersey_colors: frozenset[str] = frozenset(
+        c.strip().title()
+        for c in (args.jerseycolor or "").split(";")
+        if c.strip()
+    )
+
     output_root = Path(args.output).resolve() if args.output else None
-    all_results, blurry, output_dir = process(input_path, args.sensitivity, output_root)
+    all_results, blurry, output_dir, our_jersey_color = process(
+        input_path, args.sensitivity, output_root, jersey_colors
+    )
 
     if all_results:
         write_csv(all_results, output_dir / "blurry.csv")
-        write_info_json(all_results, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"), output_dir / "info.json")
+        write_info_json(all_results, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"),
+                        output_dir / "info.json", our_jersey_color=our_jersey_color)
+        # results.json is already written inside process() after Phase 1
     if blurry:
         write_blur_lst(blurry, output_dir / "blur.lst")
     else:
