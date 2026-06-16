@@ -18,5 +18,9 @@ TestImg/
 # Local lightweight working directory
 lw/
 
+# Event-specific working directories (local only)
+efc2023/
+efc2025/
+
 # VS Code debug launch config (personal, not shared)
 .vscode/launch.json

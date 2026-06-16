@@ -95,7 +95,7 @@ class AppConfig:
     # half-visible, judged by how many face keypoints (out of 5) are
     # detected with confidence >= face_kp_conf_threshold.
     # Set face_kp_min_visible = 0 to disable face-visibility filtering.
-    face_kp_min_visible:    int   = 3    # ≥ 3 of 5 face KPs must be confident
+    face_kp_min_visible:    int   = 2    # ≥ 3 of 5 face KPs must be confident
     face_kp_conf_threshold: float = 0.5  # per-keypoint confidence cutoff
 
     # Face-coverage check using the face model's 5 landmarks (eyes / nose / mouth).
@@ -103,8 +103,8 @@ class AppConfig:
     # of its landmarks are confident — meaning the face is more than
     # (1 - face_coverage_min_visible/5) covered.
     # Set face_coverage_min_visible = 0 to disable the check.
-    face_coverage_min_visible:    int   = 3    # ≥ 3 of 5 face-model landmarks must be confident
-    face_coverage_conf_threshold: float = 0.85  # per-landmark confidence cutoff
+    face_coverage_min_visible:    int   = 2    # ≥ 3 of 5 face-model landmarks must be confident
+    face_coverage_conf_threshold: float = 0.75  # per-landmark confidence cutoff
 
     # Minimum face size: disqualify persons whose face bbox long edge is smaller
     # than this fraction of the image long edge (e.g. 0.04 = 4 %).
@@ -402,11 +402,16 @@ class Face:
 @dataclass
 class Body:
     """A detected person ready for sharpness analysis."""
-    crop:           np.ndarray       # face image crop (BGR) used for blur scoring
-    bbox:           Box              # body bounding box (padded, clamped)
-    faces:          list[Face]       # matched faces (may be empty before face matching)
-    keypoints:      list[PredictedKeyPoint]  # 17 COCO body keypoints
-    passed:         bool = True      # scorers set this to False to disqualify
+    crop:              np.ndarray                # face image crop (BGR) used for blur scoring
+    bbox:              Box                       # body bounding box (padded, clamped)
+    faces:             list[Face]                # matched faces (may be empty before face matching)
+    keypoints:         list[PredictedKeyPoint]   # 17 COCO body keypoints
+    passed:            bool        = True        # scorers set this to False to disqualify
+    sharpness_score:   float       = 0.0         # best face sharpness score (set by FaceSharpnessScorer)
+    best_face:         Face | None = None        # face that yielded sharpness_score
+    best_narrow_box:   Box  | None = None        # narrow landmark bbox for best_face
+    lap_var:           float       = 0.0         # Laplacian variance of best face crop
+    ten:               float       = 0.0         # Tenengrad of best face crop
 
 
 # ---------------------------------------------------------------------------
@@ -833,9 +838,13 @@ class FaceSharpnessScorer(BodyScorerBase):
         self.threshold = threshold
 
     def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        h, w   = normalized_image.shape[:2]
-        narrow_pad = round(0.005 * max(h, w))
-        best_score = 0.0
+        h, w        = normalized_image.shape[:2]
+        narrow_pad  = round(0.005 * max(h, w))
+        best_score  = 0.0
+        best_face:   Face | None = None
+        best_narrow: Box  | None = None
+        best_lap    = 0.0
+        best_ten    = 0.0
         for face in body.faces:
             if not face.passed:
                 continue
@@ -852,7 +861,16 @@ class FaceSharpnessScorer(BodyScorerBase):
             log.debug("[scorer:sharpness] face conf=%.3f score=%.4f (lap=%.2f ten=%.2f)",
                       face.confidence, s, lv, t)
             if s > best_score:
-                best_score = s
+                best_score   = s
+                best_face    = face
+                best_narrow  = narrow_box
+                best_lap     = lv
+                best_ten     = t
+        body.sharpness_score = best_score
+        body.best_face       = best_face
+        body.best_narrow_box = best_narrow
+        body.lap_var         = best_lap
+        body.ten             = best_ten
         if best_score <= self.threshold:
             body.passed = False
             log.debug("[scorer:sharpness] body bbox=(%d,%d,%d,%d): best_score=%.4f <= threshold=%.2f → fail",
@@ -935,46 +953,31 @@ def analyse_image(
             cv2.imwrite(str(subdir / (image_path.stem + ".jpg")), image_orig, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return {"file": str(image_path), "status": "skipped", "reason": "No person detected", "persons_detail": []}
 
-    # Evaluate each person body; bodies with no matched face score 0 (blurry).
+    # Run scorer pipeline (all 5 rules + sharpness).
+    scorer = BodyArrayScorer([
+        MatchedFaceScorer(),
+        FaceSizeScorer(),
+        BodyHeadKPVisibilityScorer(),
+    #FaceLandmarkVisibilityScorer(),
+        FaceSharpnessScorer(threshold),
+    ])
+    persons = scorer.process(normalized_img, persons)
+
     evaluated: list[dict] = []
     for person in persons:
-        best_score: float       = 0.0
-        best_lap:   float       = 0.0
-        best_ten:   float       = 0.0
-        best_face:  Face | None = None
-        best_narrow: Box | None = None
-
-        h_proc, w_proc = normalized_img.shape[:2]
-        narrow_pad = round(0.005 * max(h_proc, w_proc))
-        for face in person.faces:
-            narrow_box = _narrow_face_box(face, pad=narrow_pad, img_w=w_proc, img_h=h_proc) if app_config.use_narrow_face_box else None
-            score_box  = narrow_box or face.bbox
-            fx1, fy1, fx2, fy2 = score_box.as_ints()
-            crop = normalized_img[fy1:fy2, fx1:fx2]
-            if crop.size == 0:
-                continue
-            crop = cap_long_edge(crop, max(h_proc, w_proc) * 0.04)
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            s, lv, t = sharpness_evaluator.score(gray)
-            log.debug("[analyse] %s — face conf=%.3f score=%.4f (lap=%.2f ten=%.2f)",
-                      image_path.name, face.confidence, s, lv, t)
-            if s > best_score:
-                best_score, best_lap, best_ten, best_face = s, lv, t, face
-                best_narrow = narrow_box
-
-        is_blurry = best_score <= threshold
+        is_blurry = not person.passed
         log.debug("[analyse] %s — person bbox=%s best_score=%.4f blurry=%s",
-                  image_path.name, person.bbox, best_score, is_blurry)
+                  image_path.name, person.bbox, person.sharpness_score, is_blurry)
         evaluated.append({
-            "body_bbox":      person.bbox,
-            "body_keypoints": person.keypoints,
-            "face_bbox":           best_face.bbox if best_face else None,
-            "narrow_face_bbox":    best_narrow,
-            "face_kps":            best_face      if best_face else None,
-            "sharpness_score":     best_score,
-            "lap_var":             best_lap,
-            "ten":                 best_ten,
-            "is_blurry":           is_blurry,
+            "body_bbox":       person.bbox,
+            "body_keypoints":  person.keypoints,
+            "face_bbox":       person.best_face.bbox if person.best_face else None,
+            "narrow_face_bbox": person.best_narrow_box,
+            "face_kps":        person.best_face,
+            "sharpness_score": person.sharpness_score,
+            "lap_var":         person.lap_var,
+            "ten":             person.ten,
+            "is_blurry":       is_blurry,
         })
 
     # Image passes if ANY person is sharp.
