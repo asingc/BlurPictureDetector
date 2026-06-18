@@ -413,7 +413,7 @@ class Body:
     lap_var:           float       = 0.0         # Laplacian variance of best face crop
     ten:               float       = 0.0         # Tenengrad of best face crop
     cloth_color:       str         = "N/A"       # predicted jersey/cloth color
-    cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean HSV
+    cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean LAB
 
 
 # ---------------------------------------------------------------------------
@@ -920,43 +920,78 @@ class ClothColorPredictor:
        (hips) when at least two are confident.  Falls back to the middle band
        of the body bbox (skip top 25 % head, bottom 20 % legs).
     2. Resize the crop to a small 24 × 24 sample grid.
-    3. Convert to HSV and classify every pixel into a basic colour bucket.
+    3. Convert to CIE L*a*b* (perceptually uniform) and assign each pixel to
+       the nearest reference color by Euclidean distance in LAB space.
        Skin-tone pixels are skipped to avoid contaminating the vote with bare
        arms or necks.
     4. The colour with the most votes is returned.
 
-    Returns one of: Red | Orange | Yellow | Green | Blue | Purple |
-                    White | Black | Gray | Unknown | N/A
+    Returns one of: Hue, Shade labels (for example Blue, Navy),
+                    or Unknown | N/A.
     """
 
     _TORSO_KP_INDICES: tuple[int, ...] = (5, 6, 11, 12)  # L/R shoulder, L/R hip
     _TORSO_KP_CONF:    float            = 0.30
+
+    # Reference colors in true CIE L*a*b* space (L: 0-100, a/b: -128 to 127).
+    # Keys use "Hue, Shade" labels for more specific output names.
+    _COLOR_LAB: dict[str, tuple[float, float, float]] = {
+        "Red, Crimson":    ( 40.0,  65.0,  40.0),
+        "Orange, Vivid":   ( 65.0,  35.0,  55.0),
+        "Yellow, Gold":    ( 85.0,  -5.0,  75.0),
+        "Green, Emerald":  ( 45.0, -40.0,  25.0),
+        "Blue, Royal":     ( 35.0,   5.0, -55.0),
+        "Blue, Navy":      ( 15.0,   5.0, -25.0),
+        "Purple, Violet":  ( 30.0,  30.0, -35.0),
+        "White, Bright":   ( 95.0,   0.0,   0.0),
+        "Gray, Medium":    ( 50.0,   0.0,   0.0),
+        "Black, Deep":     (  8.0,   0.0,   0.0),
+    }
+
+    # Skin-tone cluster center in LAB — pixels within this ΔE distance are skipped.
+    _SKIN_LAB:         tuple[float, float, float] = (65.0, 18.0, 22.0)
+    _SKIN_DIST_THRESH: float                      = 35.0
 
     def predict(self, body: Body, normalized_image: np.ndarray) -> tuple[str, dict]:
         torso = self._torso_crop(body, normalized_image)
         if torso is None or torso.size == 0:
             return "N/A", {}
         sample = cv2.resize(torso, (24, 24), interpolation=cv2.INTER_AREA)
-        hsv    = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        # float32 input → OpenCV returns true CIE L*a*b* values (L: 0-100, a/b: ±127)
+        lab    = cv2.cvtColor(sample.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
+        pixels = lab.reshape(-1, 3)  # (576, 3)
+
+        names = list(self._COLOR_LAB.keys())
+        refs  = np.array([self._COLOR_LAB[n] for n in names], dtype=np.float32)
+        skin  = np.array(self._SKIN_LAB,                      dtype=np.float32)
+
+        # Nearest reference color per pixel: (576, N_colors, 3) → (576,)
+        diffs       = pixels[:, None, :] - refs[None, :, :]
+        nearest_idx = (diffs ** 2).sum(axis=2).argmin(axis=1)
+
+        # Skin exclusion mask
+        skin_dists = np.sqrt(((pixels - skin) ** 2).sum(axis=1))
+        is_skin    = skin_dists < self._SKIN_DIST_THRESH
+
         votes: dict[str, int] = {}
-        valid_rows: list[list[int]] = []
-        for row in hsv.tolist():
-            h, s, v = int(row[0]), int(row[1]), int(row[2])
-            color = self._classify(h, s, v)
-            if color.startswith("_"):   # internal filter token (e.g. skin)
+        valid_pixels: list[np.ndarray] = []
+        for i, (idx, skip) in enumerate(zip(nearest_idx.tolist(), is_skin.tolist())):
+            if skip:
                 continue
-            votes[color] = votes.get(color, 0) + 1
-            valid_rows.append([h, s, v])
+            name = names[idx]
+            votes[name] = votes.get(name, 0) + 1
+            valid_pixels.append(pixels[i])
+
         if not votes:
-            return "Unknown", {"votes": {}, "mean_hsv": None}
-        winner = max(votes, key=votes.__getitem__)
-        mean_hsv = (
-            [round(float(np.mean([r[i] for r in valid_rows])), 1) for i in range(3)]
-            if valid_rows else None
+            return "Unknown", {"votes": {}, "mean_lab": None}
+        winner  = max(votes, key=votes.__getitem__)
+        mean_lab = (
+            [round(float(v), 1) for v in np.mean(valid_pixels, axis=0)]
+            if valid_pixels else None
         )
         detail = {
             "votes":    votes,
-            "mean_hsv": mean_hsv,  # [H, S, V] averaged over non-filtered pixels
+            "mean_lab": mean_lab,  # [L, a, b] averaged over non-skin pixels
         }
         return winner, detail
 
@@ -985,34 +1020,23 @@ class ClothColorPredictor:
             return None
         return image[y1:y2, x1:x2]
 
-    @staticmethod
-    def _classify(h: int, s: int, v: int) -> str:
-        if v < 50:
-            return "Black"
-        # White: generous saturation threshold — white fabric in photos picks up
-        # blue/green reflections raising S to 40-65 while staying very bright.
-        if s < 65 and v > 150:
-            return "White"
-        # Gray: low saturation, medium brightness.
-        if s < 40:
-            return "Gray"
-        # Rough skin-tone filter: skip pixels likely to be bare skin.
-        if h < 22 and 30 <= s <= 150 and v > 80:
-            return "_skin"
-        if h < 10 or h >= 170:
-            return "Red"
-        if h < 25:
-            return "Orange"
-        if h < 35:
-            return "Yellow"
-        if h < 85:
-            return "Green"
-        if h < 130:
-            return "Blue"
-        return "Purple"
-
 
 cloth_color_predictor = ClothColorPredictor()
+
+
+def _matches_allowed_jersey_color(predicted: str, allowed_colors: frozenset[str]) -> bool:
+    """Match either the full label (Hue, Shade) or just the hue."""
+    predicted_norm = (predicted or "").strip().lower()
+    if not predicted_norm:
+        return False
+    predicted_hue = predicted_norm.split(",", 1)[0].strip()
+    for allowed in allowed_colors:
+        allowed_norm = allowed.strip().lower()
+        if not allowed_norm:
+            continue
+        if allowed_norm == predicted_norm or allowed_norm == predicted_hue:
+            return True
+    return False
 
 
 class JerseyColorScorer(BodyScorerBase):
@@ -1029,7 +1053,7 @@ class JerseyColorScorer(BodyScorerBase):
         if not self.allowed_colors:
             return body
         color = body.cloth_color
-        if color not in self.allowed_colors:
+        if not _matches_allowed_jersey_color(color, self.allowed_colors):
             body.passed = False
             log.debug(
                 "[scorer:jersey_color] body bbox=(%d,%d,%d,%d): cloth_color=%s not in %s → fail",
@@ -1047,8 +1071,6 @@ def analyse_image(
     image_path: Path,
     pose_model: YOLO,
     face_model: YOLO,
-    threshold: float,
-    jersey_colors: frozenset[str] = frozenset(),
 ) -> dict:
     """
     Analyse a single image file.
@@ -1060,7 +1082,7 @@ def analyse_image(
     Returns a dict with at minimum the keys 'file', 'status', and
     '_annotation_data'.  '_annotation_data' carries the per-person bounding
     boxes and keypoints needed by annotate_image() to draw previews.
-    status is one of: 'blurry', 'sharp', 'skipped', 'error'.
+    status is one of: 'analysed', 'skipped', 'error'.
     """
     image_orig = _read_image(image_path)
     if image_orig is None:
@@ -1079,8 +1101,7 @@ def analyse_image(
         log.debug("[analyse] %s — skipped: no person detected", image_path.name)
         return {"file": str(image_path), "status": "skipped", "reason": "No person detected", "persons_detail": [], "_annotation_data": None}
 
-    # Predict cloth colour for ALL bodies before scoring so the jersey filter
-    # (JerseyColorScorer) can act on the colour during the scorer pipeline.
+    # Predict cloth colour for ALL bodies during extraction.
     for person in persons:
         person.cloth_color, person.cloth_color_detail = cloth_color_predictor.predict(person, normalized_img)
         log.debug("[colour] %s — body bbox=(%d,%d,%d,%d) cloth_color=%s votes=%s",
@@ -1088,22 +1109,22 @@ def analyse_image(
                   person.bbox.x1, person.bbox.y1, person.bbox.x2, person.bbox.y2,
                   person.cloth_color, person.cloth_color_detail.get("votes", {}))
 
-    # Run scorer pipeline: jersey filter first, then face-based rules + sharpness.
+    # Run extraction scoring only (no jersey filtering, no blur threshold gating).
+    # Threshold and jersey-based pass/fail are applied in process() phase 2.
     scorer = BodyArrayScorer([
-        JerseyColorScorer(jersey_colors),
         MatchedFaceScorer(),
         FaceSizeScorer(),
         BodyHeadKPVisibilityScorer(),
     #FaceLandmarkVisibilityScorer(),
-        FaceSharpnessScorer(threshold),
+        FaceSharpnessScorer(-1.0),
     ])
     persons = scorer.process(normalized_img, persons)
 
     evaluated: list[dict] = []
     for person in persons:
-        is_blurry = not person.passed
-        log.debug("[analyse] %s — person bbox=%s best_score=%.4f blurry=%s",
-                  image_path.name, person.bbox, person.sharpness_score, is_blurry)
+        qualified_for_sharpness = bool(person.passed)
+        log.debug("[analyse] %s — person bbox=%s best_score=%.4f qualified=%s",
+                  image_path.name, person.bbox, person.sharpness_score, qualified_for_sharpness)
         evaluated.append({
             "body_bbox":       person.bbox,
             "body_keypoints":  person.keypoints,
@@ -1113,22 +1134,18 @@ def analyse_image(
             "sharpness_score": person.sharpness_score,
             "lap_var":         person.lap_var,
             "ten":             person.ten,
-            "is_blurry":       is_blurry,
+            "qualified_for_sharpness": qualified_for_sharpness,
+            "is_blurry":       True,
             "cloth_color":     person.cloth_color,
             "cloth_color_detail": person.cloth_color_detail,
         })
 
-    # Image passes if ANY person is sharp.
-    overall_blurry = all(p["is_blurry"] for p in evaluated)
-
-    # Use the sharpest person's metrics for the CSV/log.
+    # Keep extracted metrics; final status/verdict is assigned in process() phase 2.
     best = max(evaluated, key=lambda p: p["sharpness_score"])
-    log.debug("[analyse] %s — overall=%s best_score=%.4f threshold=%.2f (%d person(s))",
-              image_path.name,
-              "BLURRY" if overall_blurry else "SHARP",
-              best["sharpness_score"], threshold, len(evaluated))
+    log.debug("[analyse] %s — extracted best_score=%.4f (%d person(s))",
+              image_path.name, best["sharpness_score"], len(evaluated))
 
-    # Build per-person detail rows for CSV output.
+    # Build per-person detail rows for CSV output.l
     persons_detail: list[dict] = []
     for p in evaluated:
         b: Box = p["body_bbox"]
@@ -1137,7 +1154,7 @@ def analyse_image(
         else:
             kp_confs = ""
         persons_detail.append({
-            "verdict":      "Blur" if p["is_blurry"] else "Sharp",
+            "verdict":      "Pending",
             "orig_dim":     f"{b.width:.0f} x {b.height:.0f}",
             "score":        round(p["sharpness_score"], 2),
             "facial_boxes": kp_confs,
@@ -1145,7 +1162,7 @@ def analyse_image(
 
     return {
         "file":               str(image_path),
-        "status":             "blurry" if overall_blurry else "sharp",
+        "status":             "analysed",
         "sharpness_score":    round(best["sharpness_score"], 4),
         "sharpness_grade":    round(best["sharpness_score"] * 100, 1),
         "laplacian_variance": round(best["lap_var"], 2),
@@ -1153,7 +1170,7 @@ def analyse_image(
         "persons_detail":     persons_detail,
         "_annotation_data": {
             "evaluated":        evaluated,
-            "overall_blurry":   overall_blurry,
+            "overall_blurry":   True,
             "processing_shape": normalized_img.shape[:2],
         },
     }
@@ -1221,7 +1238,7 @@ def annotate_image(result: dict, boxes_dir: Path, jersey_colors: frozenset[str] 
     score_labels: list[tuple] = []  # (text, x, y, color) — drawn opaquely after blend
     for p in evaluated:
         # Requirement: only annotate bodies whose jersey color is in the allowed set.
-        if jersey_colors and p.get("cloth_color") not in jersey_colors:
+        if jersey_colors and not _matches_allowed_jersey_color(p.get("cloth_color", "N/A"), jersey_colors):
             continue
         b: Box = p["body_bbox"]
         rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
@@ -1402,50 +1419,60 @@ def process(
               app_config.normalized_img_max_long_edge)
 
     all_results: list[dict] = []
-    blurry:      list[dict] = []
-    sharp_count = skip_count = error_count = 0
+    skip_count = error_count = 0
 
-    # ── Phase 1: detect & score all images ──────────────────────────────────
-    log.info("Phase 1/2 — detection & scoring …")
+    # ── Phase 1: extract data for all images ────────────────────────────────
+    log.info("Phase 1/3 — extraction (detect + measure + color votes) …")
     for idx, image_path in enumerate(files, 1):
         tag = f"[{idx:>{width}}/{len(files)}] {image_path.name}"
-        result = analyse_image(image_path, pose_model, face_model, threshold, jersey_colors)
+        result = analyse_image(image_path, pose_model, face_model)
         all_results.append(result)
 
-        if result["status"] == "blurry":
-            result["star_rating"] = 1
-            blurry.append(result)
-            log.info("%s  →  BLURRY   score=%.3f  grade=%.1f/100",
-                     tag, result["sharpness_score"], result["sharpness_grade"])
-
-        elif result["status"] == "sharp":
-            sharp_count += 1
-            log.info("%s  →  Sharp    score=%.3f  grade=%.1f/100",
-                     tag, result["sharpness_score"], result["sharpness_grade"])
-
-        elif result["status"] == "skipped":
+        if result["status"] == "skipped":
             skip_count += 1
             log.info("%s  →  Skipped  (%s)", tag, result.get("reason", ""))
 
-        else:
+        elif result["status"] == "error":
             error_count += 1
             log.error("%s  →  Error    (%s)", tag, result.get("error", ""))
+
+        else:
+            log.info("%s  →  Analysed  extracted_score=%.3f",
+                     tag, result.get("sharpness_score", 0.0))
+
+    analysed_count = sum(1 for r in all_results if r.get("status") == "analysed")
+    log.info("Extraction summary —  Analysed: %d  |  Skipped: %d  |  Errors: %d",
+             analysed_count, skip_count, error_count)
+
+    jersey_color_filter = ";".join(sorted(jersey_colors)) if jersey_colors else None
+    log.info("Jersey colour filter: %s", jersey_color_filter or "(none)")
+
+    # Poll dominant jersey color between extraction and verdict phases.
+    polled_jersey_color = _compute_jersey_color(all_results)
+    log.info("Polled jersey colour (all evaluated bodies): %s", polled_jersey_color)
+
+    # ── Phase 2: assign final sharp/blurry verdicts from extracted data ─────
+    log.info("Phase 2/3 — verdicts from extracted data …")
+    blurry = _recompute_verdicts(
+        all_results,
+        our_jersey_color=polled_jersey_color,
+        threshold=threshold,
+        jersey_colors=jersey_colors,
+    )
+    sharp_count = sum(1 for r in all_results if r.get("status") == "sharp")
 
     log.info("Summary —  Blurry: %d  |  Sharp: %d  |  Skipped: %d  |  Errors: %d",
              len(blurry), sharp_count, skip_count, error_count)
 
-    jersey_color_str = ";".join(sorted(jersey_colors)) if jersey_colors else None
-    log.info("Jersey colour filter: %s", jersey_color_str or "(none)")
+    write_results_json(all_results, output_dir / "results.json", our_jersey_color=polled_jersey_color)
 
-    write_results_json(all_results, output_dir / "results.json", our_jersey_color=jersey_color_str)
-
-    # ── Phase 2: write annotated previews ────────────────────────────────────
-    log.info("Phase 2/2 — writing annotated previews …")
+    # ── Phase 3: write annotated previews ────────────────────────────────────
+    log.info("Phase 3/3 — writing annotated previews …")
     for idx, result in enumerate(all_results, 1):
         log.debug("[annotate] [%d/%d] %s", idx, len(all_results), Path(result["file"]).name)
         annotate_image(result, boxes_dir, jersey_colors)
 
-    return all_results, blurry, output_dir, jersey_color_str
+    return all_results, blurry, output_dir, polled_jersey_color
 
 
 # ---------------------------------------------------------------------------
@@ -1575,9 +1602,9 @@ def write_results_json(all_results: list[dict], json_path: Path, *, our_jersey_c
 
 def _compute_jersey_color(all_results: list[dict]) -> str:
     """
-    Tally cloth colors across all sharp bodies and return the most common one.
+    Tally cloth colors across all evaluated bodies and return the most common one.
     Results labeled 'Unknown' or 'N/A' are excluded from the tally.
-    Returns 'Unknown' when no sharp body has a usable color.
+    Returns 'Unknown' when no evaluated body has a usable color.
     """
     counts: dict[str, int] = {}
     for r in all_results:
@@ -1586,35 +1613,91 @@ def _compute_jersey_color(all_results: list[dict]) -> str:
             continue
         for p in ann["evaluated"]:
             color = p.get("cloth_color", "N/A")
-            if not p["is_blurry"] and color not in ("N/A", "Unknown"):
+            if color not in ("N/A", "Unknown"):
                 counts[color] = counts.get(color, 0) + 1
     if not counts:
         return "Unknown"
     summary = "  ".join(f"{c}={n}" for c, n in sorted(counts.items(), key=lambda x: -x[1]))
-    log.info("Jersey colour distribution (sharp persons): %s", summary)
+    log.info("Jersey colour distribution (all evaluated persons): %s", summary)
     return max(counts, key=counts.__getitem__)
 
 
-def _recompute_verdicts(all_results: list[dict], our_jersey_color: str) -> list[dict]:
+def _recompute_verdicts(
+    all_results: list[dict],
+    our_jersey_color: str,
+    *,
+    threshold: float,
+    jersey_colors: frozenset[str],
+) -> list[dict]:
     """
-    Re-evaluate image-level verdicts: an image is considered sharp only when
-    at least one sharp body wears our_jersey_color.  Mutates all_results in
-    place and returns the updated blurry list.
+    Re-evaluate image-level verdicts from extracted phase-1 data.
+
+    A body passes only when all of these hold:
+    1) it was qualified in phase 1 (face/keypoint/size checks),
+    2) it matches --jerseycolor allow-list (when provided),
+    3) it matches the polled jersey color (when known),
+    4) its sharpness score is above threshold.
     """
     blurry: list[dict] = []
     for r in all_results:
-        if r["status"] not in ("blurry", "sharp"):
+        if r.get("status") not in ("analysed", "blurry", "sharp"):
             continue
         ann = r.get("_annotation_data")
         if ann is None:
             continue
-        has_our_player = any(
-            not p["is_blurry"] and p.get("cloth_color") == our_jersey_color
-            for p in ann["evaluated"]
-        )
+
+        has_our_player = False
+        best_pass_score = -1.0
+        best_pass_lap = 0.0
+        best_pass_ten = 0.0
+        best_any_score = 0.0
+        best_any_lap = 0.0
+        best_any_ten = 0.0
+
+        for p in ann["evaluated"]:
+            score = float(p.get("sharpness_score", 0.0))
+            if score > best_any_score:
+                best_any_score = score
+                best_any_lap = float(p.get("lap_var", 0.0))
+                best_any_ten = float(p.get("ten", 0.0))
+
+            passes = bool(p.get("qualified_for_sharpness", False))
+            color = p.get("cloth_color", "N/A")
+
+            if passes and jersey_colors and not _matches_allowed_jersey_color(color, jersey_colors):
+                passes = False
+            if passes and our_jersey_color != "Unknown" and color != our_jersey_color:
+                passes = False
+            if passes and score <= threshold:
+                passes = False
+
+            p["is_blurry"] = not passes
+            if passes:
+                has_our_player = True
+                if score > best_pass_score:
+                    best_pass_score = score
+                    best_pass_lap = float(p.get("lap_var", 0.0))
+                    best_pass_ten = float(p.get("ten", 0.0))
+
         new_blurry = not has_our_player
         ann["overall_blurry"] = new_blurry
         r["status"] = "blurry" if new_blurry else "sharp"
+
+        # Keep top-line metrics aligned with final pass/fail logic.
+        if new_blurry:
+            r["sharpness_score"] = round(best_any_score, 4)
+            r["laplacian_variance"] = round(best_any_lap, 2)
+            r["tenengrad_score"] = round(best_any_ten, 2)
+        else:
+            r["sharpness_score"] = round(best_pass_score, 4)
+            r["laplacian_variance"] = round(best_pass_lap, 2)
+            r["tenengrad_score"] = round(best_pass_ten, 2)
+        r["sharpness_grade"] = round(float(r["sharpness_score"]) * 100, 1)
+
+        # Update per-person CSV verdict text for phase-2 outcome.
+        for pd, p in zip(r.get("persons_detail", []), ann["evaluated"]):
+            pd["verdict"] = "Blur" if p.get("is_blurry", True) else "Sharp"
+
         r.pop("star_rating", None)
         if new_blurry:
             r["star_rating"] = 1
@@ -1704,6 +1787,8 @@ def main() -> None:
         help=(
             "Semicolon-separated list of jersey colours that qualify for "
             "evaluation and annotation (case-insensitive).  "
+            "Each entry can be a hue (e.g. blue) or a full hue+shade "
+            "label (e.g. blue, navy).  "
             "Only persons wearing one of these colours are scored for sharpness "
             "and drawn in preview images.  "
             "Default: blue;white;purple;orange.  "
