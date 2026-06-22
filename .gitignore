@@ -21,6 +21,6 @@ lw/
 # Event-specific working directories (local only)
 efc2023/
 efc2025/
-
+TestImages/
 # VS Code workspace settings (personal, not shared)
 .vscode/

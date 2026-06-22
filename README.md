@@ -44,7 +44,7 @@ The tool is split into two steps so you can review and override the automatic cl
 ### Step 1 — Score and annotate
 
 ```
-python 1_prep_review.py <image_or_directory> [--sensitivity low|medium|high] [--output <dir>]
+python 1_prep_review.py <image_or_directory> [--sensitivity low|medium|high] [--output <dir>] [--skip-facereco]
 ```
 
 Scores every image and writes an output folder:
@@ -58,7 +58,12 @@ Scores every image and writes an output folder:
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
     run.log           ← full debug log
+    .FaceReco/        ← face recognition clusters (unless --skip-facereco)
 ```
+
+**Face Recognition (optional):**
+
+By default, after annotation previews are generated, face recognition automatically clusters faces from sharp, in-team bodies using the Facenet provider. The output is stored in `.FaceReco/` within the same output directory. You can switch back to dlib with `4_face_reco.py --provider dlib`, or disable the auto-run with `--skip-facereco`.
 
 **Sensitivity thresholds** (score ≤ threshold → blurry):
 
@@ -104,6 +109,53 @@ Compares what previews remain against `info.json` and moves original source file
 | `anno_skipped/` | Move original → `<SrcDir>/Skipped/` | Leave original in place |
 
 No files are ever deleted. Writes an `apply.log` to `<ref_dir>` when done.
+
+### Step 4 - Face Recognition Clustering (Integrated into Step 1)
+
+Face recognition now runs automatically at the end of Step 1 unless `--skip-facereco` is used. It processes all bodies with `sharpness_score >= min(sensitivity_threshold, 0.03)`, regardless of blur status or team. If you want to run it independently with different parameters:
+
+```
+python 4_face_reco.py <ref_dir> [--provider dlib] [--cluster-threshold 0.68] [--face-buffer-ratio 0.20] [--min-sharpness 0.03]
+```
+
+**Filtering logic:**
+- Keeps only bodies with `sharpness_score >= min(sensitivity_threshold, 0.03)`
+- Processes all bodies regardless of blur status or team (allows reviewing even blurry faces)
+- Default minimum sharpness is 0.03 (very permissive)
+
+**What it does:**
+1. Loads per-body data from `results.json`
+2. Extracts dlib face embeddings from qualifying bodies
+3. Clusters likely same-person faces by cosine similarity (default threshold: 0.68)
+4. Writes face crops and metadata to `<ref_dir>/.FaceReco/`
+
+Output layout (within Phase 1 output directory):
+
+```
+<ref_dir>/.FaceReco/
+    0000/
+        Face/           ← qualified body faces
+        Negative/       ← faces from other clusters
+        face.json       ← editable metadata
+    0001/
+        Face/
+        Negative/
+        face.json
+```
+
+Each `face.json` stores editable person metadata (`name`, `playernum`) and a `faces` list with:
+
+- original filename
+- original body JSON payload  
+- crop file name
+- confidence
+- embedding payload (float32, base64-encoded)
+
+Provider API and implementations live under the `facereco/` module:
+
+- `facereco/providers/base.py` - abstract provider interface
+- `facereco/providers/dlib_provider.py` - dlib implementation
+- `facereco/providers/facenet_provider.py` - FaceNet (facenet-pytorch / VGGFace2) implementation
 
 ---
 

@@ -32,16 +32,58 @@ import json
 import logging
 import sys
 import urllib.request
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from algo.config import AppConfig, app_config
+from algo.models import Body, Box, Face, Point, PredictedKeyPoint
+from algo.scorers import (
+    BodyArrayScorer,
+    BodyArrayScorerBase,
+    BodyHeadKPVisibilityScorer,
+    BodyScorerBase,
+    FaceLandmarkVisibilityScorer,
+    FaceSharpnessScorer,
+    FaceSizeScorer,
+    JerseyColorScorer,
+    MatchedFaceScorer,
+)
+from algo.sharpness import (
+    GeometricMeanEvaluator,
+    LaplacianTenengradEvaluator,
+    SharpnessEvaluator,
+    sharpness_evaluator,
+)
+from algo.utils import (
+    _HEAD_KP_INDICES,
+    _matches_allowed_jersey_color,
+    _narrow_face_box,
+    cap_long_edge,
+)
 
 import cv2
 import numpy as np
 import rawpy
 from ultralytics import YOLO
+
+try:
+    from facereco.pipeline import FaceRecoConfig, FaceRecoPipeline
+    _FACERECO_AVAILABLE = True
+except ImportError:
+    _FACERECO_AVAILABLE = False
+
+try:
+    from facereco.providers.facenet_provider import FaceNetFaceRecoProvider
+    _FACENET_AVAILABLE = True
+except ImportError:
+    _FACENET_AVAILABLE = False
+
+try:
+    from facereco.providers.dlib_provider import DlibFaceRecoProvider
+    _DLIB_AVAILABLE = True
+except ImportError:
+    _DLIB_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -82,69 +124,6 @@ _COCO_SKELETON: tuple[tuple[int, int], ...] = (
 )
 
 
-@dataclass
-class AppConfig:
-    # Bounding box and status icon drawn on annotated preview images.
-    # Colors are BGR (OpenCV convention).
-    annotation_box_color_pass: tuple[int, int, int] = field(default=(255, 0, 0))  # blue  – sharp
-    annotation_box_color_fail: tuple[int, int, int] = field(default=(0,   0, 255))  # red   – blurry
-    annotation_box_thickness:  int                  = 3
-    annotation_icon_size:      int                  = 50  # px, drawn on the resized preview
-
-    # Subject selection: prefer the largest person whose face is at least
-    # half-visible, judged by how many face keypoints (out of 5) are
-    # detected with confidence >= face_kp_conf_threshold.
-    # Set face_kp_min_visible = 0 to disable face-visibility filtering.
-    face_kp_min_visible:    int   = 2    # ≥ 3 of 5 face KPs must be confident
-    face_kp_conf_threshold: float = 0.5  # per-keypoint confidence cutoff
-
-    # Face-coverage check using the face model's 5 landmarks (eyes / nose / mouth).
-    # A matched face is disqualified when fewer than face_coverage_min_visible
-    # of its landmarks are confident — meaning the face is more than
-    # (1 - face_coverage_min_visible/5) covered.
-    # Set face_coverage_min_visible = 0 to disable the check.
-    face_coverage_min_visible:    int   = 2    # ≥ 3 of 5 face-model landmarks must be confident
-    face_coverage_conf_threshold: float = 0.75  # per-landmark confidence cutoff
-
-    # Minimum face size: disqualify persons whose face bbox long edge is smaller
-    # than this fraction of the image long edge (e.g. 0.04 = 4 %).
-    # Filters out background spectators or faces too small to reliably analyse.
-    # Set to 0 to disable.
-    face_min_size_fraction: float = 0.025
-
-    # If True, sharpness is scored on the minimal bbox enclosing the 5 face
-    # landmarks rather than the face model's full detection bbox.
-    # Falls back to the full bbox when fewer than 2 landmarks are detected.
-    use_narrow_face_box: bool = True
-
-    # Face bounding box drawn on annotated previews (separate from the body box).
-    annotation_face_box_color:        tuple[int, int, int] = field(default=(0, 255, 255))  # yellow
-    annotation_face_box_thickness:    int                  = 1
-    # Narrow face bbox: minimal box enclosing the 5 face landmarks.
-    annotation_narrow_face_box_color:     tuple[int, int, int] = field(default=(0, 255, 0))  # green
-    annotation_narrow_face_box_thickness: int                  = 1
-    # Blur score label drawn below each face bounding box.
-    annotation_score_font_size_px:    int   = 20   # target text height in pixels
-    annotation_score_font_thickness:  int   = 3
-    # Face landmark circle.
-    annotation_face_kp_radius:        int   = 3    # circle radius (px)
-    annotation_face_kp_thickness:     int   = 1    # circle line thickness
-    # Body keypoint square.
-    annotation_body_kp_size:          int   = 3    # square side (px)
-    annotation_body_kp_thickness:     int   = 1    # square line thickness
-    # Body skeleton line.
-    annotation_skeleton_thickness:    int   = 1    # line thickness (px)
-    # Annotation opacity: 1.0 = fully opaque, 0.0 = invisible.
-    annotation_alpha:                 float = 0.25
-
-    # Annotated preview / processing image scaling.
-    # Images are downsized so the long edge equals normalized_img_max_long_edge.
-    # Never upscales.
-    normalized_img_max_long_edge: int = 1800
-
-
-app_config = AppConfig()
-
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -173,86 +152,6 @@ def _add_file_logging(log_path: Path) -> None:
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s"))
     log.addHandler(fh)
     log.debug("Log file opened: %s", log_path.resolve())
-
-
-# ---------------------------------------------------------------------------
-# Sharpness evaluation
-# ---------------------------------------------------------------------------
-
-class SharpnessEvaluator(ABC):
-    """Interface for face-crop sharpness evaluation."""
-
-    @abstractmethod
-    def score(self, gray: np.ndarray) -> tuple[float, float, float]:
-        """
-        Compute a normalised sharpness score for a greyscale image patch.
-
-        Returns
-        -------
-        sharpness_score : float in [0, 1]  — 1 = perfectly sharp, 0 = completely blurry
-        metric_a        : float            — first raw metric value
-        metric_b        : float            — second raw metric value
-        """
-
-
-class LaplacianTenengradEvaluator(SharpnessEvaluator):
-    """
-    Sharpness evaluator combining Laplacian variance and Tenengrad.
-
-    Each raw metric is normalised with  1 / (1 + x / scale), where *scale* is
-    calibrated so that a value at the scale equals 0.5 — placing it on the
-    medium sensitivity boundary.  The two components are then blended 60 / 40
-    and inverted so that 1 = sharp and 0 = blurry.
-    """
-
-    _LAP_SCALE: float = 100.0    # Laplacian variance reference
-    _TEN_SCALE: float = 5_000.0  # Tenengrad reference
-
-    def score(self, gray: np.ndarray) -> tuple[float, float, float]:
-        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        gx      = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy      = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        ten     = float(np.mean(gx ** 2 + gy ** 2))
-
-        # Map each raw metric to a blur component in (0, 1) using a monotone-
-        # decreasing curve; sharper images yield blur components closer to 0.
-        lap_component = 1.0 / (1.0 + lap_var / self._LAP_SCALE)
-        ten_component = 1.0 / (1.0 + ten    / self._TEN_SCALE)
-
-        # Weighted combination then invert so that 1 = sharp, 0 = blurry.
-        blur = float(np.clip(0.6 * lap_component + 0.4 * ten_component, 0.0, 1.0))
-        return 1.0 - blur, lap_var, ten
-
-
-class GeometricMeanEvaluator(SharpnessEvaluator):
-    """
-    Sharpness evaluator using the geometric mean of Laplacian variance and Tenengrad.
-
-    Unlike the weighted-average approach, the geometric mean only scores high
-    when *both* metrics agree — penalising mismatches where one metric is
-    inflated by noise, compression artefacts, eyelashes, or over-sharpening
-    while the other stays low.
-
-    score = sqrt((1 - lap_component) * (1 - ten_component))
-    """
-
-    _LAP_SCALE: float = 100.0
-    _TEN_SCALE: float = 5_000.0
-
-    def score(self, gray: np.ndarray) -> tuple[float, float, float]:
-        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        gx      = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy      = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        ten     = float(np.mean(gx ** 2 + gy ** 2))
-
-        lap_sharp = 1.0 - 1.0 / (1.0 + lap_var / self._LAP_SCALE)
-        ten_sharp = 1.0 - 1.0 / (1.0 + ten    / self._TEN_SCALE)
-
-        score = float(np.sqrt(np.clip(lap_sharp * ten_sharp, 0.0, 1.0)))
-        return score, lap_var, ten
-
-
-sharpness_evaluator: SharpnessEvaluator = GeometricMeanEvaluator()
 
 
 # ---------------------------------------------------------------------------
@@ -296,159 +195,12 @@ def _draw_status_icon(
         cv2.line(image, p1, p2, (255, 255, 255), lw, cv2.LINE_AA)
         cv2.line(image, p3, p4, (255, 255, 255), lw, cv2.LINE_AA)
 
-def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:
-    """
-    Downsize *image* so its long edge is at most *max_long_edge* pixels.
-    Never upscales — returns the original array when it is already smaller.
-    """
-    h, w = image.shape[:2]
-    scale = min(1.0, max_long_edge / max(h, w))
-    if scale >= 1.0:
-        return image
-    return cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-
 def normalize_img_size(image: np.ndarray) -> np.ndarray:
     """
     Downsize *image* so its long edge equals app_config.normalized_img_max_long_edge.
     Never upscales — returns the original array when it is already smaller.
     """
     return cap_long_edge(image, app_config.normalized_img_max_long_edge)
-
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Point:
-    """A 2-D coordinate in pixel space."""
-    x: int
-    y: int
-
-
-@dataclass
-class Box:
-    """Axis-aligned bounding box: top-left (x1, y1) → bottom-right (x2, y2)."""
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-
-    @property
-    def width(self) -> int:
-        return self.x2 - self.x1
-
-    @property
-    def height(self) -> int:
-        return self.y2 - self.y1
-
-    @property
-    def area(self) -> int:
-        return self.width * self.height
-
-    @property
-    def centre(self) -> Point:
-        return Point((self.x1 + self.x2) // 2, (self.y1 + self.y2) // 2)
-
-    def contains(self, p: Point) -> bool:
-        """Return True if *p* lies inside or on the boundary of this box."""
-        return self.x1 <= p.x <= self.x2 and self.y1 <= p.y <= self.y2
-
-    def contains_xy(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
-        """Vectorised containment test — returns a boolean mask over the input arrays."""
-        return (xs >= self.x1) & (xs <= self.x2) & (ys >= self.y1) & (ys <= self.y2)
-
-    def padded(self, pad: int, max_w: int, max_h: int) -> "Box":
-        """Return a copy expanded by *pad* pixels on every side, clamped to image bounds."""
-        return Box(
-            max(0,     self.x1 - pad),
-            max(0,     self.y1 - pad),
-            min(max_w, self.x2 + pad),
-            min(max_h, self.y2 + pad),
-        )
-
-    def as_ints(self) -> tuple[int, int, int, int]:
-        return self.x1, self.y1, self.x2, self.y2
-
-    def overlaps(self, other: "Box") -> bool:
-        """Return True if this box and *other* share any area."""
-        return (
-            self.x1 < other.x2 and self.x2 > other.x1 and
-            self.y1 < other.y2 and self.y2 > other.y1
-        )
-
-
-@dataclass
-class PredictedKeyPoint:
-    """A detected keypoint with its confidence score and pass/fail verdict."""
-    point:      Point
-    confidence: float
-    passed:     bool = True   # scorers set this to False to disqualify
-
-
-@dataclass
-class Face:
-    """A detected face: bounding box, detection confidence, and optional landmarks."""
-    bbox:       Box
-    confidence: float               # detection confidence from the face model
-    landmarks:  list[PredictedKeyPoint]  # 5 face-model landmarks (empty if unavailable)
-    passed:     bool = True          # scorers set this to False to disqualify
-
-    def n_visible(self) -> int:
-        """Count landmarks that have passed classification."""
-        return sum(1 for lm in self.landmarks if lm.passed)
-
-
-@dataclass
-class Body:
-    """A detected person ready for sharpness analysis."""
-    crop:              np.ndarray                # face image crop (BGR) used for blur scoring
-    bbox:              Box                       # body bounding box (padded, clamped)
-    faces:             list[Face]                # matched faces (may be empty before face matching)
-    keypoints:         list[PredictedKeyPoint]   # 17 COCO body keypoints
-    passed:            bool        = True        # scorers set this to False to disqualify
-    sharpness_score:   float       = 0.0         # best face sharpness score (set by FaceSharpnessScorer)
-    best_face:         Face | None = None        # face that yielded sharpness_score
-    best_narrow_box:   Box  | None = None        # narrow landmark bbox for best_face
-    lap_var:           float       = 0.0         # Laplacian variance of best face crop
-    ten:               float       = 0.0         # Tenengrad of best face crop
-    cloth_color:       str         = "N/A"       # predicted jersey/cloth color
-    cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean LAB
-
-
-# ---------------------------------------------------------------------------
-# Scoring base classes
-# ---------------------------------------------------------------------------
-
-class BodyArrayScorerBase(ABC):
-    """
-    Pipeline stage that operates on the full list of detected bodies for one
-    image.  Implementations may score, filter, rank, or augment the list.
-
-    Parameters
-    ----------
-    normalized_image : normalised BGR image used as context (e.g. for cropping).
-    bodies           : body objects as produced by the detection phase.
-
-    Returns the (possibly modified or filtered) body list.
-    """
-
-    @abstractmethod
-    def process(self, normalized_image: np.ndarray, bodies: list[Body]) -> list[Body]:
-        ...
-
-
-class BodyScorerBase(ABC):
-    """
-    Scorer that evaluates a single Body and returns an updated Body with
-    the pass/fail verdict written to body.passed (and optionally to its
-    faces / keypoints).  Scorers use a turn-off strategy: set passed=False
-    to disqualify; leave it True to keep the default passing state.
-    """
-
-    @abstractmethod
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        ...
 
 
 def _read_image(path: Path) -> np.ndarray | None:
@@ -502,15 +254,16 @@ def extract_bodies(image: np.ndarray, pose_model: YOLO) -> list[Body]:
 
     bodies: list[Body] = []
     for idx in top:
-        body_box = Box(*boxes[idx].astype(int)).padded(pad, w, h)
+        body_box = Box.from_px(*boxes[idx], w, h).padded(pad, w, h)
         if kps_data is not None:
             kps_raw   = kps_data[idx]   # (17, 3)
-            keypoints = [PredictedKeyPoint(Point(int(kps_raw[i, 0]), int(kps_raw[i, 1])), float(kps_raw[i, 2]))
+            keypoints = [PredictedKeyPoint(Point.from_px(kps_raw[i, 0], kps_raw[i, 1], w, h), float(kps_raw[i, 2]))
                          for i in range(len(kps_raw))]
         else:
             keypoints = []
+        px1, py1, px2, py2 = body_box.as_px_ints(w, h)
         log.debug("[bodies]   body[%d]: bbox=(%d,%d,%d,%d) area=%.0f kps=%d",
-                  idx, body_box.x1, body_box.y1, body_box.x2, body_box.y2, areas[idx], len(keypoints))
+                  idx, px1, py1, px2, py2, areas[idx], len(keypoints))
         bodies.append(Body(
             crop=np.empty((0, 0, 3), dtype=np.uint8),  # filled after face matching
             bbox=body_box,
@@ -545,13 +298,12 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
         return []
 
     log.debug("[faces] face model pass-1: %d raw detection(s)", len(fdet_boxes))
-    min_size = app_config.face_min_size_fraction * max(h, w)
-
     faces: list[Face] = []
     for f_idx in range(len(fdet_boxes)):
-        face_box = Box(
-            int(fdet_boxes[f_idx, 0]), int(fdet_boxes[f_idx, 1]),
-            int(fdet_boxes[f_idx, 2]), int(fdet_boxes[f_idx, 3]),
+        face_box = Box.from_px(
+            fdet_boxes[f_idx, 0], fdet_boxes[f_idx, 1],
+            fdet_boxes[f_idx, 2], fdet_boxes[f_idx, 3],
+            w, h,
         )
 
         if face_box.width <= 0 or face_box.height <= 0:
@@ -560,9 +312,10 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
         # Size filter.
         if app_config.face_min_size_fraction > 0:
             face_long = max(face_box.width, face_box.height)
-            if face_long < min_size:
-                log.debug("[faces] face[%d]: %.0fx%.0f too small (min=%.1f) — skipped",
-                          f_idx, face_box.width, face_box.height, min_size)
+            if face_long < app_config.face_min_size_fraction:
+                px1, py1, px2, py2 = face_box.as_px_ints(w, h)
+                log.debug("[faces] face[%d]: %dx%d too small (min=%.3f) — skipped",
+                          f_idx, px2 - px1, py2 - py1, app_config.face_min_size_fraction)
                 continue
 
         # ------------------------------------------------------------------
@@ -572,9 +325,10 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
         # will disqualify it (n_visible() == 0 < min_visible).
         # ------------------------------------------------------------------
         landmarks: list[PredictedKeyPoint] = []
-        crop_pad = max(10, int(max(face_box.width, face_box.height) * 0.2))
+        px1, py1, px2, py2 = face_box.as_px_ints(w, h)
+        crop_pad = max(10, int(max(px2 - px1, py2 - py1) * 0.2))
         crop_box = face_box.padded(crop_pad, w, h)
-        cx1, cy1, cx2, cy2 = crop_box.as_ints()
+        cx1, cy1, cx2, cy2 = crop_box.as_px_ints(w, h)
         face_crop = image[cy1:cy2, cx1:cx2]
 
         if face_crop.size > 0:
@@ -590,7 +344,7 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
 
                 kps_raw2 = crop_results[0].keypoints.data.cpu().numpy()[best]  # (5, 3)
                 # Translate crop-local coordinates back to full-image space.
-                landmarks = [PredictedKeyPoint(Point(int(kps_raw2[i, 0]) + cx1, int(kps_raw2[i, 1]) + cy1),
+                landmarks = [PredictedKeyPoint(Point.from_px(int(kps_raw2[i, 0]) + cx1, int(kps_raw2[i, 1]) + cy1, w, h),
                                                float(kps_raw2[i, 2]))
                              for i in range(len(kps_raw2))]
                 log.debug("[faces] face[%d]: pass-2 landmarks from crop (%d,%d,%d,%d)",
@@ -611,9 +365,6 @@ def extract_faces(image: np.ndarray, face_model: YOLO) -> list[Face]:
     return faces
 
 
-_HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)  # nose, eyes, ears
-
-
 def _head_region(body: Body, conf_threshold: float = 0.3) -> Box | None:
     """Return the bounding box of confident head keypoints (indices 0-4),
     or None if fewer than 2 are detected."""
@@ -631,27 +382,6 @@ def _head_region(body: Body, conf_threshold: float = 0.3) -> Box | None:
     return Box(min(xs), min(ys), max(xs), max(ys))
 
 
-def _narrow_face_box(
-    face: Face,
-    conf_threshold: float = 0.3,
-    pad: int = 0,
-    img_w: int | None = None,
-    img_h: int | None = None,
-) -> Box | None:
-    """Return the minimal bounding box enclosing the confident face landmarks,
-    expanded by *pad* pixels on every side and clamped to the image bounds.
-    Returns None if fewer than 2 landmarks are detected."""
-    xs = [lm.point.x for lm in face.landmarks if lm.confidence >= conf_threshold]
-    ys = [lm.point.y for lm in face.landmarks if lm.confidence >= conf_threshold]
-    if len(xs) < 2:
-        return None
-    x1 = max(0, min(xs) - pad)
-    y1 = max(0, min(ys) - pad)
-    x2 = min(img_w - 1, max(xs) + pad) if img_w is not None else max(xs) + pad
-    y2 = min(img_h - 1, max(ys) + pad) if img_h is not None else max(ys) + pad
-    return Box(x1, y1, x2, y2)
-
-
 def match_faces_to_bodies(bodies: list[Body], faces: list[Face]) -> None:
     """Assign each face to every body whose head-keypoint region overlaps the
     face bbox.  Falls back to the body bbox when head keypoints are absent.
@@ -659,9 +389,9 @@ def match_faces_to_bodies(bodies: list[Body], faces: list[Face]) -> None:
     for face in faces:
         for body in bodies:
             region = _head_region(body) or body.bbox
-            if region.overlaps(face.bbox):
+            if region.overlaps(face.bbox) or body.bbox.overlaps(face.bbox):
                 body.faces.append(face)
-                log.debug("[match]   face conf=%.3f → body head_region=(%d,%d,%d,%d)",
+                log.debug("[match]   face conf=%.3f → body head_region=(%.3f,%.3f,%.3f,%.3f)",
                           face.confidence,
                           region.x1, region.y1, region.x2, region.y2)
 
@@ -706,204 +436,19 @@ def detect_qualified_persons(
     # ------------------------------------------------------------------
     for body in bodies:
         if body.faces:
-            fx1, fy1, fx2, fy2 = body.faces[0].bbox.as_ints()
+            fx1, fy1, fx2, fy2 = body.faces[0].bbox.as_px_ints(image.shape[1], image.shape[0])
             body.crop = image[fy1:fy2, fx1:fx2]
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(image.shape[1], image.shape[0])
             log.debug("[detect]   body bbox=(%d,%d,%d,%d): %d face(s), crop %.0fx%.0f",
-                      body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2,
-                      len(body.faces), body.faces[0].bbox.width, body.faces[0].bbox.height)
+                      bx1, by1, bx2, by2,
+                      len(body.faces), body.faces[0].bbox.width * image.shape[1], body.faces[0].bbox.height * image.shape[0])
         else:
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(image.shape[1], image.shape[0])
             log.debug("[detect]   body bbox=(%d,%d,%d,%d): no matched face",
-                      body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2)
+                      bx1, by1, bx2, by2)
 
     log.debug("[detect] result: %d body(ies) returned", len(bodies))
     return bodies, True
-
-
-# ---------------------------------------------------------------------------
-# Scorer implementations
-# ---------------------------------------------------------------------------
-
-class MatchedFaceScorer(BodyScorerBase):
-    """Rule 5 — body must have at least one matched face.
-    Should run first: bodies with no face cannot be sharpness-scored."""
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        if not body.faces:
-            body.passed = False
-            log.debug("[scorer:matched_face] body bbox=(%d,%d,%d,%d): no matched face → fail",
-                      body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2)
-        return body
-
-
-class FaceSizeScorer(BodyScorerBase):
-    """Rule 1 — every face bbox long edge must be >= min_fraction × image long edge.
-    Faces that are too small are disqualified; if all faces on a body fail,
-    the body is also disqualified."""
-
-    def __init__(self, min_fraction: float | None = None) -> None:
-        self.min_fraction = min_fraction if min_fraction is not None \
-                            else app_config.face_min_size_fraction
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        if self.min_fraction <= 0:
-            return body
-        h, w   = normalized_image.shape[:2]
-        min_px = self.min_fraction * max(h, w)
-        for face in body.faces:
-            face_long = max(face.bbox.width, face.bbox.height)
-            if face_long < min_px:
-                face.passed = False
-                log.debug("[scorer:face_size] face bbox=(%d,%d,%d,%d): long_edge=%.0f < min=%.1f → fail",
-                          face.bbox.x1, face.bbox.y1, face.bbox.x2, face.bbox.y2,
-                          face_long, min_px)
-        if body.faces and not any(f.passed for f in body.faces):
-            body.passed = False
-        return body
-
-
-class BodyHeadKPVisibilityScorer(BodyScorerBase):
-    """Rule 3 — the pose model must see at least min_visible of the 5 head
-    keypoints (nose, eyes, ears) with confidence >= conf_threshold.
-    Individual keypoints below the threshold are marked passed=False."""
-
-    def __init__(
-        self,
-        min_visible:    int   | None = None,
-        conf_threshold: float | None = None,
-    ) -> None:
-        self.min_visible    = min_visible    if min_visible    is not None \
-                              else app_config.face_kp_min_visible
-        self.conf_threshold = conf_threshold if conf_threshold is not None \
-                              else app_config.face_kp_conf_threshold
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        if self.min_visible <= 0:
-            return body
-        for i in _HEAD_KP_INDICES:
-            if i < len(body.keypoints) and \
-               body.keypoints[i].confidence < self.conf_threshold:
-                body.keypoints[i].passed = False
-        n_vis = sum(
-            1 for i in _HEAD_KP_INDICES
-            if i < len(body.keypoints) and body.keypoints[i].passed
-        )
-        if n_vis < self.min_visible:
-            body.passed = False
-            log.debug("[scorer:head_kp] body bbox=(%d,%d,%d,%d): %d/%d head KPs visible (need %d) → fail",
-                      body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2,
-                      n_vis, len(_HEAD_KP_INDICES), self.min_visible)
-        return body
-
-
-class FaceLandmarkVisibilityScorer(BodyScorerBase):
-    """Rule 4 — for each face, at least min_visible of the 5 face-model landmarks
-    must have confidence >= conf_threshold (i.e. the face must not be covered).
-    Individual landmarks and faces below the threshold are marked passed=False.
-    If all faces on a body fail, the body is also disqualified."""
-
-    def __init__(
-        self,
-        min_visible:    int   | None = None,
-        conf_threshold: float | None = None,
-    ) -> None:
-        self.min_visible    = min_visible    if min_visible    is not None \
-                              else app_config.face_coverage_min_visible
-        self.conf_threshold = conf_threshold if conf_threshold is not None \
-                              else app_config.face_coverage_conf_threshold
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        if self.min_visible <= 0:
-            return body
-        for face in body.faces:
-            if not face.passed:
-                continue
-            for lm in face.landmarks:
-                if lm.confidence < self.conf_threshold:
-                    lm.passed = False
-            n_vis = face.n_visible()
-            if n_vis < self.min_visible:
-                face.passed = False
-                log.debug("[scorer:face_landmark] face bbox=(%d,%d,%d,%d): %d/%d landmarks visible (need %d) → fail",
-                          face.bbox.x1, face.bbox.y1, face.bbox.x2, face.bbox.y2,
-                          n_vis, len(face.landmarks), self.min_visible)
-        if body.faces and not any(f.passed for f in body.faces):
-            body.passed = False
-        return body
-
-
-class FaceSharpnessScorer(BodyScorerBase):
-    """Rule 2 — the best sharpness score across all passing faces must exceed
-    the threshold.  Uses the narrow landmark bbox when available, falling back
-    to the full face bbox."""
-
-    def __init__(self, threshold: float) -> None:
-        self.threshold = threshold
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        h, w        = normalized_image.shape[:2]
-        narrow_pad  = round(0.005 * max(h, w))
-        best_score  = 0.0
-        best_face:   Face | None = None
-        best_narrow: Box  | None = None
-        best_lap    = 0.0
-        best_ten    = 0.0
-        for face in body.faces:
-            if not face.passed:
-                continue
-            narrow_box = _narrow_face_box(face, pad=narrow_pad, img_w=w, img_h=h) \
-                         if app_config.use_narrow_face_box else None
-            score_box  = narrow_box or face.bbox
-            fx1, fy1, fx2, fy2 = score_box.as_ints()
-            crop = normalized_image[fy1:fy2, fx1:fx2]
-            if crop.size == 0:
-                continue
-            crop = cap_long_edge(crop, max(h, w) * 0.04)
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            s, lv, t = sharpness_evaluator.score(gray)
-            log.debug("[scorer:sharpness] face conf=%.3f score=%.4f (lap=%.2f ten=%.2f)",
-                      face.confidence, s, lv, t)
-            if s > best_score:
-                best_score   = s
-                best_face    = face
-                best_narrow  = narrow_box
-                best_lap     = lv
-                best_ten     = t
-        body.sharpness_score = best_score
-        body.best_face       = best_face
-        body.best_narrow_box = best_narrow
-        body.lap_var         = best_lap
-        body.ten             = best_ten
-        if best_score <= self.threshold:
-            body.passed = False
-            log.debug("[scorer:sharpness] body bbox=(%d,%d,%d,%d): best_score=%.4f <= threshold=%.2f → fail",
-                      body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2,
-                      best_score, self.threshold)
-        return body
-
-
-class BodyArrayScorer(BodyArrayScorerBase):
-    """Runs a sequence of BodyScorerBase scorers over every body in the list.
-
-    normalized_image is forwarded to every binary_classify call so scorers
-    that need to crop from it receive it directly.
-
-    Short-circuits per body: once a body is marked passed=False no further
-    scorers are called on it (avoids expensive work on already-failed bodies).
-
-    Returns all bodies with their passed flags updated — callers decide
-    whether to keep or discard failed bodies.
-    """
-
-    def __init__(self, scorers: list[BodyScorerBase]) -> None:
-        self._scorers = scorers
-
-    def process(self, normalized_image: np.ndarray, bodies: list[Body]) -> list[Body]:
-        for body in bodies:
-            for scorer in self._scorers:
-                body = scorer.binary_classify(body, normalized_image)
-                if not body.passed:
-                    break  # short-circuit: no point scoring a disqualified body
-        return bodies
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +489,9 @@ class ClothColorPredictor:
         "Blue, Navy":      ( 15.0,   5.0, -25.0),
         "Purple, Violet":  ( 30.0,  30.0, -35.0),
         "White, Bright":   ( 95.0,   0.0,   0.0),
+        "Gray, 75%":       ( 75.0,   0.0,   0.0),
         "Gray, Medium":    ( 50.0,   0.0,   0.0),
+        "Gray, 25%":       ( 25.0,   0.0,   0.0),
         "Black, Deep":     (  8.0,   0.0,   0.0),
     }
 
@@ -998,24 +545,32 @@ class ClothColorPredictor:
     def _torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
         h_img, w_img = image.shape[:2]
         kps  = body.keypoints
-        pts  = [
-            (kps[i].point.x, kps[i].point.y)
+        pts = [
+            (kps[i].point.x * w_img, kps[i].point.y * h_img)
             for i in self._TORSO_KP_INDICES
             if i < len(kps) and kps[i].confidence >= self._TORSO_KP_CONF
         ]
         if len(pts) >= 2:
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            x1 = max(0,         min(xs))
-            y1 = max(0,         min(ys))
-            x2 = min(w_img - 1, max(xs))
-            y2 = min(h_img - 1, max(ys))
+            x1 = max(0, int(np.floor(min(xs))))
+            y1 = max(0, int(np.floor(min(ys))))
+            # Upper bounds are exclusive for numpy slicing.
+            x2 = min(w_img, int(np.ceil(max(xs))))
+            y2 = min(h_img, int(np.ceil(max(ys))))
         else:
             b  = body.bbox
             bh = b.y2 - b.y1
-            x1, x2 = b.x1, b.x2
-            y1 = b.y1 + int(bh * 0.25)   # skip head
-            y2 = b.y2 - int(bh * 0.20)   # skip legs
+            x1 = int(np.floor(b.x1 * w_img))
+            x2 = int(np.ceil(b.x2 * w_img))
+            # Skip head and lower legs in normalized coordinates, then convert to px.
+            y1 = int(np.floor((b.y1 + (bh * 0.25)) * h_img))
+            y2 = int(np.ceil((b.y2 - (bh * 0.20)) * h_img))
+
+        x1 = max(0, min(x1, w_img))
+        x2 = max(0, min(x2, w_img))
+        y1 = max(0, min(y1, h_img))
+        y2 = max(0, min(y2, h_img))
         if x2 <= x1 or y2 <= y1:
             return None
         return image[y1:y2, x1:x2]
@@ -1023,44 +578,6 @@ class ClothColorPredictor:
 
 cloth_color_predictor = ClothColorPredictor()
 
-
-def _matches_allowed_jersey_color(predicted: str, allowed_colors: frozenset[str]) -> bool:
-    """Match either the full label (Hue, Shade) or just the hue."""
-    predicted_norm = (predicted or "").strip().lower()
-    if not predicted_norm:
-        return False
-    predicted_hue = predicted_norm.split(",", 1)[0].strip()
-    for allowed in allowed_colors:
-        allowed_norm = allowed.strip().lower()
-        if not allowed_norm:
-            continue
-        if allowed_norm == predicted_norm or allowed_norm == predicted_hue:
-            return True
-    return False
-
-
-class JerseyColorScorer(BodyScorerBase):
-    """Disqualify bodies whose jersey/cloth color is not in the allowed colour set.
-
-    Must run *after* cloth color has already been predicted for each body.
-    When *allowed_colors* is empty this scorer is a no-op (all bodies pass).
-    """
-
-    def __init__(self, allowed_colors: frozenset[str]) -> None:
-        self.allowed_colors = allowed_colors
-
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        if not self.allowed_colors:
-            return body
-        color = body.cloth_color
-        if not _matches_allowed_jersey_color(color, self.allowed_colors):
-            body.passed = False
-            log.debug(
-                "[scorer:jersey_color] body bbox=(%d,%d,%d,%d): cloth_color=%s not in %s → fail",
-                body.bbox.x1, body.bbox.y1, body.bbox.x2, body.bbox.y2,
-                color, sorted(self.allowed_colors),
-            )
-        return body
 
 
 # ---------------------------------------------------------------------------
@@ -1101,14 +618,6 @@ def analyse_image(
         log.debug("[analyse] %s — skipped: no person detected", image_path.name)
         return {"file": str(image_path), "status": "skipped", "reason": "No person detected", "persons_detail": [], "_annotation_data": None}
 
-    # Predict cloth colour for ALL bodies during extraction.
-    for person in persons:
-        person.cloth_color, person.cloth_color_detail = cloth_color_predictor.predict(person, normalized_img)
-        log.debug("[colour] %s — body bbox=(%d,%d,%d,%d) cloth_color=%s votes=%s",
-                  image_path.name,
-                  person.bbox.x1, person.bbox.y1, person.bbox.x2, person.bbox.y2,
-                  person.cloth_color, person.cloth_color_detail.get("votes", {}))
-
     # Run extraction scoring only (no jersey filtering, no blur threshold gating).
     # Threshold and jersey-based pass/fail are applied in process() phase 2.
     scorer = BodyArrayScorer([
@@ -1120,11 +629,24 @@ def analyse_image(
     ])
     persons = scorer.process(normalized_img, persons)
 
+    # Predict cloth colour for ALL bodies during extraction.
+    for person in persons:
+        if not person.passed:
+            continue
+
+        person.cloth_color, person.cloth_color_detail = cloth_color_predictor.predict(person, normalized_img)
+        bx1, by1, bx2, by2 = person.bbox.as_px_ints(normalized_img.shape[1], normalized_img.shape[0])
+        log.debug("[colour] %s — body bbox=(%d,%d,%d,%d) cloth_color=%s votes=%s",
+                  image_path.name,
+                  bx1, by1, bx2, by2,
+                  person.cloth_color, person.cloth_color_detail.get("votes", {}))
+        
     evaluated: list[dict] = []
     for person in persons:
         qualified_for_sharpness = bool(person.passed)
+        bx1, by1, bx2, by2 = person.bbox.as_px_ints(normalized_img.shape[1], normalized_img.shape[0])
         log.debug("[analyse] %s — person bbox=%s best_score=%.4f qualified=%s",
-                  image_path.name, person.bbox, person.sharpness_score, qualified_for_sharpness)
+                  image_path.name, (bx1, by1, bx2, by2), person.sharpness_score, qualified_for_sharpness)
         evaluated.append({
             "body_bbox":       person.bbox,
             "body_keypoints":  person.keypoints,
@@ -1155,7 +677,7 @@ def analyse_image(
             kp_confs = ""
         persons_detail.append({
             "verdict":      "Pending",
-            "orig_dim":     f"{b.width:.0f} x {b.height:.0f}",
+            "orig_dim":     f"{b.width * normalized_img.shape[1]:.0f} x {b.height * normalized_img.shape[0]:.0f}",
             "score":        round(p["sharpness_score"], 2),
             "facial_boxes": kp_confs,
         })
@@ -1209,16 +731,15 @@ def annotate_image(result: dict, boxes_dir: Path, jersey_colors: frozenset[str] 
     ann_data       = result["_annotation_data"]
     evaluated      = ann_data["evaluated"]
     overall_blurry = ann_data["overall_blurry"]
-    h_proc, w_proc = ann_data["processing_shape"]
 
-    # Annotate on the original (full-resolution) image; scale all bbox / keypoint
-    # coordinates from processing space (resized) back up to original dimensions.
+    # Coordinates are stored as fractions of image width/height, so convert
+    # directly to the original image dimensions here.
     annotated = image_orig.copy()
     overlay   = annotated.copy()   # all drawing goes here; blended back at the end
     h_out, w_out = annotated.shape[:2]
-    sx = w_out / w_proc
-    sy = h_out / h_proc
-    ann_scale = (sx + sy) / 2  # uniform scale factor for annotation sizes
+    sx = w_out
+    sy = h_out
+    ann_scale = max(h_out, w_out) / app_config.normalized_img_max_long_edge
 
     face_thick    = max(1, round(app_config.annotation_face_box_thickness * ann_scale))
     box_thick     = max(1, round(app_config.annotation_box_thickness * ann_scale))
@@ -1371,7 +892,7 @@ def collect_images(input_path: Path) -> list[Path]:
 def process(
     input_path: Path, sensitivity: str, output_root: Optional[Path] = None,
     jersey_colors: frozenset[str] = frozenset(),
-) -> tuple[list[dict], list[dict], Path, str | None]:
+) -> tuple[list[dict], list[dict], Path, str | None, float]:
     """
     Process all images at *input_path*.
 
@@ -1472,7 +993,7 @@ def process(
         log.debug("[annotate] [%d/%d] %s", idx, len(all_results), Path(result["file"]).name)
         annotate_image(result, boxes_dir, jersey_colors)
 
-    return all_results, blurry, output_dir, polled_jersey_color
+    return all_results, blurry, output_dir, polled_jersey_color, threshold
 
 
 # ---------------------------------------------------------------------------
@@ -1736,6 +1257,40 @@ def write_info_json(
 
 
 # ---------------------------------------------------------------------------
+# Face Recognition
+# ---------------------------------------------------------------------------
+
+def _run_facereco(output_dir: Path, sensitivity_threshold: float) -> None:
+    """Run face recognition pipeline on the Phase 1 output."""
+    if not _FACERECO_AVAILABLE:
+        log.warning(
+            "Face recognition disabled: facereco module not available. "
+            "Install with: pip install facenet-pytorch"
+        )
+        return
+
+    try:
+        log.info("Starting face recognition clustering...")
+        if _FACENET_AVAILABLE:
+            provider = FaceNetFaceRecoProvider()
+        elif _DLIB_AVAILABLE:
+            log.warning("FaceNet provider unavailable; falling back to dlib for this run.")
+            provider = DlibFaceRecoProvider()
+        else:
+            log.warning("No FaceReco provider available. Install facenet-pytorch or face-recognition + dlib.")
+            return
+        config = FaceRecoConfig(
+            cluster_similarity_threshold=0.72,
+            face_buffer_ratio=0.15,
+        )
+        pipeline = FaceRecoPipeline(provider=provider, config=config)
+        facereco_dir = pipeline.run(output_dir)
+        log.info("Face recognition complete: %s", facereco_dir)
+    except Exception as exc:
+        log.error("Face recognition failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1795,11 +1350,29 @@ def main() -> None:
             "Pass an empty string to disable jersey filtering."
         ),
     )
+    parser.add_argument(
+        "--skip-facereco",
+        action="store_true",
+        help=(
+            "Skip face recognition clustering. By default, .FaceReco/ is generated "
+            "under the output directory after preview generation completes. "
+            "Use this flag to disable it (e.g. if dlib is not installed)."
+        ),
+    )
+    parser.add_argument(
+        "--noteam",
+        action="store_true",
+        help=(
+            "Disable jersey-colour filtering. When set, bodies are never "
+            "disqualified for wearing the wrong colour — all detected persons "
+            "are scored regardless of jersey colour. Overrides --jerseycolor."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_console_logging()
-    log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s",
-              args.path, args.sensitivity, args.output, args.jerseycolor)
+    log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s",
+              args.path, args.sensitivity, args.output, args.jerseycolor, args.skip_facereco, args.noteam)
 
     input_path = Path(args.path).resolve()
     if not input_path.exists():
@@ -1807,14 +1380,19 @@ def main() -> None:
         sys.exit(1)
 
     # Parse the semicolon-separated jersey colour list, normalise to title-case.
-    jersey_colors: frozenset[str] = frozenset(
-        c.strip().title()
-        for c in (args.jerseycolor or "").split(";")
-        if c.strip()
-    )
+    # --noteam overrides --jerseycolor and disables all colour filtering.
+    if args.noteam:
+        jersey_colors: frozenset[str] = frozenset()
+        log.info("--noteam: jersey-colour filtering disabled")
+    else:
+        jersey_colors: frozenset[str] = frozenset(
+            c.strip().title()
+            for c in (args.jerseycolor or "").split(";")
+            if c.strip()
+        )
 
     output_root = Path(args.output).resolve() if args.output else None
-    all_results, blurry, output_dir, our_jersey_color = process(
+    all_results, blurry, output_dir, our_jersey_color, sensitivity_threshold = process(
         input_path, args.sensitivity, output_root, jersey_colors
     )
 
@@ -1839,6 +1417,12 @@ def main() -> None:
         log.info("  anno_blur/   delete a preview → keep that original (not blurry after all)")
         log.info("  anno_sharp/  delete a preview → exclude that original (move to Unselected/)")
         log.info("")
+
+    # Face recognition clustering
+    if all_results and not args.skip_facereco:
+        _run_facereco(output_dir, sensitivity_threshold)
+
+    if all_results:
         log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)
 
 
