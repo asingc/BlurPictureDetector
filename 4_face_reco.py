@@ -28,17 +28,17 @@ import os
 import sys
 from pathlib import Path
 
-from facereco.pipeline import FaceRecoConfig, FaceRecoPipeline
+from algo.facereco import FaceRecoConfig, FaceRecoPipeline
 
 try:
-    from facereco.providers.facenet_provider import FaceNetFaceRecoProvider
+    from algo.facenet_provider import FaceNetFaceRecoProvider
     _FACENET_AVAILABLE = True
 except ImportError:
     FaceNetFaceRecoProvider = None  # type: ignore[assignment]
     _FACENET_AVAILABLE = False
 
 try:
-    from facereco.providers.dlib_provider import DlibFaceRecoProvider
+    from algo.dlib_provider import DlibFaceRecoProvider
     _DLIB_AVAILABLE = True
 except ImportError:
     DlibFaceRecoProvider = None  # type: ignore[assignment]

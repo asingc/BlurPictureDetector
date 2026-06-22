@@ -10,19 +10,19 @@ from algo.stage import ProcessStage
 log = logging.getLogger("BlurPictureDetector")
 
 try:
-    from facereco.pipeline import FaceRecoConfig, FaceRecoPipeline
+    from algo.facereco import FaceRecoConfig, FaceRecoPipeline
     _FACERECO_AVAILABLE = True
 except ImportError:
     _FACERECO_AVAILABLE = False
 
 try:
-    from facereco.providers.facenet_provider import FaceNetFaceRecoProvider
+    from algo.facenet_provider import FaceNetFaceRecoProvider
     _FACENET_AVAILABLE = True
 except ImportError:
     _FACENET_AVAILABLE = False
 
 try:
-    from facereco.providers.dlib_provider import DlibFaceRecoProvider
+    from algo.dlib_provider import DlibFaceRecoProvider
     _DLIB_AVAILABLE = True
 except ImportError:
     _DLIB_AVAILABLE = False
@@ -68,10 +68,7 @@ class FaceRecoStage(ProcessStage):
                             "Install facenet-pytorch or face-recognition + dlib.")
                 return frames
 
-            facereco_config = FaceRecoConfig(
-                cluster_similarity_threshold=0.72,
-                face_buffer_ratio=0.15,
-            )
+            facereco_config = FaceRecoConfig()
             pipeline = FaceRecoPipeline(provider=provider, config=facereco_config)
             facereco_dir = pipeline.run(self.output_dir)
             log.info("[FaceRecoStage] face recognition complete: %s", facereco_dir)

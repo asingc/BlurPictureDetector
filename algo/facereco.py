@@ -12,7 +12,7 @@ import numpy as np
 import rawpy
 from sklearn.cluster import DBSCAN
 
-from .providers.base import BodyRecord, Box, FaceRecoProvider, Player
+from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 
 log = logging.getLogger("BlurPictureDetector")
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .base import BodyRecord, FaceRecoProvider, Player
+from .facereco_provider import BodyRecord, FaceRecoProvider, Player
 
 try:
     import face_recognition

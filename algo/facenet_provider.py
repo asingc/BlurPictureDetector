@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     InceptionResnetV1 = None
     fixed_image_standardization = None
 
-from .base import BodyRecord, FaceRecoProvider, Player
+from .facereco_provider import BodyRecord, FaceRecoProvider, Player
 
 
 _MODEL: InceptionResnetV1 | None = None
