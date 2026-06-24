@@ -119,3 +119,16 @@ class Body:
     ten:               float       = 0.0         # Tenengrad of best face crop
     cloth_color:       str         = "N/A"       # predicted jersey/cloth color
     cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean LAB
+
+
+@dataclass
+class ColorLab:
+    """A named reference colour in CIE L*a*b* space."""
+    hue:   str                         # broad category: "Red", "Blue", "Gray" …
+    shade: str                         # precise variant: "Crimson", "Royal", "75%" …
+    lab:   tuple[float, float, float]  # L*, a*, b* reference values
+
+    @property
+    def label(self) -> str:
+        """Combined label used for cloth_color: 'Hue:Shade'."""
+        return f"{self.hue}:{self.shade}"

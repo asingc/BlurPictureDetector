@@ -7,7 +7,7 @@ import numpy as np
 
 from algo.config import AppConfig
 from algo.frame import Frame
-from algo.models import Body
+from algo.models import Body, ColorLab
 from algo.scorers import (
     BodyArrayScorer,
     BodyHeadKPVisibilityScorer,
@@ -41,20 +41,22 @@ class ClothColorPredictor:
     _TORSO_KP_INDICES: tuple[int, ...] = (5, 6, 11, 12)
     _TORSO_KP_CONF:    float            = 0.30
 
-    _COLOR_LAB: dict[str, tuple[float, float, float]] = {
-        "Red, Crimson":    ( 40.0,  65.0,  40.0),
-        "Orange, Vivid":   ( 65.0,  35.0,  55.0),
-        "Yellow, Gold":    ( 85.0,  -5.0,  75.0),
-        "Green, Emerald":  ( 45.0, -40.0,  25.0),
-        "Blue, Royal":     ( 35.0,   5.0, -55.0),
-        "Blue, Navy":      ( 15.0,   5.0, -25.0),
-        "Purple, Violet":  ( 30.0,  30.0, -35.0),
-        "White, Bright":   ( 95.0,   0.0,   0.0),
-        "Gray, 75%":       ( 75.0,   0.0,   0.0),
-        "Gray, Medium":    ( 50.0,   0.0,   0.0),
-        "Gray, 25%":       ( 25.0,   0.0,   0.0),
-        "Black, Deep":     (  8.0,   0.0,   0.0),
-    }
+    _COLORS: list[ColorLab] = [
+        ColorLab("Red",        "Crimson", ( 40.0,  65.0,  40.0)),
+        ColorLab("Orange",     "Vivid",   ( 65.0,  35.0,  55.0)),
+        ColorLab("Yellow",     "Gold",    ( 85.0,  -5.0,  75.0)),
+        ColorLab("Green",      "Emerald", ( 45.0, -40.0,  25.0)),
+        ColorLab("Light Blue", "Sky",     ( 70.0,  -8.0, -30.0)),
+        ColorLab("Blue",       "Royal",   ( 35.0,   5.0, -55.0)),
+        ColorLab("Blue",       "Navy",    ( 15.0,   5.0, -25.0)),
+        ColorLab("Purple",     "Violet",  ( 30.0,  30.0, -35.0)),
+        ColorLab("Pink",       "Magenta", ( 55.0,  60.0, -20.0)),
+        ColorLab("White",      "Bright",  ( 95.0,   0.0,   0.0)),
+        ColorLab("Gray",       "75%",     ( 75.0,   0.0,   0.0)),
+        ColorLab("Gray",       "Medium",  ( 50.0,   0.0,   0.0)),
+        ColorLab("Gray",       "25%",     ( 25.0,   0.0,   0.0)),
+        ColorLab("Black",      "Deep",    (  8.0,   0.0,   0.0)),
+    ]
 
     _SKIN_LAB:         tuple[float, float, float] = (65.0, 18.0, 22.0)
     _SKIN_DIST_THRESH: float                      = 35.0
@@ -67,9 +69,9 @@ class ClothColorPredictor:
         lab    = cv2.cvtColor(sample.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
         pixels = lab.reshape(-1, 3)
 
-        names = list(self._COLOR_LAB.keys())
-        refs  = np.array([self._COLOR_LAB[n] for n in names], dtype=np.float32)
-        skin  = np.array(self._SKIN_LAB,                      dtype=np.float32)
+        colors = self._COLORS
+        refs   = np.array([c.lab for c in colors], dtype=np.float32)
+        skin   = np.array(self._SKIN_LAB, dtype=np.float32)
 
         diffs       = pixels[:, None, :] - refs[None, :, :]
         nearest_idx = (diffs ** 2).sum(axis=2).argmin(axis=1)
@@ -77,23 +79,24 @@ class ClothColorPredictor:
         skin_dists = np.sqrt(((pixels - skin) ** 2).sum(axis=1))
         is_skin    = skin_dists < self._SKIN_DIST_THRESH
 
-        votes: dict[str, int] = {}
+        votes: dict[int, int] = {}
         valid_pixels: list[np.ndarray] = []
         for i, (idx, skip) in enumerate(zip(nearest_idx.tolist(), is_skin.tolist())):
             if skip:
                 continue
-            name = names[idx]
-            votes[name] = votes.get(name, 0) + 1
+            votes[idx] = votes.get(idx, 0) + 1
             valid_pixels.append(pixels[i])
 
         if not votes:
             return "Unknown", {"votes": {}, "mean_lab": None}
-        winner  = max(votes, key=votes.__getitem__)
-        mean_lab = (
+        winner_idx = max(votes, key=votes.__getitem__)
+        winner     = colors[winner_idx]
+        mean_lab   = (
             [round(float(v), 1) for v in np.mean(valid_pixels, axis=0)]
             if valid_pixels else None
         )
-        return winner, {"votes": votes, "mean_lab": mean_lab}
+        votes_by_label = {colors[k].label: v for k, v in votes.items()}
+        return winner.label, {"votes": votes_by_label, "mean_lab": mean_lab}
 
     def _torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
         h_img, w_img = image.shape[:2]

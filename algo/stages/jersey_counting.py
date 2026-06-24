@@ -5,7 +5,7 @@ import logging
 from algo.config import AppConfig
 from algo.frame import Frame
 from algo.stage import ProcessStage
-from algo.utils import _matches_allowed_jersey_color
+from algo.utils import _colors_match, _matches_allowed_jersey_color
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -42,9 +42,11 @@ class JerseyCountingStage(ProcessStage):
 
     def __init__(self, jersey_colors: frozenset[str]) -> None:
         self.jersey_colors = jersey_colors
+        self.our_color: str = "Unknown"
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         our_color = _poll_jersey_color(frames)
+        self.our_color = our_color
         log.info("[JerseyCountingStage] polled team colour: %s", our_color)
 
         for frame in frames:
@@ -62,7 +64,7 @@ class JerseyCountingStage(ProcessStage):
                     continue
 
                 # Team colour check (polled from all frames).
-                if our_color != "Unknown" and body.cloth_color != our_color:
+                if our_color != "Unknown" and not _colors_match(body.cloth_color, our_color):
                     body.passed = False
                     log.debug("[JerseyCountingStage] %s — body cloth=%s != team colour %s → fail",
                               frame.path.name, body.cloth_color, our_color)

@@ -38,10 +38,26 @@ class FaceRecoStage(ProcessStage):
 
     *output_dir* must therefore contain a valid ``results.json`` before this
     stage runs (written by an upstream output step).
+
+    Parameters
+    ----------
+    output_dir:
+        Directory produced by the prep/grading stage.
+    face_db_dir:
+        Optional path to a face-database directory.  Each sub-directory must
+        represent a person and contain a ``face.json`` with embeddings.
+        Clusters matching a DB entry will be named after that person.
     """
 
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        face_db_dir: Path | None = None,
+        face_db_match_threshold: float = 0.72,
+    ) -> None:
         self.output_dir = output_dir
+        self.face_db_dir = face_db_dir
+        self.face_db_match_threshold = face_db_match_threshold
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         sharp_body_count = sum(
@@ -62,13 +78,20 @@ class FaceRecoStage(ProcessStage):
                 provider = FaceNetFaceRecoProvider()
             elif _DLIB_AVAILABLE:
                 log.warning("[FaceRecoStage] FaceNet unavailable; falling back to dlib.")
-                provider = DlibFaceRecoProvider()
+                provider = DlibFaceRecoProvider(
+                    face_db_dir=self.face_db_dir,
+                    face_db_match_threshold=self.face_db_match_threshold,
+                )
+            
             else:
                 log.warning("[FaceRecoStage] No FaceReco provider available. "
                             "Install facenet-pytorch or face-recognition + dlib.")
                 return frames
 
-            facereco_config = FaceRecoConfig()
+            facereco_config = FaceRecoConfig(
+                face_db_dir=self.face_db_dir,
+                face_db_match_threshold=self.face_db_match_threshold,
+            )
             pipeline = FaceRecoPipeline(provider=provider, config=facereco_config)
             facereco_dir = pipeline.run(self.output_dir)
             log.info("[FaceRecoStage] face recognition complete: %s", facereco_dir)

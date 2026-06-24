@@ -37,7 +37,14 @@ from pathlib import Path
 from typing import Optional
 
 from algo.config import AppConfig, app_config
-from algo.models import Body, Box, Face, Point, PredictedKeyPoint
+from algo.frame import Frame
+from algo.models import Body, Box, ColorLab, Face, Point, PredictedKeyPoint
+from algo.stage import ProcessStage
+from algo.stages.annotation import AnnotationStage
+from algo.stages.face_reco import FaceRecoStage
+from algo.stages.grading import GradingStage
+from algo.stages.image_analysis import ImageAnalysisStage
+from algo.stages.jersey_counting import JerseyCountingStage
 from algo.scorers import (
     BodyArrayScorer,
     BodyArrayScorerBase,
@@ -478,22 +485,23 @@ class ClothColorPredictor:
     _TORSO_KP_INDICES: tuple[int, ...] = (5, 6, 11, 12)  # L/R shoulder, L/R hip
     _TORSO_KP_CONF:    float            = 0.30
 
-    # Reference colors in true CIE L*a*b* space (L: 0-100, a/b: -128 to 127).
-    # Keys use "Hue, Shade" labels for more specific output names.
-    _COLOR_LAB: dict[str, tuple[float, float, float]] = {
-        "Red, Crimson":    ( 40.0,  65.0,  40.0),
-        "Orange, Vivid":   ( 65.0,  35.0,  55.0),
-        "Yellow, Gold":    ( 85.0,  -5.0,  75.0),
-        "Green, Emerald":  ( 45.0, -40.0,  25.0),
-        "Blue, Royal":     ( 35.0,   5.0, -55.0),
-        "Blue, Navy":      ( 15.0,   5.0, -25.0),
-        "Purple, Violet":  ( 30.0,  30.0, -35.0),
-        "White, Bright":   ( 95.0,   0.0,   0.0),
-        "Gray, 75%":       ( 75.0,   0.0,   0.0),
-        "Gray, Medium":    ( 50.0,   0.0,   0.0),
-        "Gray, 25%":       ( 25.0,   0.0,   0.0),
-        "Black, Deep":     (  8.0,   0.0,   0.0),
-    }
+    # Reference colours in CIE L*a*b* space.
+    _COLORS: list = [
+        ColorLab("Red",        "Crimson", ( 40.0,  65.0,  40.0)),
+        ColorLab("Orange",     "Vivid",   ( 65.0,  35.0,  55.0)),
+        ColorLab("Yellow",     "Gold",    ( 85.0,  -5.0,  75.0)),
+        ColorLab("Green",      "Emerald", ( 45.0, -40.0,  25.0)),
+        ColorLab("Light Blue", "Sky",     ( 70.0,  -8.0, -30.0)),
+        ColorLab("Blue",       "Royal",   ( 35.0,   5.0, -55.0)),
+        ColorLab("Blue",       "Navy",    ( 15.0,   5.0, -25.0)),
+        ColorLab("Purple",     "Violet",  ( 30.0,  30.0, -35.0)),
+        ColorLab("Pink",       "Magenta", ( 55.0,  60.0, -20.0)),
+        ColorLab("White",      "Bright",  ( 95.0,   0.0,   0.0)),
+        ColorLab("Gray",       "75%",     ( 75.0,   0.0,   0.0)),
+        ColorLab("Gray",       "Medium",  ( 50.0,   0.0,   0.0)),
+        ColorLab("Gray",       "25%",     ( 25.0,   0.0,   0.0)),
+        ColorLab("Black",      "Deep",    (  8.0,   0.0,   0.0)),
+    ]
 
     # Skin-tone cluster center in LAB — pixels within this ΔE distance are skipped.
     _SKIN_LAB:         tuple[float, float, float] = (65.0, 18.0, 22.0)
@@ -508,9 +516,9 @@ class ClothColorPredictor:
         lab    = cv2.cvtColor(sample.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
         pixels = lab.reshape(-1, 3)  # (576, 3)
 
-        names = list(self._COLOR_LAB.keys())
-        refs  = np.array([self._COLOR_LAB[n] for n in names], dtype=np.float32)
-        skin  = np.array(self._SKIN_LAB,                      dtype=np.float32)
+        colors = self._COLORS
+        refs   = np.array([c.lab for c in colors], dtype=np.float32)
+        skin   = np.array(self._SKIN_LAB, dtype=np.float32)
 
         # Nearest reference color per pixel: (576, N_colors, 3) → (576,)
         diffs       = pixels[:, None, :] - refs[None, :, :]
@@ -520,27 +528,24 @@ class ClothColorPredictor:
         skin_dists = np.sqrt(((pixels - skin) ** 2).sum(axis=1))
         is_skin    = skin_dists < self._SKIN_DIST_THRESH
 
-        votes: dict[str, int] = {}
+        votes: dict[int, int] = {}
         valid_pixels: list[np.ndarray] = []
         for i, (idx, skip) in enumerate(zip(nearest_idx.tolist(), is_skin.tolist())):
             if skip:
                 continue
-            name = names[idx]
-            votes[name] = votes.get(name, 0) + 1
+            votes[idx] = votes.get(idx, 0) + 1
             valid_pixels.append(pixels[i])
 
         if not votes:
             return "Unknown", {"votes": {}, "mean_lab": None}
-        winner  = max(votes, key=votes.__getitem__)
-        mean_lab = (
+        winner_idx = max(votes, key=votes.__getitem__)
+        winner     = colors[winner_idx]
+        mean_lab   = (
             [round(float(v), 1) for v in np.mean(valid_pixels, axis=0)]
             if valid_pixels else None
         )
-        detail = {
-            "votes":    votes,
-            "mean_lab": mean_lab,  # [L, a, b] averaged over non-skin pixels
-        }
-        return winner, detail
+        votes_by_label = {colors[k].label: v for k, v in votes.items()}
+        return winner.label, {"votes": votes_by_label, "mean_lab": mean_lab}
 
     def _torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
         h_img, w_img = image.shape[:2]
@@ -985,8 +990,6 @@ def process(
     log.info("Summary —  Blurry: %d  |  Sharp: %d  |  Skipped: %d  |  Errors: %d",
              len(blurry), sharp_count, skip_count, error_count)
 
-    write_results_json(all_results, output_dir / "results.json", our_jersey_color=polled_jersey_color)
-
     # ── Phase 3: write annotated previews ────────────────────────────────────
     log.info("Phase 3/3 — writing annotated previews …")
     for idx, result in enumerate(all_results, 1):
@@ -1014,40 +1017,49 @@ _CSV_FIELDS: list[str] = ["File", "Verdict", "Sharp Score", "# Boxes"] + [
 ]
 
 
-def write_csv(all_results: list[dict], csv_path: Path) -> None:
-    _VERDICT_MAP = {
-        "sharp":   "Sharp",
-        "blurry":  "Blur",
-        "skipped": "Skipped",
-        "error":   "Skipped",
-    }
+def write_csv(frames: list[Frame], csv_path: Path) -> None:
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for r in all_results:
-            verdict = _VERDICT_MAP.get(r["status"], "Skipped")
-            score   = r.get("sharpness_score")
+        for frame in frames:
+            norm_img = frame.normalized_image
+            img_w = norm_img.shape[1] if norm_img is not None else 1
+            img_h = norm_img.shape[0] if norm_img is not None else 1
+            if not frame.bodies:
+                verdict, score = "Skipped", None
+            elif frame.is_sharp():
+                verdict = "Sharp"
+                score = max(b.sharpness_score for b in frame.bodies if b.passed)
+            else:
+                verdict = "Blur"
+                score = max(b.sharpness_score for b in frame.bodies)
             row: dict = {
-                "File":        Path(r["file"]).name,
+                "File":        frame.path.name,
                 "Verdict":     verdict,
                 "Sharp Score": f"{score:.2f}" if score is not None else "",
-                "# Boxes":     len(r.get("persons_detail", [])),
+                "# Boxes":     len(frame.bodies),
             }
-            for n, pd in enumerate(r.get("persons_detail", []), 1):
-                row[f"Box {n} - Verdict"]              = pd["verdict"]
-                row[f"Box {n} - Orig Dimension"]       = pd["orig_dim"]
-                row[f"Box {n} - Face Box Sharp Score"] = f"{pd['score']:.2f}"
-                row[f"Box {n} - Facial Boxes"]         = pd["facial_boxes"]
+            for n, body in enumerate(frame.bodies, 1):
+                b = body.bbox
+                kp_confs = (
+                    ", ".join(f"{lm.confidence:.2f}" for lm in body.best_face.landmarks)
+                    if body.best_face else ""
+                )
+                row[f"Box {n} - Verdict"]              = "Sharp" if body.passed else "Blur"
+                row[f"Box {n} - Orig Dimension"]       = f"{b.width * img_w:.0f} x {b.height * img_h:.0f}"
+                row[f"Box {n} - Face Box Sharp Score"] = f"{body.sharpness_score:.2f}"
+                row[f"Box {n} - Facial Boxes"]         = kp_confs
             writer.writerow(row)
     log.info("CSV report written to:    %s", csv_path)
 
 
-def write_blur_lst(blurry: list[dict], lst_path: Path) -> None:
+def write_blur_lst(frames: list[Frame], lst_path: Path) -> None:
     """Write a plain-text list of blurry image filenames and their blur scores."""
     with open(lst_path, "w", encoding="utf-8") as fh:
-        for entry in blurry:
-            filename = Path(entry["file"]).name
-            fh.write(f"{filename}\t{entry['sharpness_score']}\n")
+        for frame in frames:
+            if frame.bodies and not frame.is_sharp():
+                score = max(b.sharpness_score for b in frame.bodies)
+                fh.write(f"{frame.path.name}\t{score}\n")
     log.info("Blur list written to:     %s", lst_path)
 
 
@@ -1103,14 +1115,45 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def write_results_json(all_results: list[dict], json_path: Path, *, our_jersey_color: str | None = None) -> None:
+def write_results_json(frames: list[Frame], json_path: Path, *, our_jersey_color: str | None = None) -> None:
     """Write full per-image analytic results (scores, bboxes, keypoints) to JSON."""
     serializable = []
-    for r in all_results:
-        entry = {k: v for k, v in r.items() if k != "_annotation_data"}
-        ann = r.get("_annotation_data")
-        if ann is not None:
-            entry["annotation_data"] = _serial_annotation_data(ann)
+    for frame in frames:
+        norm_img = frame.normalized_image
+        if not frame.bodies:
+            entry: dict = {"file": str(frame.path), "status": "skipped"}
+        else:
+            overall_blurry = not frame.is_sharp()
+            passing = [b for b in frame.bodies if b.passed]
+            best = max(passing or frame.bodies, key=lambda b: b.sharpness_score)
+            entry = {
+                "file":               str(frame.path),
+                "status":             "blurry" if overall_blurry else "sharp",
+                "sharpness_score":    round(best.sharpness_score, 4),
+                "sharpness_grade":    round(best.sharpness_score * 100, 1),
+                "laplacian_variance": round(best.lap_var, 2),
+                "tenengrad_score":    round(best.ten, 2),
+                "annotation_data": {
+                    "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
+                    "overall_blurry":   overall_blurry,
+                    "evaluated": [
+                        {
+                            "body_bbox":          _serial_box(body.bbox),
+                            "body_keypoints":     [_serial_keypoint(kp) for kp in body.keypoints],
+                            "face_bbox":          _serial_box(body.best_face.bbox) if body.best_face else None,
+                            "narrow_face_bbox":   _serial_box(body.best_narrow_box) if body.best_narrow_box else None,
+                            "face_kps":           _serial_face(body.best_face) if body.best_face else None,
+                            "sharpness_score":    body.sharpness_score,
+                            "lap_var":            body.lap_var,
+                            "ten":                body.ten,
+                            "is_blurry":          not body.passed,
+                            "cloth_color":        body.cloth_color,
+                            "cloth_color_detail": body.cloth_color_detail,
+                        }
+                        for body in frame.bodies
+                    ],
+                },
+            }
         serializable.append(entry)
     payload = {
         "our_jersey_color": our_jersey_color,
@@ -1219,37 +1262,34 @@ def _recompute_verdicts(
         for pd, p in zip(r.get("persons_detail", []), ann["evaluated"]):
             pd["verdict"] = "Blur" if p.get("is_blurry", True) else "Sharp"
 
-        r.pop("star_rating", None)
         if new_blurry:
-            r["star_rating"] = 1
             blurry.append(r)
     return blurry
 
 
 def write_info_json(
-    all_results: list[dict],
+    frames: list[Frame],
     input_path: Path,
     timestamp: str,
     json_path: Path,
     our_jersey_color: str | None = None,
 ) -> None:
     """Write a run-summary JSON file."""
-    def _entry(r: dict) -> dict:
-        src = Path(r["file"]).name
-        return {"src": src, "anno": Path(src).stem + ".jpg"}
+    def _entry(frame: Frame) -> dict:
+        return {"src": frame.path.name, "anno": frame.path.stem + ".jpg"}
 
-    blur_files    = [_entry(r) for r in all_results if r["status"] == "blurry"]
-    sharp_files   = [_entry(r) for r in all_results if r["status"] == "sharp"]
-    skipped_files = [_entry(r) for r in all_results if r["status"] in ("skipped", "error")]
+    blur_files    = [_entry(f) for f in frames if f.bodies and not f.is_sharp()]
+    sharp_files   = [_entry(f) for f in frames if f.bodies and f.is_sharp()]
+    skipped_files = [_entry(f) for f in frames if not f.bodies]
 
     payload = {
-        "SrcDir":           str(input_path.resolve()),
-        "SrcType":          "File" if input_path.is_file() else "Directory",
-        "Timestamp":        timestamp,
-        "OurJerseyColor":   our_jersey_color,
-        "Anno_Blur":        blur_files,
-        "Anno_Sharp":       sharp_files,
-        "Anno_Skipped":     skipped_files,
+        "SrcDir":         str(input_path.resolve()),
+        "SrcType":        "File" if input_path.is_file() else "Directory",
+        "Timestamp":      timestamp,
+        "OurJerseyColor": our_jersey_color,
+        "Anno_Blur":      blur_files,
+        "Anno_Sharp":     sharp_files,
+        "Anno_Skipped":   skipped_files,
     }
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
@@ -1260,7 +1300,12 @@ def write_info_json(
 # Face Recognition
 # ---------------------------------------------------------------------------
 
-def _run_facereco(output_dir: Path, sensitivity_threshold: float) -> None:
+def _run_facereco(
+    output_dir: Path,
+    sensitivity_threshold: float,
+    face_db_dir: Path | None = None,
+    face_db_match_threshold: float = 0.72,
+) -> None:
     """Run face recognition pipeline on the Phase 1 output."""
     if not _FACERECO_AVAILABLE:
         log.warning(
@@ -1282,6 +1327,8 @@ def _run_facereco(output_dir: Path, sensitivity_threshold: float) -> None:
         config = FaceRecoConfig(
             cluster_similarity_threshold=0.72,
             face_buffer_ratio=0.15,
+            face_db_dir=face_db_dir,
+            face_db_match_threshold=face_db_match_threshold,
         )
         pipeline = FaceRecoPipeline(provider=provider, config=config)
         facereco_dir = pipeline.run(output_dir)
@@ -1337,16 +1384,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--jerseycolor",
-        default="blue;white;purple;orange",
+        default="blue;white;+purple;+orange;+light blue;+pink",
         metavar="COLOR[;COLOR...]",
         help=(
             "Semicolon-separated list of jersey colours that qualify for "
             "evaluation and annotation (case-insensitive).  "
-            "Each entry can be a hue (e.g. blue) or a full hue+shade "
-            "label (e.g. blue, navy).  "
-            "Only persons wearing one of these colours are scored for sharpness "
-            "and drawn in preview images.  "
-            "Default: blue;white;purple;orange.  "
+            "Each entry can be a plain colour (e.g. blue) or a full hue+shade "
+            "label (e.g. navy).  "
+            "Prefix a colour with '+' to make it forced-include — it will always "
+            "be in the filter regardless of what other colours are listed "
+            "(e.g. +light blue;+pink for goalies).  "
             "Pass an empty string to disable jersey filtering."
         ),
     )
@@ -1357,6 +1404,26 @@ def main() -> None:
             "Skip face recognition clustering. By default, .FaceReco/ is generated "
             "under the output directory after preview generation completes. "
             "Use this flag to disable it (e.g. if dlib is not installed)."
+        ),
+    )
+    parser.add_argument(
+        "--face-db",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a face-DB directory.  Each sub-directory must represent a "
+            "person and contain a face.json with positive embeddings.  "
+            "Matched clusters will be stored in a folder named after that person."
+        ),
+    )
+    parser.add_argument(
+        "--face-db-match-threshold",
+        type=float,
+        default=0.72,
+        metavar="THRESHOLD",
+        help=(
+            "Cosine similarity threshold for matching a cluster against the face DB "
+            "(default: 0.72).  Higher = stricter matching."
         ),
     )
     parser.add_argument(
@@ -1371,8 +1438,8 @@ def main() -> None:
     args = parser.parse_args()
 
     _setup_console_logging()
-    log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s",
-              args.path, args.sensitivity, args.output, args.jerseycolor, args.skip_facereco, args.noteam)
+    log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s face_db=%s",
+              args.path, args.sensitivity, args.output, args.jerseycolor, args.skip_facereco, args.noteam, args.face_db)
 
     input_path = Path(args.path).resolve()
     if not input_path.exists():
@@ -1380,33 +1447,77 @@ def main() -> None:
         sys.exit(1)
 
     # Parse the semicolon-separated jersey colour list, normalise to title-case.
-    # --noteam overrides --jerseycolor and disables all colour filtering.
+    # Colours prefixed with '+' are forced-include: they are always added to the
+    # filter regardless of what other colours are listed (e.g. goalie colours).
+    # --noteam overrides everything and disables all colour filtering.
     if args.noteam:
         jersey_colors: frozenset[str] = frozenset()
         log.info("--noteam: jersey-colour filtering disabled")
     else:
-        jersey_colors: frozenset[str] = frozenset(
+        forced_colors: frozenset[str] = frozenset(
+            c.strip().lstrip("+").strip().title()
+            for c in (args.jerseycolor or "").split(";")
+            if c.strip().startswith("+") and c.strip().lstrip("+").strip()
+        )
+        regular_colors: frozenset[str] = frozenset(
             c.strip().title()
             for c in (args.jerseycolor or "").split(";")
-            if c.strip()
+            if c.strip() and not c.strip().startswith("+")
         )
+        jersey_colors: frozenset[str] = regular_colors | forced_colors
+        if forced_colors:
+            log.debug("Jersey colours — regular: %s  forced (+): %s",
+                      sorted(regular_colors), sorted(forced_colors))
+        else:
+            log.debug("Jersey colours: %s", sorted(jersey_colors))
 
+    try:
+        sensitivity_threshold = float(args.sensitivity)
+    except ValueError:
+        sensitivity_threshold = SENSITIVITY_THRESHOLDS[args.sensitivity]
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_root = Path(args.output).resolve() if args.output else None
-    all_results, blurry, output_dir, our_jersey_color, sensitivity_threshold = process(
-        input_path, args.sensitivity, output_root, jersey_colors
-    )
+    output_dir  = output_root if output_root is not None else Path("output") / f"{ts}-{input_path.stem}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _add_file_logging(output_dir / "run.log")
+    log.debug("Output directory: %s", output_dir.resolve())
 
-    if all_results:
-        write_csv(all_results, output_dir / "blurry.csv")
-        write_info_json(all_results, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"),
+    log.info("Loading models …")
+    pose_model = YOLO("yolov8n-pose.pt")
+    face_model = YOLO(_ensure_face_model())
+
+    face_db_dir: Path | None = None
+    if args.face_db is not None:
+        face_db_dir = Path(args.face_db).resolve()
+        if not face_db_dir.is_dir():
+            log.error("--face-db directory not found: %s", face_db_dir)
+            face_db_dir = None
+
+    jersey_stage = JerseyCountingStage(jersey_colors)
+    stages: list[ProcessStage] = [
+        ImageAnalysisStage(input_path, pose_model, face_model),
+        GradingStage(sensitivity_threshold),
+        jersey_stage,
+        AnnotationStage(output_dir, jersey_colors),
+    ]
+    frames: list[Frame] = []
+    for stage in stages:
+        frames = stage.process(frames, app_config)
+
+    our_jersey_color = jersey_stage.our_color
+    write_results_json(frames, output_dir / "results.json", our_jersey_color=our_jersey_color)
+
+    if frames:
+        write_csv(frames, output_dir / "blurry.csv")
+        write_info_json(frames, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"),
                         output_dir / "info.json", our_jersey_color=our_jersey_color)
-        # results.json is already written inside process() after Phase 1
-    if blurry:
-        write_blur_lst(blurry, output_dir / "blur.lst")
+    if any(f.bodies and not f.is_sharp() for f in frames):
+        write_blur_lst(frames, output_dir / "blur.lst")
     else:
         log.info("No blurry images detected — blur.lst not written.")
 
-    if all_results:
+    if frames:
         log.info("")
         log.info("Annotated previews saved to:")
         log.info("  %s", output_dir / "anno_blur")
@@ -1418,11 +1529,14 @@ def main() -> None:
         log.info("  anno_sharp/  delete a preview → exclude that original (move to Unselected/)")
         log.info("")
 
-    # Face recognition clustering
-    if all_results and not args.skip_facereco:
-        _run_facereco(output_dir, sensitivity_threshold)
+    if frames and not args.skip_facereco:
+        FaceRecoStage(
+            output_dir,
+            face_db_dir=face_db_dir,
+            face_db_match_threshold=args.face_db_match_threshold,
+        ).process(frames, app_config)
 
-    if all_results:
+    if frames:
         log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)
 
 

@@ -101,6 +101,26 @@ def main() -> None:
         help="Extra crop padding ratio around face box (0.15 = 15%% per side).",
     )
     parser.add_argument(
+        "--face-db",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a face-DB directory.  Each sub-directory must represent a "
+            "person and contain a face.json with positive (and optionally negative) "
+            "embeddings.  Clusters whose centroid matches a DB entry above the "
+            "match threshold will be stored in a folder named after that person."
+        ),
+    )
+    parser.add_argument(
+        "--face-db-match-threshold",
+        type=float,
+        default=0.72,
+        help=(
+            "Cosine similarity threshold for matching a cluster against the face DB "
+            "(default: 0.72).  Higher = stricter matching."
+        ),
+    )
+    parser.add_argument(
         "--open-viewer",
         action="store_true",
         help="Open the generated .FaceReco folder in the system file explorer.",
@@ -114,10 +134,19 @@ def main() -> None:
         log.error("prep_output_dir not found: %s", prep_output_dir)
         sys.exit(1)
 
+    face_db_dir: Path | None = None
+    if args.face_db is not None:
+        face_db_dir = Path(args.face_db).resolve()
+        if not face_db_dir.is_dir():
+            log.error("--face-db directory not found: %s", face_db_dir)
+            sys.exit(1)
+
     provider = _build_provider(args.provider)
     config = FaceRecoConfig(
         cluster_similarity_threshold=args.cluster_threshold,
         face_buffer_ratio=args.face_buffer_ratio,
+        face_db_dir=face_db_dir,
+        face_db_match_threshold=args.face_db_match_threshold,
     )
     pipeline = FaceRecoPipeline(provider=provider, config=config)
 

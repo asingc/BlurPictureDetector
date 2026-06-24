@@ -24,6 +24,12 @@ class FaceRecoConfig:
     cluster_similarity_threshold: float = 0.68
     face_buffer_ratio: float = 0.15
     output_dir_name: str = ".FaceReco"
+    # Optional path to a face-DB directory.  Each subdirectory must contain
+    # a face.json produced by a previous FaceReco run.
+    face_db_dir: Path | None = None
+    # Minimum cosine similarity for a cluster centroid to be matched against
+    # a face-DB entry.
+    face_db_match_threshold: float = 0.72
 
 
 @dataclass
@@ -39,6 +45,91 @@ class FaceSample:
 class Cluster:
     cluster_id: int
     samples: list[FaceSample]
+
+
+@dataclass
+class FaceDbEntry:
+    """One person loaded from the face database."""
+
+    name: str
+    playernum: int | None
+    provider: str
+    embeddings: list[np.ndarray]          # positive embeddings
+    negative_embeddings: list[np.ndarray]  # negative embeddings (may be empty)
+
+
+def _decode_embedding(face_data: dict) -> np.ndarray | None:
+    """Decode a base64-encoded embedding stored in a face.json entry."""
+    try:
+        dtype = np.dtype(face_data.get("dtype", "float32"))
+        raw = base64.b64decode(face_data["value"])
+        return np.frombuffer(raw, dtype=dtype).copy()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class FaceDb:
+    """Loaded face database: a collection of known people with their embeddings."""
+
+    def __init__(self, entries: list[FaceDbEntry]) -> None:
+        self.entries = entries
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    @classmethod
+    def load(cls, db_dir: Path) -> "FaceDb":
+        """Walk *db_dir* and load every ``face.json`` found in a sub-directory."""
+        entries: list[FaceDbEntry] = []
+        if not db_dir.is_dir():
+            raise FileNotFoundError(f"Face-DB directory not found: {db_dir}")
+        for person_dir in sorted(db_dir.iterdir()):
+            if not person_dir.is_dir():
+                continue
+            face_json = person_dir / "face.json"
+            if not face_json.exists():
+                log.debug("FaceDB [load]: %s — no face.json, skipped", person_dir.name)
+                continue
+            try:
+                with open(face_json, encoding="utf-8-sig") as fh:
+                    data = json.load(fh)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("FaceDB [load]: %s — failed to parse face.json: %s", person_dir.name, exc)
+                continue
+            name = data.get("name") or person_dir.name
+            playernum = data.get("playernum")
+            provider = str(data.get("provider", ""))
+            embeddings = [
+                e for e in (_decode_embedding(f) for f in data.get("faces", []))
+                if e is not None
+            ]
+            neg_embeddings = [
+                e for e in (_decode_embedding(f) for f in data.get("negative_faces", []))
+                if e is not None
+            ]
+            if not embeddings:
+                log.debug("FaceDB [load]: %s — no valid embeddings, skipped", name)
+                continue
+            entries.append(FaceDbEntry(
+                name=name,
+                playernum=playernum,
+                provider=provider,
+                embeddings=embeddings,
+                negative_embeddings=neg_embeddings,
+            ))
+            log.debug("FaceDB [load]: %s  playernum=%s  provider=%s  embeddings=%d  negatives=%d",
+                      name, playernum, provider, len(embeddings), len(neg_embeddings))
+        total_faces = sum(len(e.embeddings) for e in entries)
+        log.info(
+            "FaceDB [load]: loaded %d cluster(s) / %d face(s) from %s",
+            len(entries), total_faces, db_dir,
+        )
+        for entry in entries:
+            log.info(
+                "FaceDB [load]:   %-20s  playernum=%-4s  faces=%d  negatives=%d",
+                entry.name, entry.playernum, len(entry.embeddings), len(entry.negative_embeddings),
+            )
+        return cls(entries)
 
 
 @dataclass
@@ -83,13 +174,28 @@ class FaceRecoPipeline:
             log.warning("FaceReco: no qualified (sharp) bodies found — empty folder created: %s", out_root)
             return out_root
 
+        # Load face DB before clustering so identity info is available for matching.
+        face_db: FaceDb | None = None
+        if self.config.face_db_dir is not None:
+            face_db = FaceDb.load(self.config.face_db_dir)
+            log.info("FaceReco: face DB loaded — %d person(s) from %s",
+                     len(face_db), self.config.face_db_dir)
+
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
         samples = self._predict_samples(qualified)
         log.info("FaceReco: %d/%d embeddings extracted successfully", len(samples), len(qualified))
         clusters = self._cluster_samples(samples)
         log.info("FaceReco: %d cluster(s) identified  (sizes: %s)",
                  len(clusters), [len(c.samples) for c in clusters])
-        self._write_cluster_outputs(out_root, clusters, src_dir)
+
+        cluster_name_map: dict[int, FaceDbEntry] = {}
+        if face_db is not None:
+            cluster_name_map = self._match_clusters_to_facedb(clusters, face_db)
+            log.info("FaceReco: %d/%d cluster(s) matched to face DB",
+                     len(cluster_name_map), len(clusters))
+
+        self._write_all_faces(out_root, clusters)
+        self._write_cluster_outputs(out_root, clusters, src_dir, cluster_name_map)
         log.info("FaceReco completed: %d qualified bodies → %d clusters  output=%s",
                  len(samples), len(clusters), out_root)
         return out_root
@@ -293,50 +399,227 @@ class FaceRecoPipeline:
             return vector
         return vector / norm
 
-    def _write_cluster_outputs(self, out_root: Path, clusters: list[Cluster], src_dir: Path) -> None:
-        cluster_dirs: list[Path] = []
+    def _match_clusters_to_facedb(
+        self, clusters: list[Cluster], face_db: FaceDb,
+    ) -> dict[int, FaceDbEntry]:
+        """Match clusters to face-DB entries using per-sample majority voting.
+
+        For each sample in a cluster, the best-matching DB entry (highest
+        cosine similarity to any of that person's known embeddings) is found.
+        If that similarity meets ``config.face_db_match_threshold`` the sample
+        casts a vote for that person.  The cluster is assigned to the person
+        with the most votes, provided they hold a strict majority (> 50 % of
+        all samples in the cluster).
+
+        Voting per-sample — rather than comparing a single cluster centroid —
+        handles the common case where a person's face embeddings are split
+        across multiple DBSCAN clusters: even a cluster whose centroid has
+        drifted away from the DB embeddings will still be correctly identified
+        if most of its individual samples match that person.
+
+        Only DB entries produced by the same provider as the current pipeline
+        are considered, so that embedding spaces are compatible.
+        """
+        provider_name = self.provider.provider_name()
+        compatible = [e for e in face_db.entries if e.provider == provider_name]
+        if not compatible:
+            log.warning(
+                "FaceReco [match]: no face-DB entries for provider '%s' — skipping DB matching",
+                provider_name,
+            )
+            return {}
+
+        # Pre-normalise all DB embeddings once to avoid repeated work.
+        normalised_db: list[tuple[FaceDbEntry, list[np.ndarray]]] = [
+            (entry, [self._normalize(emb.astype(np.float32)) for emb in entry.embeddings])
+            for entry in compatible
+        ]
+
+        result: dict[int, FaceDbEntry] = {}
+        for cluster in clusters:
+            if not cluster.samples:
+                continue
+
+            # Per-sample voting: each sample independently finds its best DB match.
+            votes: dict[str, int] = {}          # person name → vote count
+            best_sim_for: dict[str, float] = {} # person name → highest sim seen
+
+            for sample in cluster.samples:
+                emb = self._normalize(sample.embedding.astype(np.float32))
+                sample_best_score = -1.0
+                sample_best_entry: FaceDbEntry | None = None
+
+                for entry, normed_embs in normalised_db:
+                    sim = max(float(np.dot(emb, ne)) for ne in normed_embs)
+                    if sim > sample_best_score:
+                        sample_best_score = sim
+                        sample_best_entry = entry
+
+                if (sample_best_entry is not None
+                        and sample_best_score >= self.config.face_db_match_threshold):
+                    name = sample_best_entry.name
+                    votes[name] = votes.get(name, 0) + 1
+                    best_sim_for[name] = max(best_sim_for.get(name, -1.0), sample_best_score)
+
+            n_samples = len(cluster.samples)
+            if not votes:
+                log.debug(
+                    "FaceReco [match]: cluster %04d (%d sample(s)) — no votes above threshold %.3f",
+                    cluster.cluster_id, n_samples, self.config.face_db_match_threshold,
+                )
+                continue
+
+            winner_name = max(votes, key=lambda n: votes[n])
+            winner_votes = votes[winner_name]
+            vote_ratio = winner_votes / n_samples
+
+            log.debug(
+                "FaceReco [match]: cluster %04d (%d sample(s)) — votes=%s  winner=%s (%d/%d = %.0f%%)",
+                cluster.cluster_id, n_samples, dict(votes),
+                winner_name, winner_votes, n_samples, vote_ratio * 100,
+            )
+
+            if vote_ratio > 0.5:
+                winner_entry = next(e for e in compatible if e.name == winner_name)
+                result[cluster.cluster_id] = winner_entry
+                log.info(
+                    "FaceReco [match]: cluster %04d → %s (playernum=%s  votes=%d/%d=%.0f%%  best_sim=%.4f)",
+                    cluster.cluster_id, winner_name, winner_entry.playernum,
+                    winner_votes, n_samples, vote_ratio * 100, best_sim_for[winner_name],
+                )
+            else:
+                log.debug(
+                    "FaceReco [match]: cluster %04d — no majority  (winner=%s  %d/%d=%.0f%%)",
+                    cluster.cluster_id, winner_name, winner_votes, n_samples, vote_ratio * 100,
+                )
+        return result
+
+    def _write_all_faces(self, out_root: Path, clusters: list[Cluster]) -> None:
+        """Write every processed face crop and a combined face.json to
+        ``<out_root>/.AllFaces/``.
+
+        This is a flat dump of the entire run — one image per face, one JSON
+        entry per face — independent of how the faces are later clustered.
+        The directory is written *before* :meth:`_write_cluster_outputs` so
+        that ``crop_image`` is still in memory for each sample.
+        """
+        all_faces_dir = out_root / ".AllFaces"
+        all_faces_dir.mkdir(parents=True, exist_ok=True)
+
+        face_entries: list[dict] = []
+        written = 0
+
+        for cluster in clusters:
+            cluster_num = f"{cluster.cluster_id:04d}"
+            for sample in cluster.samples:
+                crop = sample.crop_image
+                if crop is None:
+                    log.debug(
+                        "FaceReco [allfaces]: %s body#%d — no crop, skipped",
+                        sample.body.orig_filename, sample.body.body_index,
+                    )
+                    continue
+
+                crop_name = (
+                    f"{cluster_num}-"
+                    f"{Path(sample.body.orig_filename).stem}-"
+                    f"b{sample.body.body_index}.jpg"
+                )
+                cv2.imwrite(
+                    str(all_faces_dir / crop_name), crop,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92],
+                )
+                written += 1
+
+                emb = sample.embedding.astype(np.float32)
+                face_entries.append({
+                    "origFilename": sample.body.orig_filename,
+                    "cluster": cluster_num,
+                    "cropFileName": crop_name,
+                    "confidence": sample.confidence,
+                    "Body": sample.body.raw_body,
+                    "embedding": {
+                        "dtype": "float32",
+                        "shape": [int(emb.shape[0])],
+                        "encoding": "base64",
+                        "value": base64.b64encode(emb.tobytes()).decode("ascii"),
+                    },
+                })
+
+        payload = {
+            "provider": self.provider.provider_name(),
+            "total": written,
+            "faces": face_entries,
+        }
+        with open(all_faces_dir / "face.json", "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+        log.info("FaceReco [allfaces]: %d face(s) written to %s", written, all_faces_dir)
+
+    def _write_cluster_outputs(
+        self,
+        out_root: Path,
+        clusters: list[Cluster],
+        src_dir: Path,
+        cluster_name_map: dict[int, FaceDbEntry] | None = None,
+    ) -> None:
+        # Maps cluster_id → actual output directory (may be named after a person).
+        cluster_id_to_dir: dict[int, Path] = {}
         log.info("FaceReco [write]: writing %d cluster(s) to %s", len(clusters), out_root)
         for cluster_index, cluster in enumerate(clusters, start=1):
-            cluster_name = f"{cluster.cluster_id:04d}"
-            cluster_dir = out_root / cluster_name
+            # The 4-digit numeric name is always used for internal file naming.
+            cluster_num = f"{cluster.cluster_id:04d}"
+            db_entry = (cluster_name_map or {}).get(cluster.cluster_id)
+            # Use the person's name as the directory name when matched.
+            dir_name = db_entry.name if db_entry is not None else cluster_num
+            cluster_dir = out_root / dir_name
             face_dir = cluster_dir / "Face"
             negative_dir = cluster_dir / "Negative"
             face_dir.mkdir(parents=True, exist_ok=True)
             negative_dir.mkdir(parents=True, exist_ok=True)
-            cluster_dirs.append(cluster_dir)
+            cluster_id_to_dir[cluster.cluster_id] = cluster_dir
 
             written = 0
             for sample in cluster.samples:
                 crop = sample.crop_image
                 if crop is None:
                     log.debug("FaceReco [write]: cluster %s — %s body#%d has no crop image",
-                              cluster_name, sample.body.orig_filename, sample.body.body_index)
+                              cluster_num, sample.body.orig_filename, sample.body.body_index)
                     continue
 
-                crop_name = f"{cluster_name}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.jpg"
+                crop_name = f"{cluster_num}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.jpg"
                 cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 sample.crop_file_name = crop_name
                 sample.crop_image = None
                 written += 1
                 log.debug("FaceReco [write]: cluster %s — saved crop %s  (%dx%d)",
-                          cluster_name, crop_name, crop.shape[1], crop.shape[0])
+                          cluster_num, crop_name, crop.shape[1], crop.shape[0])
 
-            self._write_face_json(cluster_dir, cluster_name, cluster.samples)
+            self._write_face_json(
+                cluster_dir, cluster_num, cluster.samples,
+                name=db_entry.name if db_entry is not None else "",
+                playernum=db_entry.playernum if db_entry is not None else None,
+            )
+            label = f"{cluster_num} ({dir_name})" if db_entry is not None else cluster_num
             log.info(
                 "FaceReco [write]: cluster %s  (%d/%d)  samples=%d  crops_written=%d",
-                cluster_name, cluster_index, len(clusters), len(cluster.samples), written,
+                label, cluster_index, len(clusters), len(cluster.samples), written,
             )
 
         log.info("FaceReco [write]: populating Negative folders for %d cluster(s)", len(clusters))
-        for target_index, (target_cluster, target_dir) in enumerate(zip(clusters, cluster_dirs), start=1):
+        for target_index, target_cluster in enumerate(clusters, start=1):
+            target_dir = cluster_id_to_dir[target_cluster.cluster_id]
             negative_dir = target_dir / "Negative"
-            target_name = f"{target_cluster.cluster_id:04d}"
+            target_num = f"{target_cluster.cluster_id:04d}"
             neg_count = 0
             for other_cluster in clusters:
                 if other_cluster.cluster_id == target_cluster.cluster_id:
                     continue
-                source_name = f"{other_cluster.cluster_id:04d}"
-                source_face_dir = out_root / source_name / "Face"
+                # When a face DB was used, only matched clusters are reliable
+                # negative sources; skip unmatched clusters entirely.
+                if cluster_name_map and other_cluster.cluster_id not in cluster_name_map:
+                    continue
+                source_face_dir = cluster_id_to_dir[other_cluster.cluster_id] / "Face"
                 for sample in other_cluster.samples:
                     if not sample.crop_file_name:
                         continue
@@ -344,10 +627,10 @@ class FaceRecoPipeline:
                     if not src.exists():
                         log.debug("FaceReco [neg]: source crop missing: %s", src)
                         continue
-                    neg_name = f"{target_name}-{sample.crop_file_name.split('-', 1)[1]}"
+                    neg_name = f"{target_num}-{sample.crop_file_name.split('-', 1)[1]}"
                     self._link_or_copy_file(src, negative_dir / neg_name)
                     neg_count += 1
-            log.debug("FaceReco [neg]: cluster %s — %d negative sample(s) linked", target_name, neg_count)
+            log.debug("FaceReco [neg]: cluster %s — %d negative sample(s) linked", target_num, neg_count)
             if target_index == 1 or target_index % 25 == 0 or target_index == len(clusters):
                 log.info("FaceReco [neg]: populated Negative folder %d/%d", target_index, len(clusters))
 
@@ -397,7 +680,14 @@ class FaceRecoPipeline:
         )
         return image[y1:y2, x1:x2]
 
-    def _write_face_json(self, cluster_dir: Path, cluster_name: str, samples: list[FaceSample]) -> None:
+    def _write_face_json(
+        self,
+        cluster_dir: Path,
+        cluster_name: str,
+        samples: list[FaceSample],
+        name: str = "",
+        playernum: int | None = None,
+    ) -> None:
         faces = []
         for sample in samples:
             emb = sample.embedding.astype(np.float32)
@@ -418,8 +708,8 @@ class FaceRecoPipeline:
             )
 
         payload = {
-            "name": "",
-            "playernum": None,
+            "name": name,
+            "playernum": playernum,
             "cluster": cluster_name,
             "provider": self.provider.provider_name(),
             "faces": faces,

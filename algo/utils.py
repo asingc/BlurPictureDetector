@@ -53,16 +53,40 @@ def _narrow_face_box(
     return Box(x1, y1, x2, y2)
 
 
-def _matches_allowed_jersey_color(predicted: str, allowed_colors: frozenset[str]) -> bool:
-    """Match either the full label (Hue, Shade) or just the hue."""
-    predicted_norm = (predicted or "").strip().lower()
-    if not predicted_norm:
+def _matches_allowed_jersey_color(cloth_color: str, allowed_colors: frozenset[str]) -> bool:
+    """Match cloth_color ("Hue:Shade") against the allow-list.
+
+    Shade match is preferred; hue match is accepted as fallback.
+    Allow-list entries may be plain hue names, shade names, or "Hue:Shade" labels.
+    """
+    if not cloth_color:
         return False
-    predicted_hue = predicted_norm.split(",", 1)[0].strip()
+    c_hue, _, c_shade = cloth_color.partition(":")
+    c_hue_l   = c_hue.strip().lower()
+    c_shade_l = c_shade.strip().lower()
     for allowed in allowed_colors:
-        allowed_norm = allowed.strip().lower()
-        if not allowed_norm:
+        a = allowed.strip().lower()
+        if not a:
             continue
-        if allowed_norm == predicted_norm or allowed_norm == predicted_hue:
-            return True
+        if ":" in a:
+            a_hue, _, a_shade = a.partition(":")
+            if a_shade == c_shade_l or a_hue == c_hue_l:
+                return True
+        else:
+            if a == c_shade_l or a == c_hue_l:
+                return True
     return False
+
+
+def _colors_match(cloth_color: str, reference: str) -> bool:
+    """Return True if *cloth_color* matches *reference* ("Hue:Shade" format).
+
+    Shade equality is preferred; hue equality is accepted as fallback.
+    """
+    if not cloth_color or not reference:
+        return False
+    c_hue, _, c_shade = cloth_color.partition(":")
+    r_hue, _, r_shade = reference.partition(":")
+    if c_shade.strip().lower() == r_shade.strip().lower():
+        return True
+    return c_hue.strip().lower() == r_hue.strip().lower()
