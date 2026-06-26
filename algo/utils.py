@@ -5,7 +5,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from algo.models import Box, Face
+from algo.models import Box, ColorLab, Face
 
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
@@ -53,17 +53,24 @@ def _narrow_face_box(
     return Box(x1, y1, x2, y2)
 
 
-def _matches_allowed_jersey_color(cloth_color: str, allowed_colors: frozenset[str]) -> bool:
-    """Match cloth_color ("Hue:Shade") against the allow-list.
+def _color_from_label(label: str) -> "ColorLab | None":
+    """Parse a 'Hue:Shade' label into a ColorLab, or return None for N/A / Unknown."""
+    if not label or label in ("N/A", "Unknown"):
+        return None
+    hue, _, shade = label.partition(":")
+    return ColorLab(hue.strip(), shade.strip())
+
+
+def _matches_allowed_jersey_color(color: "ColorLab | None", allowed_colors: frozenset[str]) -> bool:
+    """Match *color* against the allow-list.
 
     Shade match is preferred; hue match is accepted as fallback.
     Allow-list entries may be plain hue names, shade names, or "Hue:Shade" labels.
     """
-    if not cloth_color:
+    if color is None:
         return False
-    c_hue, _, c_shade = cloth_color.partition(":")
-    c_hue_l   = c_hue.strip().lower()
-    c_shade_l = c_shade.strip().lower()
+    c_hue_l   = color.hue.strip().lower()
+    c_shade_l = color.shade.strip().lower()
     for allowed in allowed_colors:
         a = allowed.strip().lower()
         if not a:
@@ -78,15 +85,13 @@ def _matches_allowed_jersey_color(cloth_color: str, allowed_colors: frozenset[st
     return False
 
 
-def _colors_match(cloth_color: str, reference: str) -> bool:
-    """Return True if *cloth_color* matches *reference* ("Hue:Shade" format).
+def _colors_match(color: "ColorLab | None", reference: "ColorLab | None") -> bool:
+    """Return True if *color* matches *reference*.
 
     Shade equality is preferred; hue equality is accepted as fallback.
     """
-    if not cloth_color or not reference:
+    if color is None or reference is None:
         return False
-    c_hue, _, c_shade = cloth_color.partition(":")
-    r_hue, _, r_shade = reference.partition(":")
-    if c_shade.strip().lower() == r_shade.strip().lower():
+    if color.shade.strip().lower() == reference.shade.strip().lower():
         return True
-    return c_hue.strip().lower() == r_hue.strip().lower()
+    return color.hue.strip().lower() == reference.hue.strip().lower()

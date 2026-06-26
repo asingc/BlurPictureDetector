@@ -64,6 +64,7 @@ from algo.sharpness import (
 )
 from algo.utils import (
     _HEAD_KP_INDICES,
+    _color_from_label,
     _matches_allowed_jersey_color,
     _narrow_face_box,
     cap_long_edge,
@@ -491,7 +492,7 @@ class ClothColorPredictor:
         ColorLab("Orange",     "Vivid",   ( 65.0,  35.0,  55.0)),
         ColorLab("Yellow",     "Gold",    ( 85.0,  -5.0,  75.0)),
         ColorLab("Green",      "Emerald", ( 45.0, -40.0,  25.0)),
-        ColorLab("Light Blue", "Sky",     ( 70.0,  -8.0, -30.0)),
+        ColorLab("Blue",       "Light Blue", ( 70.0,  -8.0, -30.0)),
         ColorLab("Blue",       "Royal",   ( 35.0,   5.0, -55.0)),
         ColorLab("Blue",       "Navy",    ( 15.0,   5.0, -25.0)),
         ColorLab("Purple",     "Violet",  ( 30.0,  30.0, -35.0)),
@@ -764,7 +765,7 @@ def annotate_image(result: dict, boxes_dir: Path, jersey_colors: frozenset[str] 
     score_labels: list[tuple] = []  # (text, x, y, color) — drawn opaquely after blend
     for p in evaluated:
         # Requirement: only annotate bodies whose jersey color is in the allowed set.
-        if jersey_colors and not _matches_allowed_jersey_color(p.get("cloth_color", "N/A"), jersey_colors):
+        if jersey_colors and not _matches_allowed_jersey_color(_color_from_label(p.get("cloth_color", "N/A")), jersey_colors):
             continue
         b: Box = p["body_bbox"]
         rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
@@ -1228,9 +1229,9 @@ def _recompute_verdicts(
             passes = bool(p.get("qualified_for_sharpness", False))
             color = p.get("cloth_color", "N/A")
 
-            if passes and jersey_colors and not _matches_allowed_jersey_color(color, jersey_colors):
+            if passes and jersey_colors and not _matches_allowed_jersey_color(_color_from_label(color), jersey_colors):
                 passes = False
-            if passes and our_jersey_color != "Unknown" and color != our_jersey_color:
+            if passes and our_jersey_color is not None and our_jersey_color != "Unknown" and color != our_jersey_color:
                 passes = False
             if passes and score <= threshold:
                 passes = False
@@ -1450,26 +1451,24 @@ def main() -> None:
     # Colours prefixed with '+' are forced-include: they are always added to the
     # filter regardless of what other colours are listed (e.g. goalie colours).
     # --noteam overrides everything and disables all colour filtering.
+    forced_colors: frozenset[str] = frozenset(
+        c.strip().lstrip("+").strip().title()
+        for c in (args.jerseycolor or "").split(";")
+        if c.strip().startswith("+") and c.strip().lstrip("+").strip()
+    )
+    regular_colors: frozenset[str] = frozenset(
+        c.strip().title()
+        for c in (args.jerseycolor or "").split(";")
+        if c.strip() and not c.strip().startswith("+")
+    )
+    jersey_colors: frozenset[str] = regular_colors | forced_colors
     if args.noteam:
-        jersey_colors: frozenset[str] = frozenset()
         log.info("--noteam: jersey-colour filtering disabled")
+    elif forced_colors:
+        log.debug("Jersey colours — regular: %s  forced (+): %s",
+                  sorted(regular_colors), sorted(forced_colors))
     else:
-        forced_colors: frozenset[str] = frozenset(
-            c.strip().lstrip("+").strip().title()
-            for c in (args.jerseycolor or "").split(";")
-            if c.strip().startswith("+") and c.strip().lstrip("+").strip()
-        )
-        regular_colors: frozenset[str] = frozenset(
-            c.strip().title()
-            for c in (args.jerseycolor or "").split(";")
-            if c.strip() and not c.strip().startswith("+")
-        )
-        jersey_colors: frozenset[str] = regular_colors | forced_colors
-        if forced_colors:
-            log.debug("Jersey colours — regular: %s  forced (+): %s",
-                      sorted(regular_colors), sorted(forced_colors))
-        else:
-            log.debug("Jersey colours: %s", sorted(jersey_colors))
+        log.debug("Jersey colours: %s", sorted(jersey_colors))
 
     try:
         sensitivity_threshold = float(args.sensitivity)
@@ -1494,7 +1493,7 @@ def main() -> None:
             log.error("--face-db directory not found: %s", face_db_dir)
             face_db_dir = None
 
-    jersey_stage = JerseyCountingStage(jersey_colors)
+    jersey_stage = JerseyCountingStage(forced_colors, regular_colors, no_team=args.noteam)
     stages: list[ProcessStage] = [
         ImageAnalysisStage(input_path, pose_model, face_model),
         GradingStage(sensitivity_threshold),
@@ -1505,7 +1504,7 @@ def main() -> None:
     for stage in stages:
         frames = stage.process(frames, app_config)
 
-    our_jersey_color = jersey_stage.our_color
+    our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
     write_results_json(frames, output_dir / "results.json", our_jersey_color=our_jersey_color)
 
     if frames:

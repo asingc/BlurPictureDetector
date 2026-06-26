@@ -112,6 +112,7 @@ class Body:
     faces:             list[Face]                # matched faces (may be empty before face matching)
     keypoints:         list[PredictedKeyPoint]   # 17 COCO body keypoints
     passed:            bool        = True        # scorers set this to False to disqualify
+    rejection_reason:  str         = ""          # reason why this body was rejected (empty if accepted)
     sharpness_score:   float       = 0.0         # best face sharpness score (set by FaceSharpnessScorer)
     best_face:         Face | None = None        # face that yielded sharpness_score
     best_narrow_box:   Box  | None = None        # narrow landmark bbox for best_face
@@ -124,9 +125,9 @@ class Body:
 @dataclass
 class ColorLab:
     """A named reference colour in CIE L*a*b* space."""
-    hue:   str                         # broad category: "Red", "Blue", "Gray" …
-    shade: str                         # precise variant: "Crimson", "Royal", "75%" …
-    lab:   tuple[float, float, float]  # L*, a*, b* reference values
+    hue:   str                                          # broad category: "Red", "Blue", "Gray" …
+    shade: str                                          # precise variant: "Crimson", "Royal", "75%" …
+    lab:   tuple[float, float, float] = (0.0, 0.0, 0.0)  # L*, a*, b* reference values (optional for label-only instances)
 
     @property
     def label(self) -> str:

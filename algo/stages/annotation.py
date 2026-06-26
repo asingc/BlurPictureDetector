@@ -10,7 +10,7 @@ from algo.config import AppConfig
 from algo.frame import Frame
 from algo.models import Box, Face
 from algo.stage import ProcessStage
-from algo.utils import _matches_allowed_jersey_color
+from algo.utils import _color_from_label, _matches_allowed_jersey_color
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -105,12 +105,13 @@ def _annotate_frame(
     font           = cv2.FONT_HERSHEY_SIMPLEX
     font_thick     = config.annotation_score_font_thickness
     (_, _base_h), _ = cv2.getTextSize("Mg", font, 1.0, font_thick)
-    font_scale = config.annotation_score_font_size_px * ann_scale / max(_base_h, 1)
+    font_scale           = config.annotation_score_font_size_px            * ann_scale / max(_base_h, 1)
+    rejection_font_scale = config.annotation_rejection_reason_font_size_px * ann_scale / max(_base_h, 1)
 
     score_labels: list[tuple] = []
 
     for body in frame.bodies:
-        if jersey_colors and not _matches_allowed_jersey_color(body.cloth_color, jersey_colors):
+        if jersey_colors and not _matches_allowed_jersey_color(_color_from_label(body.cloth_color), jersey_colors):
             continue
 
         b = body.bbox
@@ -168,15 +169,23 @@ def _annotate_frame(
             label = f"{body.sharpness_score:.2f}"
             (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
             text_y = min(label_bottom + th + baseline + 2, h_out - 1)
-            score_labels.append((label, label_x, text_y, body_color))
+            score_labels.append((label, label_x, text_y, body_color, font_scale))
 
-        # Cloth colour label
-        cloth = body.cloth_color
-        if cloth not in ("N/A", "Unknown"):
-            (clw, clh), _ = cv2.getTextSize(cloth, font, font_scale, font_thick)
-            cl_x = max(rbx1, rbx2 - clw - 4)
-            cl_y = max(clh + 4, rby1 + clh + 4)
-            score_labels.append((cloth, cl_x, cl_y, body_color))
+        # Cloth colour label (passed) or rejection reason (failed)
+        if body.passed:
+            cloth = body.cloth_color
+            if cloth not in ("N/A", "Unknown"):
+                (clw, clh), _ = cv2.getTextSize(cloth, font, font_scale, font_thick)
+                cl_x = max(rbx1, rbx2 - clw - 4)
+                cl_y = max(clh + 4, rby1 + clh + 4)
+                score_labels.append((cloth, cl_x, cl_y, body_color, font_scale))
+        else:
+            reason = body.rejection_reason
+            if reason:
+                (rw, rh), _ = cv2.getTextSize(reason, font, rejection_font_scale, font_thick)
+                r_x = max(rbx1, rbx2 - rw - 4)
+                r_y = max(rh + 4, rby1 + rh + 4)
+                score_labels.append((reason, r_x, r_y, body_color, rejection_font_scale))
 
         # Face landmark circles
         if body.best_face is not None:
@@ -194,8 +203,8 @@ def _annotate_frame(
     cv2.addWeighted(overlay, config.annotation_alpha,
                     annotated, 1.0 - config.annotation_alpha, 0, annotated)
 
-    for label, lx, ly, lcolor in score_labels:
-        cv2.putText(annotated, label, (lx, ly), font, font_scale, lcolor, font_thick, cv2.LINE_AA)
+    for label, lx, ly, lcolor, fscale in score_labels:
+        cv2.putText(annotated, label, (lx, ly), font, fscale, lcolor, font_thick, cv2.LINE_AA)
 
     out_name    = frame.path.stem + ".jpg"
     anno_subdir = output_dir / ("anno_blur" if overall_blurry else "anno_sharp")

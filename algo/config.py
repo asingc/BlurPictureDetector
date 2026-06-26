@@ -45,8 +45,10 @@ class AppConfig:
     annotation_narrow_face_box_color:     tuple[int, int, int] = field(default=(0, 255, 0))  # green
     annotation_narrow_face_box_thickness: int                  = 1
     # Blur score label drawn below each face bounding box.
-    annotation_score_font_size_px:    int   = 20   # target text height in pixels
-    annotation_score_font_thickness:  int   = 3
+    annotation_score_font_size_px:          int   = 20   # target text height in pixels
+    annotation_score_font_thickness:        int   = 3
+    # Rejection reason label drawn on failed bodies instead of jersey colour.
+    annotation_rejection_reason_font_size_px: int = 16   # target text height in pixels
     # Face landmark circle.
     annotation_face_kp_radius:        int   = 3    # circle radius (px)
     annotation_face_kp_thickness:     int   = 1    # circle line thickness

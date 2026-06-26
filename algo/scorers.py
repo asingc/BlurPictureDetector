@@ -9,7 +9,7 @@ import numpy as np
 from algo.config import app_config
 from algo.models import Body, Box, Face
 from algo.sharpness import sharpness_evaluator
-from algo.utils import _HEAD_KP_INDICES, _matches_allowed_jersey_color, _narrow_face_box, cap_long_edge
+from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, _narrow_face_box, cap_long_edge
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -60,6 +60,7 @@ class MatchedFaceScorer(BodyScorerBase):
     def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
         if not body.faces:
             body.passed = False
+            body.rejection_reason = "no matched face"
             bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
             log.debug("[scorer:matched_face] body bbox=(%d,%d,%d,%d): no matched face → fail",
                       bx1, by1, bx2, by2)
@@ -88,6 +89,7 @@ class FaceSizeScorer(BodyScorerBase):
                           fx1, fy1, fx2, fy2, face_long, self.min_fraction)
         if body.faces and not any(f.passed for f in body.faces):
             body.passed = False
+            body.rejection_reason = "all faces too small"
         return body
 
 
@@ -119,6 +121,7 @@ class BodyHeadKPVisibilityScorer(BodyScorerBase):
         )
         if n_vis < self.min_visible:
             body.passed = False
+            body.rejection_reason = f"only {n_vis}/{len(_HEAD_KP_INDICES)} head keypoints visible (need {self.min_visible})"
             bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
             log.debug("[scorer:head_kp] body bbox=(%d,%d,%d,%d): %d/%d head KPs visible (need %d) → fail",
                       bx1, by1, bx2, by2,
@@ -160,6 +163,7 @@ class FaceLandmarkVisibilityScorer(BodyScorerBase):
                           n_vis, len(face.landmarks), self.min_visible)
         if body.faces and not any(f.passed for f in body.faces):
             body.passed = False
+            body.rejection_reason = "all faces failed landmark visibility"
         return body
 
 
@@ -208,6 +212,7 @@ class FaceSharpnessScorer(BodyScorerBase):
         body.ten             = best_ten
         if best_score <= self.threshold:
             body.passed = False
+            body.rejection_reason = f"sharpness score {best_score:.4f} <= threshold {self.threshold:.2f}"
             bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
             log.debug("[scorer:sharpness] body bbox=(%d,%d,%d,%d): best_score=%.4f <= threshold=%.2f → fail",
                       bx1, by1, bx2, by2,
@@ -228,9 +233,10 @@ class JerseyColorScorer(BodyScorerBase):
     def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
         if not self.allowed_colors:
             return body
-        color = body.cloth_color
+        color = _color_from_label(body.cloth_color)
         if not _matches_allowed_jersey_color(color, self.allowed_colors):
             body.passed = False
+            body.rejection_reason = f"jersey color '{color}' not in allowed set {sorted(self.allowed_colors)}"
             log.debug(
                 "[scorer:jersey_color] body bbox=(%d,%d,%d,%d): cloth_color=%s not in %s → fail",
                     *body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0]),
