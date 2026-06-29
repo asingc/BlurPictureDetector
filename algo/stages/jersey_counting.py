@@ -87,6 +87,7 @@ class JerseyCountingStage(ProcessStage):
                 # Allow-list check (CLI --jerseycolor regular entries).
                 if not _matches_allowed_jersey_color(bcolor, self.allowed_colors):
                     body.passed = False
+                    body.rejection_reason = f"jersey color '{body.cloth_color}' not in allow-list"
                     log.debug("[JerseyCountingStage] %s — body cloth=%s not in allow-list → fail",
                               frame.path.name, body.cloth_color)
                     continue
@@ -94,6 +95,7 @@ class JerseyCountingStage(ProcessStage):
                 # Team colour check (polled from all frames).
                 if not _colors_match(bcolor, our_color):
                     body.passed = False
+                    body.rejection_reason = f"jersey color '{body.cloth_color}' != team colour '{our_color.label}'"
                     log.debug("[JerseyCountingStage] %s — body cloth=%s != team colour %s → fail",
                               frame.path.name, body.cloth_color, our_color.label)
 

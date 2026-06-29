@@ -54,10 +54,14 @@ class FaceRecoStage(ProcessStage):
         output_dir: Path,
         face_db_dir: Path | None = None,
         face_db_match_threshold: float = 0.72,
+        align_faces: bool = False,
+        debug_align: bool = False,
     ) -> None:
         self.output_dir = output_dir
         self.face_db_dir = face_db_dir
         self.face_db_match_threshold = face_db_match_threshold
+        self.align_faces = align_faces
+        self.debug_align = debug_align
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         sharp_body_count = sum(
@@ -91,6 +95,8 @@ class FaceRecoStage(ProcessStage):
             facereco_config = FaceRecoConfig(
                 face_db_dir=self.face_db_dir,
                 face_db_match_threshold=self.face_db_match_threshold,
+                align_faces=self.align_faces,
+                debug_align=self.debug_align,
             )
             pipeline = FaceRecoPipeline(provider=provider, config=facereco_config)
             facereco_dir = pipeline.run(self.output_dir)

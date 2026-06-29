@@ -49,8 +49,10 @@ class ClothColorPredictor:
         ColorLab("Light Blue", "Sky",     ( 70.0,  -8.0, -30.0)),
         ColorLab("Blue",       "Royal",   ( 35.0,   5.0, -55.0)),
         ColorLab("Blue",       "Navy",    ( 15.0,   5.0, -25.0)),
+        ColorLab("Blue",       "Deep Blue", ( 12.0,  10.0, -42.0)),
         ColorLab("Purple",     "Violet",  ( 30.0,  30.0, -35.0)),
         ColorLab("Pink",       "Magenta", ( 55.0,  60.0, -20.0)),
+        ColorLab("Pink",       "Deep Magenta", ( 28.0,  48.0, -12.0)),
         ColorLab("White",      "Bright",  ( 95.0,   0.0,   0.0)),
         ColorLab("Gray",       "75%",     ( 75.0,   0.0,   0.0)),
         ColorLab("Gray",       "Medium",  ( 50.0,   0.0,   0.0)),
@@ -160,19 +162,26 @@ class GradingStage(ProcessStage):
             if frame.normalized_image is None:
                 continue
 
-            frame.bodies = scorer.process(frame.normalized_image, frame.bodies)
+            try:
+                frame.bodies = scorer.process(frame.normalized_image, frame.bodies)
 
-            for body in frame.bodies:
-                if not body.passed:
-                    continue
-                body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(
-                    body, frame.normalized_image
-                )
-                bx1, by1, bx2, by2 = body.bbox.as_px_ints(
-                    frame.normalized_image.shape[1], frame.normalized_image.shape[0]
-                )
-                log.debug("[GradingStage] %s — body bbox=(%d,%d,%d,%d) score=%.4f cloth=%s",
-                          frame.path.name, bx1, by1, bx2, by2,
-                          body.sharpness_score, body.cloth_color)
+                for body in frame.bodies:
+                    if not body.passed:
+                        continue
+                    body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(
+                        body, frame.normalized_image
+                    )
+                    bx1, by1, bx2, by2 = body.bbox.as_px_ints(
+                        frame.normalized_image.shape[1], frame.normalized_image.shape[0]
+                    )
+                    log.debug("[GradingStage] %s — body bbox=(%d,%d,%d,%d) score=%.4f cloth=%s",
+                              frame.path.name, bx1, by1, bx2, by2,
+                              body.sharpness_score, body.cloth_color)
+            except Exception as exc:  # noqa: BLE001 — never let one frame abort the batch
+                log.exception("[GradingStage] %s — error while grading: %s",
+                              frame.path.name, exc)
+                for body in frame.bodies:
+                    body.passed = False
+                    body.rejection_reason = f"exception while grading: {exc}"
 
         return frames

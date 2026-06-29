@@ -121,6 +121,25 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--align-faces",
+        action="store_true",
+        help=(
+            "Similarity-align each face to a canonical 5-point template before "
+            "computing its embedding.  Must match the setting used to build the "
+            "face DB (RebuildFaceDB.py --align-faces).  Use for alignment A/B "
+            "comparison."
+        ),
+    )
+    parser.add_argument(
+        "--debug-align",
+        action="store_true",
+        help=(
+            "Write per-face alignment QA images (annotated crop + aligned face) "
+            "to <output>/.FaceReco/.debug for visual inspection of landmark "
+            "order and alignment quality."
+        ),
+    )
+    parser.add_argument(
         "--open-viewer",
         action="store_true",
         help="Open the generated .FaceReco folder in the system file explorer.",
@@ -147,6 +166,8 @@ def main() -> None:
         face_buffer_ratio=args.face_buffer_ratio,
         face_db_dir=face_db_dir,
         face_db_match_threshold=args.face_db_match_threshold,
+        align_faces=args.align_faces,
+        debug_align=args.debug_align,
     )
     pipeline = FaceRecoPipeline(provider=provider, config=config)
 

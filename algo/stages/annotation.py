@@ -10,7 +10,6 @@ from algo.config import AppConfig
 from algo.frame import Frame
 from algo.models import Box, Face
 from algo.stage import ProcessStage
-from algo.utils import _color_from_label, _matches_allowed_jersey_color
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -62,7 +61,6 @@ def _draw_status_icon(
 def _annotate_frame(
     frame: Frame,
     output_dir: Path,
-    jersey_colors: frozenset[str],
     config: AppConfig,
 ) -> None:
     """Write an annotated preview for one frame to the appropriate sub-folder.
@@ -110,10 +108,13 @@ def _annotate_frame(
 
     score_labels: list[tuple] = []
 
-    for body in frame.bodies:
-        if jersey_colors and not _matches_allowed_jersey_color(_color_from_label(body.cloth_color), jersey_colors):
-            continue
+    # Bodies to annotate: top-N by bbox area ∪ all passed bodies.
+    # Sort largest-first so bigger boxes render behind smaller ones.
+    sorted_by_size = sorted(frame.bodies, key=lambda b: b.bbox.area, reverse=True)
+    top_n_ids = {id(b) for b in sorted_by_size[:config.annotation_top_n_bodies]}
+    bodies_to_render = [b for b in sorted_by_size if id(b) in top_n_ids or b.passed]
 
+    for body in bodies_to_render:
         b = body.bbox
         rbx1 = int(b.x1 * sx); rby1 = int(b.y1 * sy)
         rbx2 = int(b.x2 * sx); rby2 = int(b.y2 * sy)
@@ -180,12 +181,11 @@ def _annotate_frame(
                 cl_y = max(clh + 4, rby1 + clh + 4)
                 score_labels.append((cloth, cl_x, cl_y, body_color, font_scale))
         else:
-            reason = body.rejection_reason
-            if reason:
-                (rw, rh), _ = cv2.getTextSize(reason, font, rejection_font_scale, font_thick)
-                r_x = max(rbx1, rbx2 - rw - 4)
-                r_y = max(rh + 4, rby1 + rh + 4)
-                score_labels.append((reason, r_x, r_y, body_color, rejection_font_scale))
+            reason = body.rejection_reason or "rejected (no reason given)"
+            (rw, rh), _ = cv2.getTextSize(reason, font, rejection_font_scale, font_thick)
+            r_x = max(rbx1, rbx2 - rw - 4)
+            r_y = max(rh + 4, rby1 + rh + 4)
+            score_labels.append((reason, r_x, r_y, body_color, rejection_font_scale))
 
         # Face landmark circles
         if body.best_face is not None:
@@ -226,13 +226,12 @@ class AnnotationStage(ProcessStage):
     The frame list is returned unchanged.
     """
 
-    def __init__(self, output_dir: Path, jersey_colors: frozenset[str] = frozenset()) -> None:
-        self.output_dir   = output_dir
-        self.jersey_colors = jersey_colors
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         for idx, frame in enumerate(frames, 1):
             log.debug("[AnnotationStage] [%d/%d] %s", idx, len(frames), frame.path.name)
-            _annotate_frame(frame, self.output_dir, self.jersey_colors, config)
+            _annotate_frame(frame, self.output_dir, config)
         log.info("[AnnotationStage] annotated %d frame(s) → %s", len(frames), self.output_dir)
         return frames

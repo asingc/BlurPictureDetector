@@ -60,6 +60,10 @@ class AppConfig:
     # Annotation opacity: 1.0 = fully opaque, 0.0 = invisible.
     annotation_alpha:                 float = 0.25
 
+    # Number of largest bodies (by bbox area) always annotated regardless of
+    # pass/fail.  All passed bodies are annotated on top of this set.
+    annotation_top_n_bodies:          int   = 5
+
     # Annotated preview / processing image scaling.
     # Images are downsized so the long edge equals normalized_img_max_long_edge.
     # Never upscales.

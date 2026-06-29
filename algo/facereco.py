@@ -3,15 +3,15 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 import rawpy
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import AgglomerativeClustering
 
+from .face_crop_embed import embed_face_crop, load_face_model, make_alignment_debug_image
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 
 log = logging.getLogger("BlurPictureDetector")
@@ -24,12 +24,26 @@ class FaceRecoConfig:
     cluster_similarity_threshold: float = 0.68
     face_buffer_ratio: float = 0.15
     output_dir_name: str = ".FaceReco"
+    # When True, each face crop is similarity-aligned to a canonical 5-point
+    # template before its embedding is computed.  Must match the setting used
+    # to build the face DB (RebuildFaceDB.py --align-faces) for matching to
+    # work.  Provided as an on/off switch for alignment A/B comparison.
+    align_faces: bool = False
+    # When True, write per-face alignment QA images (annotated crop + aligned
+    # face) to ``<output_dir>/.FaceReco/.debug`` so the landmark order and
+    # alignment quality can be inspected visually.
+    debug_align: bool = False
     # Optional path to a face-DB directory.  Each subdirectory must contain
     # a face.json produced by a previous FaceReco run.
     face_db_dir: Path | None = None
     # Minimum cosine similarity for a cluster centroid to be matched against
     # a face-DB entry.
     face_db_match_threshold: float = 0.72
+    # Number of a person's top positive embeddings to average when scoring a
+    # sample against that person.  Averaging the best few (rather than the
+    # single closest) makes matching robust to one noisy/mislabeled DB
+    # embedding.  1 reproduces the old single-max behaviour.
+    face_db_match_topk: int = 3
 
 
 @dataclass
@@ -149,13 +163,15 @@ class FaceRecoPipeline:
         info_path = prep_output_dir / "info.json"
 
         log.info("FaceReco: starting  prep_dir=%s", prep_output_dir)
+        log.info("FaceReco: face alignment %s", "ENABLED" if self.config.align_faces else "disabled")
         log.debug(
             "FaceReco config: provider=%s  cluster_threshold=%.3f  eps=%.3f  "
-            "face_buffer_ratio=%.2f  output_dir=%s",
+            "face_buffer_ratio=%.2f  align_faces=%s  output_dir=%s",
             self.provider.provider_name(),
             self.config.cluster_similarity_threshold,
             1.0 - self.config.cluster_similarity_threshold,
             self.config.face_buffer_ratio,
+            self.config.align_faces,
             self.config.output_dir_name,
         )
 
@@ -170,6 +186,12 @@ class FaceRecoPipeline:
         out_root.mkdir(parents=True, exist_ok=True)
         log.debug("FaceReco: output root=%s", out_root)
 
+        debug_dir: Path | None = None
+        if self.config.debug_align:
+            debug_dir = out_root / ".debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            log.info("FaceReco: alignment debug images → %s", debug_dir)
+
         if not qualified:
             log.warning("FaceReco: no qualified (sharp) bodies found — empty folder created: %s", out_root)
             return out_root
@@ -182,7 +204,7 @@ class FaceRecoPipeline:
                      len(face_db), self.config.face_db_dir)
 
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
-        samples = self._predict_samples(qualified)
+        samples = self._predict_samples(qualified, debug_dir)
         log.info("FaceReco: %d/%d embeddings extracted successfully", len(samples), len(qualified))
         clusters = self._cluster_samples(samples)
         log.info("FaceReco: %d cluster(s) identified  (sizes: %s)",
@@ -292,7 +314,11 @@ class FaceRecoPipeline:
             log.debug("FaceReco [load]: %s  loaded %dx%d", path.name, img.shape[1], img.shape[0])
         return img
 
-    def _predict_samples(self, qualified: list[_QualifiedBody]) -> list[tuple[_QualifiedBody, Player, np.ndarray]]:
+    def _predict_samples(
+        self,
+        qualified: list[_QualifiedBody],
+        debug_dir: Path | None = None,
+    ) -> list[tuple[_QualifiedBody, Player, np.ndarray]]:
         predicted: list[tuple[_QualifiedBody, Player, np.ndarray]] = []
         total = len(qualified)
         skipped_load = skipped_embedding = skipped_crop = 0
@@ -304,7 +330,29 @@ class FaceRecoPipeline:
                 skipped_load += 1
                 log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
                 continue
-            player = self.provider.predict_player(image, item.body)
+            # Crop the face area first (same "face preview" rules used for the
+            # saved crop), then re-detect landmarks on the crop and embed from
+            # it.  Embedding from the exact crop we save guarantees that a
+            # later RebuildFaceDB run reproduces this embedding, so prediction
+            # and face-DB embeddings live in the same space.
+            crop = self._crop_face_with_buffer(image, item.body)
+            if crop is None:
+                skipped_crop += 1
+                log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
+                continue
+            result = embed_face_crop(
+                self.provider,
+                load_face_model(),
+                crop,
+                fallback_confidence=item.body.confidence,
+                align=self.config.align_faces,
+                collect_debug=debug_dir is not None,
+            )
+            if debug_dir is not None:
+                player, debug = result
+                self._write_align_debug(debug_dir, item, crop, debug)
+            else:
+                player = result
             embedding = player.internal.get("embedding")
             if embedding is None:
                 skipped_embedding += 1
@@ -316,11 +364,6 @@ class FaceRecoPipeline:
                 tag, emb_arr.shape[0], float(np.linalg.norm(emb_arr)),
                 f"{player.confidence:.3f}" if player.confidence is not None else "n/a",
             )
-            crop = self._crop_face_with_buffer(image, item.body)
-            if crop is None:
-                skipped_crop += 1
-                log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
-                continue
             log.debug("FaceReco [embed]: %s — crop %dx%d  ✓", tag, crop.shape[1], crop.shape[0])
             predicted.append((item, player, crop))
             if index == 1 or index % 50 == 0 or index == total:
@@ -332,39 +375,79 @@ class FaceRecoPipeline:
         )
         return predicted
 
-    def _cluster_samples(self, predicted: list[tuple[_QualifiedBody, Player, np.ndarray]]) -> list[Cluster]:
-        """Cluster face embeddings with DBSCAN using pairwise cosine distance.
+    def _write_align_debug(
+        self,
+        debug_dir: Path,
+        item: _QualifiedBody,
+        crop: np.ndarray,
+        debug: dict,
+    ) -> None:
+        """Write one alignment QA image (annotated crop + aligned face)."""
+        try:
+            vis = make_alignment_debug_image(
+                crop, debug.get("landmarks_px", []), debug.get("aligned")
+            )
+            name = f"{Path(item.image_path.name).stem}-b{item.body.body_index}.png"
+            cv2.imwrite(str(debug_dir / name), vis, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        except Exception as exc:  # noqa: BLE001 — debug output must never break the run
+            log.debug("FaceReco [debug]: failed to write alignment debug for %s body#%d: %s",
+                      item.image_path.name, item.body.body_index, exc)
 
-        Every sample is always assigned to a cluster (min_samples=1).
-        eps = 1 - cluster_similarity_threshold converts the similarity
-        threshold to a cosine *distance* threshold.
+    def _cluster_samples(self, predicted: list[tuple[_QualifiedBody, Player, np.ndarray]]) -> list[Cluster]:
+        """Cluster face embeddings by pairwise cosine distance.
+
+        Uses **average-linkage** agglomerative clustering rather than DBSCAN.
+        DBSCAN with ``min_samples=1`` performs single-link clustering, which is
+        prone to *chaining*: two unrelated people get merged into one cluster as
+        soon as a single intermediate "bridge" face sits within ``eps`` of both.
+        On a roster of similar-looking athletes this collapses most faces into a
+        single giant bucket.  Average linkage requires the *mean* pairwise
+        distance between two groups to fall below the threshold before they
+        merge, which resists chaining while still assigning every face to a
+        cluster.
+
+        ``distance_threshold = 1 - cluster_similarity_threshold`` converts the
+        configured cosine *similarity* threshold into a cosine *distance*
+        threshold.
         """
         if not predicted:
             log.warning("FaceReco [cluster]: no samples to cluster")
             return []
 
-        # Build unit-normalised embedding matrix.
-        embeddings: list[np.ndarray] = []
-        for _item, player, _crop in predicted:
-            emb = np.asarray(player.internal["embedding"], dtype=np.float32)
-            embeddings.append(self._normalize(emb))
+        # Single, intentional normalisation step.  FaceNet (InceptionResnetV1)
+        # already L2-normalises its output, so this is effectively a no-op for
+        # those embeddings, but it guarantees unit vectors regardless of the
+        # provider -- every downstream comparison (clustering here AND face-DB
+        # matching) then operates on unit vectors.  There is no distorting
+        # "double normalisation": re-normalising a unit vector is mathematically
+        # a no-op, and cosine distance is scale-invariant either way.
+        embeddings: list[np.ndarray] = [
+            self._normalize(np.asarray(player.internal["embedding"], dtype=np.float32))
+            for _item, player, _crop in predicted
+        ]
         matrix = np.array(embeddings, dtype=np.float32)
+        n_samples = len(embeddings)
 
         eps = max(1e-6, 1.0 - self.config.cluster_similarity_threshold)
-        log.info(
-            "FaceReco [cluster]: running DBSCAN  n_samples=%d  eps=%.4f  "
-            "(similarity_threshold=%.3f)  metric=cosine",
-            len(embeddings), eps, self.config.cluster_similarity_threshold,
-        )
-        labels: np.ndarray = DBSCAN(
-            eps=eps,
-            min_samples=1,
-            metric="cosine",
-            n_jobs=1,
-        ).fit_predict(matrix)
+        if n_samples < 2:
+            # AgglomerativeClustering needs >= 2 samples; trivially one cluster.
+            labels = np.zeros(n_samples, dtype=int)
+            log.info("FaceReco [cluster]: %d sample(s) -- single cluster", n_samples)
+        else:
+            log.info(
+                "FaceReco [cluster]: agglomerative  n_samples=%d  distance_threshold=%.4f  "
+                "(similarity_threshold=%.3f)  metric=cosine  linkage=average",
+                n_samples, eps, self.config.cluster_similarity_threshold,
+            )
+            labels = AgglomerativeClustering(
+                n_clusters=None,
+                metric="cosine",
+                linkage="average",
+                distance_threshold=eps,
+            ).fit_predict(matrix)
 
         unique_labels = sorted(set(labels.tolist()))
-        log.info("FaceReco [cluster]: DBSCAN produced %d cluster(s)  labels=%s",
+        log.info("FaceReco [cluster]: produced %d cluster(s)  labels=%s",
                  len(unique_labels), unique_labels)
 
         cluster_map: dict[int, Cluster] = {}
@@ -396,8 +479,28 @@ class FaceRecoPipeline:
     def _normalize(self, vector: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vector))
         if norm <= 1e-12:
-            return vector
+            log.warning("FaceReco [normalize]: zero/near-zero norm vector detected (norm=%.2e), treating as unit vector", norm)
+            return np.ones_like(vector) / np.sqrt(vector.shape[0])
         return vector / norm
+
+    def _aggregate_similarity(
+        self, emb: np.ndarray, refs: list[np.ndarray],
+    ) -> float:
+        """Score *emb* against a person's reference embeddings.
+
+        Returns the mean of the ``face_db_match_topk`` highest cosine
+        similarities, which is robust to a single noisy/mislabeled reference.
+        When the person has fewer references than ``topk`` (or topk <= 1) this
+        degrades gracefully toward the plain maximum.
+        """
+        if not refs:
+            return -1.0
+        sims = np.fromiter((float(np.dot(emb, r)) for r in refs), dtype=np.float64)
+        k = max(1, min(self.config.face_db_match_topk, sims.shape[0]))
+        if k == 1:
+            return float(sims.max())
+        topk = np.partition(sims, -k)[-k:]
+        return float(topk.mean())
 
     def _match_clusters_to_facedb(
         self, clusters: list[Cluster], face_db: FaceDb,
@@ -417,6 +520,11 @@ class FaceRecoPipeline:
         drifted away from the DB embeddings will still be correctly identified
         if most of its individual samples match that person.
 
+        Negative embeddings act as a veto: if a sample resembles one of the
+        matched person's curated non-match examples at least as strongly as its
+        best positive match, that sample's vote is discarded.  This suppresses
+        false positives from known look-alikes.
+
         Only DB entries produced by the same provider as the current pipeline
         are considered, so that embedding spaces are compatible.
         """
@@ -430,8 +538,13 @@ class FaceRecoPipeline:
             return {}
 
         # Pre-normalise all DB embeddings once to avoid repeated work.
-        normalised_db: list[tuple[FaceDbEntry, list[np.ndarray]]] = [
-            (entry, [self._normalize(emb.astype(np.float32)) for emb in entry.embeddings])
+        # Each tuple: (entry, normalised positives, normalised negatives).
+        normalised_db: list[tuple[FaceDbEntry, list[np.ndarray], list[np.ndarray]]] = [
+            (
+                entry,
+                [self._normalize(emb.astype(np.float32)) for emb in entry.embeddings],
+                [self._normalize(emb.astype(np.float32)) for emb in entry.negative_embeddings],
+            )
             for entry in compatible
         ]
 
@@ -448,15 +561,32 @@ class FaceRecoPipeline:
                 emb = self._normalize(sample.embedding.astype(np.float32))
                 sample_best_score = -1.0
                 sample_best_entry: FaceDbEntry | None = None
+                sample_best_negs: list[np.ndarray] = []
 
-                for entry, normed_embs in normalised_db:
-                    sim = max(float(np.dot(emb, ne)) for ne in normed_embs)
+                for entry, normed_embs, normed_negs in normalised_db:
+                    sim = self._aggregate_similarity(emb, normed_embs)
                     if sim > sample_best_score:
                         sample_best_score = sim
                         sample_best_entry = entry
+                        sample_best_negs = normed_negs
 
                 if (sample_best_entry is not None
                         and sample_best_score >= self.config.face_db_match_threshold):
+                    # Negative veto: if the sample resembles one of this person's
+                    # curated non-match examples at least as much as the best
+                    # positive, the match is rejected (it's a known look-alike).
+                    neg_sim = max(
+                        (float(np.dot(emb, ne)) for ne in sample_best_negs),
+                        default=-1.0,
+                    )
+                    if neg_sim >= sample_best_score:
+                        log.debug(
+                            "FaceReco [match]: cluster %04d — sample vetoed by negative "
+                            "(%s  pos_sim=%.4f  neg_sim=%.4f)",
+                            cluster.cluster_id, sample_best_entry.name,
+                            sample_best_score, neg_sim,
+                        )
+                        continue
                     name = sample_best_entry.name
                     votes[name] = votes.get(name, 0) + 1
                     best_sim_for[name] = max(best_sim_for.get(name, -1.0), sample_best_score)
@@ -520,14 +650,16 @@ class FaceRecoPipeline:
                     )
                     continue
 
+                # Lossless PNG: the saved crop must reproduce this run's
+                # embedding exactly when the DB is later rebuilt from it.
                 crop_name = (
                     f"{cluster_num}-"
                     f"{Path(sample.body.orig_filename).stem}-"
-                    f"b{sample.body.body_index}.jpg"
+                    f"b{sample.body.body_index}.png"
                 )
                 cv2.imwrite(
                     str(all_faces_dir / crop_name), crop,
-                    [cv2.IMWRITE_JPEG_QUALITY, 92],
+                    [cv2.IMWRITE_PNG_COMPRESSION, 3],
                 )
                 written += 1
 
@@ -548,6 +680,7 @@ class FaceRecoPipeline:
 
         payload = {
             "provider": self.provider.provider_name(),
+            "aligned": self.config.align_faces,
             "total": written,
             "faces": face_entries,
         }
@@ -563,8 +696,6 @@ class FaceRecoPipeline:
         src_dir: Path,
         cluster_name_map: dict[int, FaceDbEntry] | None = None,
     ) -> None:
-        # Maps cluster_id → actual output directory (may be named after a person).
-        cluster_id_to_dir: dict[int, Path] = {}
         log.info("FaceReco [write]: writing %d cluster(s) to %s", len(clusters), out_root)
         for cluster_index, cluster in enumerate(clusters, start=1):
             # The 4-digit numeric name is always used for internal file naming.
@@ -577,7 +708,6 @@ class FaceRecoPipeline:
             negative_dir = cluster_dir / "Negative"
             face_dir.mkdir(parents=True, exist_ok=True)
             negative_dir.mkdir(parents=True, exist_ok=True)
-            cluster_id_to_dir[cluster.cluster_id] = cluster_dir
 
             written = 0
             for sample in cluster.samples:
@@ -587,8 +717,10 @@ class FaceRecoPipeline:
                               cluster_num, sample.body.orig_filename, sample.body.body_index)
                     continue
 
-                crop_name = f"{cluster_num}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.jpg"
-                cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                # Lossless PNG: this crop becomes the face-DB image, so it must
+                # reproduce the prediction embedding exactly on rebuild.
+                crop_name = f"{cluster_num}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
+                cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
                 sample.crop_file_name = crop_name
                 sample.crop_image = None
                 written += 1
@@ -606,47 +738,11 @@ class FaceRecoPipeline:
                 label, cluster_index, len(clusters), len(cluster.samples), written,
             )
 
-        log.info("FaceReco [write]: populating Negative folders for %d cluster(s)", len(clusters))
-        for target_index, target_cluster in enumerate(clusters, start=1):
-            target_dir = cluster_id_to_dir[target_cluster.cluster_id]
-            negative_dir = target_dir / "Negative"
-            target_num = f"{target_cluster.cluster_id:04d}"
-            neg_count = 0
-            for other_cluster in clusters:
-                if other_cluster.cluster_id == target_cluster.cluster_id:
-                    continue
-                # When a face DB was used, only matched clusters are reliable
-                # negative sources; skip unmatched clusters entirely.
-                if cluster_name_map and other_cluster.cluster_id not in cluster_name_map:
-                    continue
-                source_face_dir = cluster_id_to_dir[other_cluster.cluster_id] / "Face"
-                for sample in other_cluster.samples:
-                    if not sample.crop_file_name:
-                        continue
-                    src = source_face_dir / sample.crop_file_name
-                    if not src.exists():
-                        log.debug("FaceReco [neg]: source crop missing: %s", src)
-                        continue
-                    neg_name = f"{target_num}-{sample.crop_file_name.split('-', 1)[1]}"
-                    self._link_or_copy_file(src, negative_dir / neg_name)
-                    neg_count += 1
-            log.debug("FaceReco [neg]: cluster %s — %d negative sample(s) linked", target_num, neg_count)
-            if target_index == 1 or target_index % 25 == 0 or target_index == len(clusters):
-                log.info("FaceReco [neg]: populated Negative folder %d/%d", target_index, len(clusters))
-
-    def _resolve_image_path(self, src_dir: Path, orig_filename: str) -> Path | None:
-        direct = src_dir / orig_filename
-        if direct.exists():
-            return direct
-        return None
-
-    def _link_or_copy_file(self, src: Path, dst: Path) -> None:
-        if dst.exists():
-            return
-        try:
-            dst.hardlink_to(src)
-        except OSError:
-            shutil.copyfile(src, dst)
+        # Negative folders are left empty here.  They are reserved for manually
+        # curated counter-examples in the face DB; prediction must not fill them
+        # with crops from other clusters (the FaceDB contains no such images, so
+        # auto-populating them would make prediction output inconsistent with a
+        # rebuilt DB and pollute the negative set with mislabelled faces).
 
     def _crop_face_with_buffer(self, image: np.ndarray, body: BodyRecord) -> np.ndarray | None:
         # Use the full face-detector bbox (bigger box); fall back to narrow only
@@ -712,6 +808,7 @@ class FaceRecoPipeline:
             "playernum": playernum,
             "cluster": cluster_name,
             "provider": self.provider.provider_name(),
+            "aligned": self.config.align_faces,
             "faces": faces,
         }
         with open(cluster_dir / "face.json", "w", encoding="utf-8") as fh:

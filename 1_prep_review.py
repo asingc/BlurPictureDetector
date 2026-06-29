@@ -488,20 +488,22 @@ class ClothColorPredictor:
 
     # Reference colours in CIE L*a*b* space.
     _COLORS: list = [
-        ColorLab("Red",        "Crimson", ( 40.0,  65.0,  40.0)),
-        ColorLab("Orange",     "Vivid",   ( 65.0,  35.0,  55.0)),
-        ColorLab("Yellow",     "Gold",    ( 85.0,  -5.0,  75.0)),
-        ColorLab("Green",      "Emerald", ( 45.0, -40.0,  25.0)),
-        ColorLab("Blue",       "Light Blue", ( 70.0,  -8.0, -30.0)),
-        ColorLab("Blue",       "Royal",   ( 35.0,   5.0, -55.0)),
-        ColorLab("Blue",       "Navy",    ( 15.0,   5.0, -25.0)),
-        ColorLab("Purple",     "Violet",  ( 30.0,  30.0, -35.0)),
-        ColorLab("Pink",       "Magenta", ( 55.0,  60.0, -20.0)),
-        ColorLab("White",      "Bright",  ( 95.0,   0.0,   0.0)),
-        ColorLab("Gray",       "75%",     ( 75.0,   0.0,   0.0)),
-        ColorLab("Gray",       "Medium",  ( 50.0,   0.0,   0.0)),
-        ColorLab("Gray",       "25%",     ( 25.0,   0.0,   0.0)),
-        ColorLab("Black",      "Deep",    (  8.0,   0.0,   0.0)),
+        ColorLab("Red",        "Crimson",   ( 40.0,  65.0,  40.0)),
+        ColorLab("Orange",     "Vivid",     ( 65.0,  35.0,  55.0)),
+        ColorLab("Yellow",     "Gold",      ( 85.0,  -5.0,  75.0)),
+        ColorLab("Green",      "Emerald",   ( 45.0, -40.0,  25.0)),
+        ColorLab("Light Blue", "Sky",       ( 70.0,  -8.0, -30.0)),
+        ColorLab("Blue",       "Royal",     ( 35.0,   5.0, -55.0)),
+        ColorLab("Blue",       "Navy",      ( 15.0,   5.0, -25.0)),
+        ColorLab("Blue",       "Deep Blue", ( 12.0,  10.0, -42.0)),
+        ColorLab("Purple",     "Violet",    ( 30.0,  30.0, -35.0)),
+        ColorLab("Pink",       "Magenta",   ( 55.0,  60.0, -20.0)),
+        ColorLab("Pink",       "Deep Magenta", ( 28.0,  48.0, -12.0)),
+        ColorLab("White",      "Bright",    ( 95.0,   0.0,   0.0)),
+        ColorLab("Gray",       "75%",       ( 75.0,   0.0,   0.0)),
+        ColorLab("Gray",       "Medium",    ( 50.0,   0.0,   0.0)),
+        ColorLab("Gray",       "25%",       ( 25.0,   0.0,   0.0)),
+        ColorLab("Black",      "Deep",      (  8.0,   0.0,   0.0)),
     ]
 
     # Skin-tone cluster center in LAB — pixels within this ΔE distance are skipped.
@@ -1428,6 +1430,25 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--align-faces",
+        action="store_true",
+        help=(
+            "Similarity-align each face to a canonical 5-point template before "
+            "computing its embedding.  Must match the setting used to build the "
+            "face DB (RebuildFaceDB.py --align-faces).  Use for alignment A/B "
+            "comparison."
+        ),
+    )
+    parser.add_argument(
+        "--debug-align",
+        action="store_true",
+        help=(
+            "Write per-face alignment QA images (annotated crop + aligned face) "
+            "to <output>/.FaceReco/.debug for visual inspection of landmark "
+            "order and alignment quality."
+        ),
+    )
+    parser.add_argument(
         "--noteam",
         action="store_true",
         help=(
@@ -1498,7 +1519,7 @@ def main() -> None:
         ImageAnalysisStage(input_path, pose_model, face_model),
         GradingStage(sensitivity_threshold),
         jersey_stage,
-        AnnotationStage(output_dir, jersey_colors),
+        AnnotationStage(output_dir),
     ]
     frames: list[Frame] = []
     for stage in stages:
@@ -1533,6 +1554,8 @@ def main() -> None:
             output_dir,
             face_db_dir=face_db_dir,
             face_db_match_threshold=args.face_db_match_threshold,
+            align_faces=args.align_faces,
+            debug_align=args.debug_align,
         ).process(frames, app_config)
 
     if frames:
