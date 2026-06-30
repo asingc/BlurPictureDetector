@@ -69,5 +69,39 @@ class AppConfig:
     # Never upscales.
     normalized_img_max_long_edge: int = 1800
 
+    # Jersey team-colour matching mode.
+    # When True, the polled team-colour check collapses every jersey into one of
+    # two lightness buckets — "Light" (white / pale) vs "Dark" (non-white /
+    # coloured) — instead of comparing exact Hue:Shade labels.  This makes team
+    # filtering robust to the large brightness swings caused by light and shadow,
+    # which would otherwise read the same real-world jersey as different shades.
+    # Set to False to fall back to exact shade/hue matching.
+    jersey_binary_lightness: bool = True
+    # A jersey is classified "Light" only when its mean L* is at least
+    # jersey_light_l_min AND its chroma (sqrt(a*^2 + b*^2)) is at most
+    # jersey_light_chroma_max.  The chroma gate keeps brightly-lit *coloured*
+    # jerseys (e.g. yellow, light blue) in the "Dark" bucket.  Only used when
+    # jersey_binary_lightness is True.
+    jersey_light_l_min:      float = 55.0
+    jersey_light_chroma_max: float = 20.0
+
+    # Jersey team-colour matching by weighted L*a*b* distance (preferred).
+    # When True (default) the polled team-colour check compares each body's
+    # measured mean L*a*b* against the team's target colour using a Euclidean
+    # distance in which the L* (brightness) axis is down-weighted by
+    # jersey_lab_l_weight.  This matches a jersey by its underlying colour
+    # (its a*/b* chromaticity) while tolerating the large brightness swings
+    # caused by light and shadow.  Takes precedence over jersey_binary_lightness;
+    # set both to False to fall back to exact shade/hue matching.
+    jersey_lab_match:    bool  = True
+    # Weight applied to the L* (brightness) squared difference; a*/b* always
+    # weigh 1.0.  Smaller = more forgiving of brightness.  At 0.0 brightness is
+    # ignored entirely (white and black would then be indistinguishable, which
+    # is why a small non-zero weight is kept so achromatic jerseys still split
+    # by lightness).
+    jersey_lab_l_weight: float = 0.15
+    # Maximum weighted L*a*b* distance for a body to match the team colour.
+    jersey_lab_max_dist: float = 22.0
+
 
 app_config = AppConfig()
