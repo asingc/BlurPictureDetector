@@ -36,9 +36,12 @@ class FaceRecoConfig:
     # Optional path to a face-DB directory.  Each subdirectory must contain
     # a face.json produced by a previous FaceReco run.
     face_db_dir: Path | None = None
-    # Minimum cosine similarity for a cluster centroid to be matched against
-    # a face-DB entry.
-    face_db_match_threshold: float = 0.72
+    # Minimum cosine similarity for a single face to be matched directly to a
+    # face-DB person.  Each face is matched independently against the DB before
+    # any clustering, so this is deliberately stricter than the old per-cluster
+    # voting threshold -- there is no majority-vote safety net to catch a single
+    # mis-assigned face.
+    face_db_match_threshold: float = 0.80
     # Number of a person's top positive embeddings to average when scoring a
     # sample against that person.  Averaging the best few (rather than the
     # single closest) makes matching robust to one noisy/mislabeled DB
@@ -206,15 +209,30 @@ class FaceRecoPipeline:
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
         samples = self._predict_samples(qualified, debug_dir)
         log.info("FaceReco: %d/%d embeddings extracted successfully", len(samples), len(qualified))
-        clusters = self._cluster_samples(samples)
-        log.info("FaceReco: %d cluster(s) identified  (sizes: %s)",
-                 len(clusters), [len(c.samples) for c in clusters])
 
+        # Strategy: match each face directly against the face DB first, then
+        # cluster only the faces that matched nobody.  This avoids letting a
+        # clustering mistake break DB matching for a whole bucket.
         cluster_name_map: dict[int, FaceDbEntry] = {}
+        matched_clusters: list[Cluster] = []
+        unmatched = samples
         if face_db is not None:
-            cluster_name_map = self._match_clusters_to_facedb(clusters, face_db)
-            log.info("FaceReco: %d/%d cluster(s) matched to face DB",
-                     len(cluster_name_map), len(clusters))
+            matched_clusters, cluster_name_map, unmatched = self._match_samples_to_facedb(
+                samples, face_db,
+            )
+            log.info(
+                "FaceReco: face-DB direct match — %d face(s) matched to %d person(s), %d unmatched",
+                sum(len(c.samples) for c in matched_clusters), len(matched_clusters), len(unmatched),
+            )
+
+        next_id = max((c.cluster_id for c in matched_clusters), default=-1) + 1
+        residual_clusters = self._cluster_samples(unmatched, start_id=next_id)
+        clusters = matched_clusters + residual_clusters
+        log.info(
+            "FaceReco: %d cluster(s) total — %d matched person bucket(s) + %d new cluster(s)  (sizes: %s)",
+            len(clusters), len(matched_clusters), len(residual_clusters),
+            [len(c.samples) for c in clusters],
+        )
 
         self._write_all_faces(out_root, clusters)
         self._write_cluster_outputs(out_root, clusters, src_dir, cluster_name_map)
@@ -393,8 +411,17 @@ class FaceRecoPipeline:
             log.debug("FaceReco [debug]: failed to write alignment debug for %s body#%d: %s",
                       item.image_path.name, item.body.body_index, exc)
 
-    def _cluster_samples(self, predicted: list[tuple[_QualifiedBody, Player, np.ndarray]]) -> list[Cluster]:
-        """Cluster face embeddings by pairwise cosine distance.
+    def _cluster_samples(
+        self,
+        predicted: list[tuple[_QualifiedBody, Player, np.ndarray]],
+        start_id: int = 0,
+    ) -> list[Cluster]:
+        """Cluster the *residual* (DB-unmatched) face embeddings by cosine distance.
+
+        Runs only on the faces that did not match any face-DB person, grouping
+        the genuinely unknown faces into new clusters.  Cluster ids start at
+        *start_id* so they do not collide with the matched person buckets that
+        were numbered before this call.
 
         Uses **average-linkage** agglomerative clustering rather than DBSCAN.
         DBSCAN with ``min_samples=1`` performs single-link clustering, which is
@@ -411,7 +438,7 @@ class FaceRecoPipeline:
         threshold.
         """
         if not predicted:
-            log.warning("FaceReco [cluster]: no samples to cluster")
+            log.info("FaceReco [cluster]: no residual faces to cluster")
             return []
 
         # Single, intentional normalisation step.  FaceNet (InceptionResnetV1)
@@ -452,8 +479,9 @@ class FaceRecoPipeline:
 
         cluster_map: dict[int, Cluster] = {}
         for i, (label, (item, player, crop)) in enumerate(zip(labels.tolist(), predicted)):
-            if label not in cluster_map:
-                cluster_map[label] = Cluster(cluster_id=label, samples=[])
+            cid = int(label) + start_id
+            if cid not in cluster_map:
+                cluster_map[cid] = Cluster(cluster_id=cid, samples=[])
             sample = FaceSample(
                 body=item.body,
                 embedding=embeddings[i],
@@ -461,10 +489,10 @@ class FaceRecoPipeline:
                 crop_file_name="",
                 crop_image=crop,
             )
-            cluster_map[label].samples.append(sample)
+            cluster_map[cid].samples.append(sample)
             log.debug(
                 "FaceReco [cluster]: %s body#%d → cluster %d",
-                item.body.orig_filename, item.body.body_index, label,
+                item.body.orig_filename, item.body.body_index, cid,
             )
 
         clusters = sorted(cluster_map.values(), key=lambda c: c.cluster_id)
@@ -502,40 +530,39 @@ class FaceRecoPipeline:
         topk = np.partition(sims, -k)[-k:]
         return float(topk.mean())
 
-    def _match_clusters_to_facedb(
-        self, clusters: list[Cluster], face_db: FaceDb,
-    ) -> dict[int, FaceDbEntry]:
-        """Match clusters to face-DB entries using per-sample majority voting.
+    def _match_samples_to_facedb(
+        self,
+        predicted: list[tuple[_QualifiedBody, Player, np.ndarray]],
+        face_db: FaceDb,
+    ) -> tuple[list[Cluster], dict[int, FaceDbEntry], list[tuple[_QualifiedBody, Player, np.ndarray]]]:
+        """Assign each face directly to a face-DB person, before any clustering.
 
-        For each sample in a cluster, the best-matching DB entry (highest
-        cosine similarity to any of that person's known embeddings) is found.
-        If that similarity meets ``config.face_db_match_threshold`` the sample
-        casts a vote for that person.  The cluster is assigned to the person
-        with the most votes, provided they hold a strict majority (> 50 % of
-        all samples in the cluster).
+        Every face is compared independently against the DB.  A face is matched
+        to the person whose top-k positive embeddings yield the highest
+        aggregate cosine similarity, provided that similarity meets
+        ``config.face_db_match_threshold`` and is not vetoed by that person's
+        negative examples.  Matched faces are grouped into one
+        :class:`Cluster` per person (numbered ``0..M-1`` in discovery order);
+        faces that match nobody — or that are vetoed — are returned in
+        *unmatched* so they can be clustered afterwards.
 
-        Voting per-sample — rather than comparing a single cluster centroid —
-        handles the common case where a person's face embeddings are split
-        across multiple DBSCAN clusters: even a cluster whose centroid has
-        drifted away from the DB embeddings will still be correctly identified
-        if most of its individual samples match that person.
-
-        Negative embeddings act as a veto: if a sample resembles one of the
-        matched person's curated non-match examples at least as strongly as its
-        best positive match, that sample's vote is discarded.  This suppresses
-        false positives from known look-alikes.
+        Negative embeddings act as a veto: if a face resembles one of the
+        best-matching person's curated non-match examples at least as strongly
+        as its positive match, it is treated as unmatched (a known look-alike).
 
         Only DB entries produced by the same provider as the current pipeline
         are considered, so that embedding spaces are compatible.
+
+        Returns ``(matched_clusters, cluster_name_map, unmatched)``.
         """
         provider_name = self.provider.provider_name()
         compatible = [e for e in face_db.entries if e.provider == provider_name]
         if not compatible:
             log.warning(
-                "FaceReco [match]: no face-DB entries for provider '%s' — skipping DB matching",
+                "FaceReco [match]: no face-DB entries for provider '%s' — all faces will be clustered",
                 provider_name,
             )
-            return {}
+            return [], {}, predicted
 
         # Pre-normalise all DB embeddings once to avoid repeated work.
         # Each tuple: (entry, normalised positives, normalised negatives).
@@ -548,81 +575,65 @@ class FaceRecoPipeline:
             for entry in compatible
         ]
 
-        result: dict[int, FaceDbEntry] = {}
-        for cluster in clusters:
-            if not cluster.samples:
+        threshold = self.config.face_db_match_threshold
+        # Preserve discovery order of people for stable cluster numbering.
+        person_samples: dict[str, list[FaceSample]] = {}
+        person_entry: dict[str, FaceDbEntry] = {}
+        unmatched: list[tuple[_QualifiedBody, Player, np.ndarray]] = []
+
+        for item, player, crop in predicted:
+            emb = self._normalize(np.asarray(player.internal["embedding"], dtype=np.float32))
+            tag = f"{item.body.orig_filename} body#{item.body.body_index}"
+
+            best_score = -1.0
+            best_entry: FaceDbEntry | None = None
+            best_negs: list[np.ndarray] = []
+            for entry, normed_embs, normed_negs in normalised_db:
+                sim = self._aggregate_similarity(emb, normed_embs)
+                if sim > best_score:
+                    best_score = sim
+                    best_entry = entry
+                    best_negs = normed_negs
+
+            if best_entry is None or best_score < threshold:
+                unmatched.append((item, player, crop))
+                log.debug("FaceReco [match]: %s — no DB match (best_sim=%.4f < %.3f)",
+                          tag, best_score, threshold)
                 continue
 
-            # Per-sample voting: each sample independently finds its best DB match.
-            votes: dict[str, int] = {}          # person name → vote count
-            best_sim_for: dict[str, float] = {} # person name → highest sim seen
-
-            for sample in cluster.samples:
-                emb = self._normalize(sample.embedding.astype(np.float32))
-                sample_best_score = -1.0
-                sample_best_entry: FaceDbEntry | None = None
-                sample_best_negs: list[np.ndarray] = []
-
-                for entry, normed_embs, normed_negs in normalised_db:
-                    sim = self._aggregate_similarity(emb, normed_embs)
-                    if sim > sample_best_score:
-                        sample_best_score = sim
-                        sample_best_entry = entry
-                        sample_best_negs = normed_negs
-
-                if (sample_best_entry is not None
-                        and sample_best_score >= self.config.face_db_match_threshold):
-                    # Negative veto: if the sample resembles one of this person's
-                    # curated non-match examples at least as much as the best
-                    # positive, the match is rejected (it's a known look-alike).
-                    neg_sim = max(
-                        (float(np.dot(emb, ne)) for ne in sample_best_negs),
-                        default=-1.0,
-                    )
-                    if neg_sim >= sample_best_score:
-                        log.debug(
-                            "FaceReco [match]: cluster %04d — sample vetoed by negative "
-                            "(%s  pos_sim=%.4f  neg_sim=%.4f)",
-                            cluster.cluster_id, sample_best_entry.name,
-                            sample_best_score, neg_sim,
-                        )
-                        continue
-                    name = sample_best_entry.name
-                    votes[name] = votes.get(name, 0) + 1
-                    best_sim_for[name] = max(best_sim_for.get(name, -1.0), sample_best_score)
-
-            n_samples = len(cluster.samples)
-            if not votes:
+            # Negative veto: a face resembling the person's curated non-match
+            # examples at least as much as its positive match is a look-alike.
+            neg_sim = max((float(np.dot(emb, ne)) for ne in best_negs), default=-1.0)
+            if neg_sim >= best_score:
+                unmatched.append((item, player, crop))
                 log.debug(
-                    "FaceReco [match]: cluster %04d (%d sample(s)) — no votes above threshold %.3f",
-                    cluster.cluster_id, n_samples, self.config.face_db_match_threshold,
+                    "FaceReco [match]: %s — vetoed by negative of %s (pos_sim=%.4f neg_sim=%.4f) → unmatched",
+                    tag, best_entry.name, best_score, neg_sim,
                 )
                 continue
 
-            winner_name = max(votes, key=lambda n: votes[n])
-            winner_votes = votes[winner_name]
-            vote_ratio = winner_votes / n_samples
-
-            log.debug(
-                "FaceReco [match]: cluster %04d (%d sample(s)) — votes=%s  winner=%s (%d/%d = %.0f%%)",
-                cluster.cluster_id, n_samples, dict(votes),
-                winner_name, winner_votes, n_samples, vote_ratio * 100,
+            sample = FaceSample(
+                body=item.body,
+                embedding=emb,
+                confidence=player.confidence,
+                crop_file_name="",
+                crop_image=crop,
             )
+            person_samples.setdefault(best_entry.name, []).append(sample)
+            person_entry.setdefault(best_entry.name, best_entry)
+            log.debug("FaceReco [match]: %s → %s (sim=%.4f)", tag, best_entry.name, best_score)
 
-            if vote_ratio > 0.5:
-                winner_entry = next(e for e in compatible if e.name == winner_name)
-                result[cluster.cluster_id] = winner_entry
-                log.info(
-                    "FaceReco [match]: cluster %04d → %s (playernum=%s  votes=%d/%d=%.0f%%  best_sim=%.4f)",
-                    cluster.cluster_id, winner_name, winner_entry.playernum,
-                    winner_votes, n_samples, vote_ratio * 100, best_sim_for[winner_name],
-                )
-            else:
-                log.debug(
-                    "FaceReco [match]: cluster %04d — no majority  (winner=%s  %d/%d=%.0f%%)",
-                    cluster.cluster_id, winner_name, winner_votes, n_samples, vote_ratio * 100,
-                )
-        return result
+        matched_clusters: list[Cluster] = []
+        cluster_name_map: dict[int, FaceDbEntry] = {}
+        for cid, (name, samples) in enumerate(person_samples.items()):
+            entry = person_entry[name]
+            matched_clusters.append(Cluster(cluster_id=cid, samples=samples))
+            cluster_name_map[cid] = entry
+            log.info(
+                "FaceReco [match]: person %04d → %-20s (playernum=%s) — %d face(s)",
+                cid, name, entry.playernum, len(samples),
+            )
+        return matched_clusters, cluster_name_map, unmatched
 
     def _write_all_faces(self, out_root: Path, clusters: list[Cluster]) -> None:
         """Write every processed face crop and a combined face.json to

@@ -114,10 +114,12 @@ def main() -> None:
     parser.add_argument(
         "--face-db-match-threshold",
         type=float,
-        default=0.72,
+        default=0.80,
         help=(
-            "Cosine similarity threshold for matching a cluster against the face DB "
-            "(default: 0.72).  Higher = stricter matching."
+            "Cosine similarity threshold for matching a single face directly "
+            "against the face DB (default: 0.80).  Each face is matched "
+            "independently before clustering, so this is intentionally strict; "
+            "higher = fewer false matches, more faces left to cluster."
         ),
     )
     parser.add_argument(

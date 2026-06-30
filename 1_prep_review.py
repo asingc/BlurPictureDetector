@@ -1307,7 +1307,7 @@ def _run_facereco(
     output_dir: Path,
     sensitivity_threshold: float,
     face_db_dir: Path | None = None,
-    face_db_match_threshold: float = 0.72,
+    face_db_match_threshold: float = 0.80,
 ) -> None:
     """Run face recognition pipeline on the Phase 1 output."""
     if not _FACERECO_AVAILABLE:

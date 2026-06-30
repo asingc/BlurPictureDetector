@@ -53,7 +53,7 @@ class FaceRecoStage(ProcessStage):
         self,
         output_dir: Path,
         face_db_dir: Path | None = None,
-        face_db_match_threshold: float = 0.72,
+        face_db_match_threshold: float = 0.80,
         align_faces: bool = False,
         debug_align: bool = False,
     ) -> None:
