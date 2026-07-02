@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -36,17 +36,46 @@ class FaceRecoConfig:
     # Optional path to a face-DB directory.  Each subdirectory must contain
     # a face.json produced by a previous FaceReco run.
     face_db_dir: Path | None = None
-    # Minimum cosine similarity for a single face to be matched directly to a
-    # face-DB person.  Each face is matched independently against the DB before
-    # any clustering, so this is deliberately stricter than the old per-cluster
-    # voting threshold -- there is no majority-vote safety net to catch a single
-    # mis-assigned face.
-    face_db_match_threshold: float = 0.80
-    # Number of a person's top positive embeddings to average when scoring a
-    # sample against that person.  Averaging the best few (rather than the
-    # single closest) makes matching robust to one noisy/mislabeled DB
-    # embedding.  1 reproduces the old single-max behaviour.
-    face_db_match_topk: int = 3
+    # Minimum cosine similarity between a query face and the closest-matching
+    # PROTOTYPE (visual sub-cluster — see ``Prototype``/``build_prototypes``)
+    # of a face-DB person, required to accept that person as a candidate
+    # match.  Each face is matched independently against the DB before any
+    # clustering -- there is no majority-vote safety net -- so this should be
+    # calibrated empirically with ``RebuildFaceDB.py`` (it calibrates by default
+    # after rebuilding) rather than guessed.
+    face_db_match_threshold: float | None = None
+    # Minimum cosine-similarity gap required between the best-matching person
+    # and the best-matching *different* person.  A face whose top-2
+    # candidates are nearly tied is exactly the failure mode that causes
+    # "faces mixed up between people" -- accepting the #1 candidate anyway is
+    # a coin flip dressed up as a confident match.  When the margin isn't met
+    # the face is left unmatched (sent to residual clustering instead of a
+    # guessed identity).  Calibrate alongside ``face_db_match_threshold``
+    # with ``RebuildFaceDB.py``.
+    face_db_match_margin: float | None = None
+    # Cosine-similarity threshold used to split EACH PERSON's own positive
+    # embeddings into visually-cohesive "prototypes" (sub-clusters) when the
+    # face DB is loaded.  A real person's photos often form more than one
+    # visual group (glasses on/off, indoor/outdoor lighting, angle, squint,
+    # etc.) -- averaging all of a person's embeddings together would smear
+    # those groups into an unrepresentative centroid.  Matching instead scores
+    # a query against the SINGLE closest prototype of each person, so it only
+    # has to resemble one genuine "look" rather than the blended average of
+    # all of them.
+    face_db_prototype_threshold: float | None = None
+    # When True and ``face_db_dir/calibration.json`` exists, any face-DB
+    # matching parameter left as ``None`` above is filled from that file for
+    # the active provider (facenet/dlib). This turns "rebuild + calibrate"
+    # into a real one-step workflow: the next recognition run automatically
+    # consumes the calibrated values without manual copy/paste.
+    use_face_db_calibration: bool = True
+    calibration_file_name: str = "calibration.json"
+    # Minimum short-edge size (pixels) of a face crop for its embedding to be
+    # trusted at all.  Tiny / heavily-upscaled crops produce noisy embeddings
+    # that are a common source of confident-looking false matches; crops
+    # below this size are routed straight to skipped/unmatched instead of
+    # being compared against the DB or clustered.
+    min_face_crop_px: int = 32
 
 
 @dataclass
@@ -56,12 +85,99 @@ class FaceSample:
     confidence: float | None
     crop_file_name: str
     crop_image: np.ndarray | None
+    # Diagnostics populated only for face-DB matches (see
+    # _match_samples_to_facedb) -- kept on the sample so they can be written
+    # into face.json for human auditing of *why* a face was matched.
+    match_score: float | None = None
+    match_margin: float | None = None
+    match_runner_up: str | None = None
 
 
 @dataclass
 class Cluster:
     cluster_id: int
     samples: list[FaceSample]
+
+
+def normalize_embedding(vector: np.ndarray) -> np.ndarray:
+    """L2-normalise *vector* to a unit cosine-similarity-ready vector.
+
+    Shared by DB loading (prototype building) and prediction-time matching so
+    every embedding comparison in this module -- clustering, prototype
+    construction, and face-DB matching -- happens in the exact same space.
+    """
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        log.warning("FaceReco [normalize]: zero/near-zero norm vector detected (norm=%.2e), treating as unit vector", norm)
+        return np.ones_like(vector) / np.sqrt(vector.shape[0])
+    return vector / norm
+
+
+@dataclass
+class Prototype:
+    """One visually-cohesive sub-cluster of a single person's embeddings.
+
+    A real person's reference photos rarely form one tight blob in embedding
+    space -- glasses on/off, indoor/outdoor lighting, camera angle, and
+    expression all shift FaceNet's output meaningfully.  Treating a person as
+    a single average vector blends these sub-groups together into a centroid
+    that may not closely resemble any individual photo, which both misses
+    genuine matches (the blended centroid is too far from any real look) and
+    invites false matches (the blend drifts toward whichever look-alike
+    happens to pull the average that way).  build_prototypes() instead splits
+    a person's embeddings into these tighter groups up front, and matching
+    scores a query against the single closest one.
+    """
+
+    centroid: np.ndarray        # unit vector -- mean of members, re-normalised
+    members: list[np.ndarray]   # unit vectors belonging to this sub-cluster
+    cohesion: float              # mean cosine(member, centroid); 1.0 = identical members
+
+
+def build_prototypes(embeddings: list[np.ndarray], similarity_threshold: float) -> list[Prototype]:
+    """Split one person's positive *embeddings* into visually-cohesive prototypes.
+
+    Uses the same average-linkage cosine agglomerative clustering as residual
+    face clustering (see FaceRecoPipeline._cluster_samples) -- average linkage
+    resists chaining unrelated-looking photos of the same person into one
+    over-broad prototype, while still merging genuinely similar shots.
+
+    Returns prototypes sorted largest-first (purely so log output reads with
+    the most representative "look" first); a person with zero embeddings
+    returns an empty list, and one embedding returns a single 1-member
+    prototype with cohesion 1.0.
+    """
+    if not embeddings:
+        return []
+    normed = [normalize_embedding(e.astype(np.float32)) for e in embeddings]
+    n = len(normed)
+    if n == 1:
+        labels = [0]
+    else:
+        eps = max(1e-6, 1.0 - similarity_threshold)
+        matrix = np.array(normed, dtype=np.float32)
+        labels = AgglomerativeClustering(
+            n_clusters=None,
+            metric="cosine",
+            linkage="average",
+            distance_threshold=eps,
+        ).fit_predict(matrix).tolist()
+
+    groups: dict[int, list[np.ndarray]] = {}
+    for label, vec in zip(labels, normed):
+        groups.setdefault(int(label), []).append(vec)
+
+    prototypes: list[Prototype] = []
+    for members in groups.values():
+        centroid = normalize_embedding(np.mean(members, axis=0))
+        if len(members) > 1:
+            cohesion = float(np.mean([float(np.dot(m, centroid)) for m in members]))
+        else:
+            cohesion = 1.0
+        prototypes.append(Prototype(centroid=centroid, members=members, cohesion=cohesion))
+
+    prototypes.sort(key=lambda p: len(p.members), reverse=True)
+    return prototypes
 
 
 @dataclass
@@ -73,6 +189,7 @@ class FaceDbEntry:
     provider: str
     embeddings: list[np.ndarray]          # positive embeddings
     negative_embeddings: list[np.ndarray]  # negative embeddings (may be empty)
+    prototypes: list[Prototype] = field(default_factory=list)  # sub-clustered positives, see build_prototypes
 
 
 def _decode_embedding(face_data: dict) -> np.ndarray | None:
@@ -95,8 +212,15 @@ class FaceDb:
         return len(self.entries)
 
     @classmethod
-    def load(cls, db_dir: Path) -> "FaceDb":
-        """Walk *db_dir* and load every ``face.json`` found in a sub-directory."""
+    def load(cls, db_dir: Path, prototype_similarity_threshold: float = 0.62) -> "FaceDb":
+        """Walk *db_dir* and load every ``face.json`` found in a sub-directory.
+
+        Each person's positive embeddings are split into visually-cohesive
+        *prototypes* (see :func:`build_prototypes`) using
+        *prototype_similarity_threshold* -- this is what lets a person's
+        photos span multiple visual sub-clusters (lighting, angle, glasses,
+        etc.) without diluting matching into one unrepresentative average.
+        """
         entries: list[FaceDbEntry] = []
         if not db_dir.is_dir():
             raise FileNotFoundError(f"Face-DB directory not found: {db_dir}")
@@ -127,24 +251,28 @@ class FaceDb:
             if not embeddings:
                 log.debug("FaceDB [load]: %s — no valid embeddings, skipped", name)
                 continue
+            prototypes = build_prototypes(embeddings, prototype_similarity_threshold)
             entries.append(FaceDbEntry(
                 name=name,
                 playernum=playernum,
                 provider=provider,
                 embeddings=embeddings,
                 negative_embeddings=neg_embeddings,
+                prototypes=prototypes,
             ))
-            log.debug("FaceDB [load]: %s  playernum=%s  provider=%s  embeddings=%d  negatives=%d",
-                      name, playernum, provider, len(embeddings), len(neg_embeddings))
+            log.debug("FaceDB [load]: %s  playernum=%s  provider=%s  embeddings=%d  negatives=%d  prototypes=%d",
+                      name, playernum, provider, len(embeddings), len(neg_embeddings), len(prototypes))
         total_faces = sum(len(e.embeddings) for e in entries)
         log.info(
-            "FaceDB [load]: loaded %d cluster(s) / %d face(s) from %s",
-            len(entries), total_faces, db_dir,
+            "FaceDB [load]: loaded %d cluster(s) / %d face(s) from %s  (prototype_threshold=%.3f)",
+            len(entries), total_faces, db_dir, prototype_similarity_threshold,
         )
         for entry in entries:
+            proto_sizes = [len(p.members) for p in entry.prototypes]
             log.info(
-                "FaceDB [load]:   %-20s  playernum=%-4s  faces=%d  negatives=%d",
+                "FaceDB [load]:   %-20s  playernum=%-4s  faces=%d  negatives=%d  prototypes=%d %s",
                 entry.name, entry.playernum, len(entry.embeddings), len(entry.negative_embeddings),
+                len(entry.prototypes), proto_sizes,
             )
         return cls(entries)
 
@@ -159,6 +287,25 @@ class FaceRecoPipeline:
     def __init__(self, provider: FaceRecoProvider, config: FaceRecoConfig) -> None:
         self.provider = provider
         self.config = config
+        self._effective_face_db_match_threshold = (
+            config.face_db_match_threshold if config.face_db_match_threshold is not None else 0.72
+        )
+        self._effective_face_db_match_margin = (
+            config.face_db_match_margin if config.face_db_match_margin is not None else 0.05
+        )
+
+    def _load_calibration(self, db_dir: Path) -> dict:
+        path = db_dir / self.config.calibration_file_name
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FaceReco: failed to read calibration file %s: %s", path, exc)
+        return {}
 
     def run(self, prep_output_dir: Path) -> Path:
         prep_output_dir = prep_output_dir.resolve()
@@ -201,10 +348,77 @@ class FaceRecoPipeline:
 
         # Load face DB before clustering so identity info is available for matching.
         face_db: FaceDb | None = None
+        effective_match_threshold = (
+            self.config.face_db_match_threshold
+            if self.config.face_db_match_threshold is not None
+            else 0.72
+        )
+        effective_match_margin = (
+            self.config.face_db_match_margin
+            if self.config.face_db_match_margin is not None
+            else 0.05
+        )
+        effective_proto_threshold = (
+            self.config.face_db_prototype_threshold
+            if self.config.face_db_prototype_threshold is not None
+            else 0.62
+        )
         if self.config.face_db_dir is not None:
-            face_db = FaceDb.load(self.config.face_db_dir)
+            provider_name = self.provider.provider_name()
+            cal_provider: dict | None = None
+            if self.config.use_face_db_calibration:
+                cal = self._load_calibration(self.config.face_db_dir)
+                providers = cal.get("providers") if isinstance(cal, dict) else None
+                if isinstance(providers, dict):
+                    candidate = providers.get(provider_name)
+                    if isinstance(candidate, dict):
+                        # Auto-apply calibration only when the calibration run
+                        # itself indicates usable separation. A very high EER
+                        # or huge confusion rate usually means the DB is
+                        # contaminated/mislabeled; blindly importing those
+                        # numbers can make matching worse.
+                        eer = candidate.get("equal_error_rate")
+                        confusions = candidate.get("confusions_count")
+                        usable = candidate.get("usable_samples")
+                        quality_ok = True
+                        if isinstance(eer, (int, float)) and float(eer) > 0.25:
+                            quality_ok = False
+                        if isinstance(confusions, int) and isinstance(usable, int) and usable > 0:
+                            if (confusions / usable) > 0.25:
+                                quality_ok = False
+
+                        if quality_ok:
+                            cal_provider = candidate
+                            if self.config.face_db_prototype_threshold is None and isinstance(candidate.get("prototype_threshold"), (int, float)):
+                                effective_proto_threshold = float(candidate["prototype_threshold"])
+                            if self.config.face_db_match_threshold is None and isinstance(candidate.get("recommended_match_threshold"), (int, float)):
+                                effective_match_threshold = float(candidate["recommended_match_threshold"])
+                            if self.config.face_db_match_margin is None and isinstance(candidate.get("recommended_match_margin"), (int, float)):
+                                effective_match_margin = float(candidate["recommended_match_margin"])
+                        else:
+                            log.warning(
+                                "FaceReco: calibration for provider=%s looks unreliable "
+                                "(eer=%s confusions=%s usable=%s) — ignoring it; "
+                                "using explicit/default thresholds instead",
+                                provider_name, eer, confusions, usable,
+                            )
+
+            face_db = FaceDb.load(
+                self.config.face_db_dir,
+                prototype_similarity_threshold=effective_proto_threshold,
+            )
             log.info("FaceReco: face DB loaded — %d person(s) from %s",
                      len(face_db), self.config.face_db_dir)
+            if cal_provider is not None:
+                log.info(
+                    "FaceReco: using calibration for provider=%s  match_threshold=%.3f  match_margin=%.3f  prototype_threshold=%.3f",
+                    provider_name, effective_match_threshold, effective_match_margin, effective_proto_threshold,
+                )
+
+        # Store effective thresholds resolved above (defaults and optional
+        # calibration import) so matcher code stays focused on matching logic.
+        self._effective_face_db_match_threshold = effective_match_threshold
+        self._effective_face_db_match_margin = effective_match_margin
 
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
         samples = self._predict_samples(qualified, debug_dir)
@@ -358,6 +572,18 @@ class FaceRecoPipeline:
                 skipped_crop += 1
                 log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
                 continue
+            # Quality gate: a crop too small to trust is excluded entirely --
+            # never matched against the DB and never folded into residual
+            # clustering -- rather than letting a noisy embedding produce a
+            # confident-looking wrong answer either way.
+            short_edge = min(crop.shape[0], crop.shape[1])
+            if short_edge < self.config.min_face_crop_px:
+                skipped_crop += 1
+                log.debug(
+                    "FaceReco [embed]: %s — crop too small (%dpx < %dpx min), skipped",
+                    tag, short_edge, self.config.min_face_crop_px,
+                )
+                continue
             result = embed_face_crop(
                 self.provider,
                 load_face_model(),
@@ -505,30 +731,22 @@ class FaceRecoPipeline:
         return clusters
 
     def _normalize(self, vector: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            log.warning("FaceReco [normalize]: zero/near-zero norm vector detected (norm=%.2e), treating as unit vector", norm)
-            return np.ones_like(vector) / np.sqrt(vector.shape[0])
-        return vector / norm
+        return normalize_embedding(vector)
 
-    def _aggregate_similarity(
-        self, emb: np.ndarray, refs: list[np.ndarray],
-    ) -> float:
-        """Score *emb* against a person's reference embeddings.
+    def _best_prototype_match(self, emb: np.ndarray, entry: FaceDbEntry) -> float:
+        """Best cosine similarity between *emb* and any of *entry*'s prototypes.
 
-        Returns the mean of the ``face_db_match_topk`` highest cosine
-        similarities, which is robust to a single noisy/mislabeled reference.
-        When the person has fewer references than ``topk`` (or topk <= 1) this
-        degrades gracefully toward the plain maximum.
+        Each person's positive embeddings were split into visually-cohesive
+        prototypes when the DB was loaded (see :func:`build_prototypes`).
+        Scoring against the single closest prototype -- rather than averaging
+        across all of a person's embeddings -- means a query only has to
+        resemble ONE genuine sub-cluster (e.g. "with glasses"), and is never
+        dragged down (or up) by averaging with a visually unrelated sub-
+        cluster of the same person.
         """
-        if not refs:
+        if not entry.prototypes:
             return -1.0
-        sims = np.fromiter((float(np.dot(emb, r)) for r in refs), dtype=np.float64)
-        k = max(1, min(self.config.face_db_match_topk, sims.shape[0]))
-        if k == 1:
-            return float(sims.max())
-        topk = np.partition(sims, -k)[-k:]
-        return float(topk.mean())
+        return max(float(np.dot(emb, proto.centroid)) for proto in entry.prototypes)
 
     def _match_samples_to_facedb(
         self,
@@ -537,18 +755,27 @@ class FaceRecoPipeline:
     ) -> tuple[list[Cluster], dict[int, FaceDbEntry], list[tuple[_QualifiedBody, Player, np.ndarray]]]:
         """Assign each face directly to a face-DB person, before any clustering.
 
-        Every face is compared independently against the DB.  A face is matched
-        to the person whose top-k positive embeddings yield the highest
-        aggregate cosine similarity, provided that similarity meets
-        ``config.face_db_match_threshold`` and is not vetoed by that person's
-        negative examples.  Matched faces are grouped into one
-        :class:`Cluster` per person (numbered ``0..M-1`` in discovery order);
-        faces that match nobody — or that are vetoed — are returned in
-        *unmatched* so they can be clustered afterwards.
+        Every face is compared independently against every person's closest
+        *prototype* (visual sub-cluster -- see :func:`build_prototypes`).  A
+        face is matched to the best-scoring person only when ALL of the
+        following hold:
 
-        Negative embeddings act as a veto: if a face resembles one of the
-        best-matching person's curated non-match examples at least as strongly
-        as its positive match, it is treated as unmatched (a known look-alike).
+          1. ``best_score >= config.face_db_match_threshold`` -- the absolute
+             similarity floor.
+          2. ``best_score - second_best_score >= config.face_db_match_margin``
+             -- the winner must clearly beat the best-scoring *different*
+             person, not just edge them out.  A near-tie between two
+             candidates is precisely the situation that causes faces to get
+             mixed up between similar-looking people; when the margin isn't
+             met the face is left unmatched rather than guessed.
+          3. Not vetoed by the winning person's curated negative examples --
+             a face resembling those non-match examples at least as strongly
+             as its positive match is a known look-alike.
+
+        Matched faces are grouped into one :class:`Cluster` per person
+        (numbered ``0..M-1`` in discovery order); faces that match nobody --
+        or that fail the margin check, or are vetoed -- are returned in
+        *unmatched* so they can be clustered afterwards.
 
         Only DB entries produced by the same provider as the current pipeline
         are considered, so that embedding spaces are compatible.
@@ -564,18 +791,16 @@ class FaceRecoPipeline:
             )
             return [], {}, predicted
 
-        # Pre-normalise all DB embeddings once to avoid repeated work.
-        # Each tuple: (entry, normalised positives, normalised negatives).
-        normalised_db: list[tuple[FaceDbEntry, list[np.ndarray], list[np.ndarray]]] = [
-            (
-                entry,
-                [self._normalize(emb.astype(np.float32)) for emb in entry.embeddings],
-                [self._normalize(emb.astype(np.float32)) for emb in entry.negative_embeddings],
-            )
+        # Pre-normalise negative embeddings once to avoid repeated work.
+        # Positive embeddings are already unit vectors inside each entry's
+        # prototypes (built at DB-load time), so only negatives need it here.
+        normalised_negs: dict[str, list[np.ndarray]] = {
+            entry.name: [self._normalize(emb.astype(np.float32)) for emb in entry.negative_embeddings]
             for entry in compatible
-        ]
+        }
 
-        threshold = self.config.face_db_match_threshold
+        threshold = self._effective_face_db_match_threshold
+        margin_floor = self._effective_face_db_match_margin
         # Preserve discovery order of people for stable cluster numbering.
         person_samples: dict[str, list[FaceSample]] = {}
         person_entry: dict[str, FaceDbEntry] = {}
@@ -585,24 +810,36 @@ class FaceRecoPipeline:
             emb = self._normalize(np.asarray(player.internal["embedding"], dtype=np.float32))
             tag = f"{item.body.orig_filename} body#{item.body.body_index}"
 
-            best_score = -1.0
-            best_entry: FaceDbEntry | None = None
-            best_negs: list[np.ndarray] = []
-            for entry, normed_embs, normed_negs in normalised_db:
-                sim = self._aggregate_similarity(emb, normed_embs)
-                if sim > best_score:
-                    best_score = sim
-                    best_entry = entry
-                    best_negs = normed_negs
+            # Score against EVERY person, not just track a running best — the
+            # gap between the #1 and #2 candidate (the margin) matters as
+            # much as the absolute score for telling similar people apart.
+            scored = sorted(
+                ((self._best_prototype_match(emb, entry), entry) for entry in compatible),
+                key=lambda t: t[0], reverse=True,
+            )
+            best_score, best_entry = scored[0]
+            second_score, second_entry = scored[1] if len(scored) > 1 else (-1.0, None)
+            margin = best_score - second_score
 
-            if best_entry is None or best_score < threshold:
+            if best_score < threshold:
                 unmatched.append((item, player, crop))
                 log.debug("FaceReco [match]: %s — no DB match (best_sim=%.4f < %.3f)",
                           tag, best_score, threshold)
                 continue
 
+            if margin < margin_floor:
+                unmatched.append((item, player, crop))
+                log.debug(
+                    "FaceReco [match]: %s — ambiguous: %s=%.4f vs %s=%.4f (margin=%.4f < %.3f) → unmatched",
+                    tag, best_entry.name, best_score,
+                    second_entry.name if second_entry is not None else "n/a", second_score,
+                    margin, margin_floor,
+                )
+                continue
+
             # Negative veto: a face resembling the person's curated non-match
             # examples at least as much as its positive match is a look-alike.
+            best_negs = normalised_negs.get(best_entry.name, [])
             neg_sim = max((float(np.dot(emb, ne)) for ne in best_negs), default=-1.0)
             if neg_sim >= best_score:
                 unmatched.append((item, player, crop))
@@ -618,10 +855,13 @@ class FaceRecoPipeline:
                 confidence=player.confidence,
                 crop_file_name="",
                 crop_image=crop,
+                match_score=best_score,
+                match_margin=margin,
+                match_runner_up=second_entry.name if second_entry is not None else None,
             )
             person_samples.setdefault(best_entry.name, []).append(sample)
             person_entry.setdefault(best_entry.name, best_entry)
-            log.debug("FaceReco [match]: %s → %s (sim=%.4f)", tag, best_entry.name, best_score)
+            log.debug("FaceReco [match]: %s → %s (sim=%.4f margin=%.4f)", tag, best_entry.name, best_score, margin)
 
         matched_clusters: list[Cluster] = []
         cluster_name_map: dict[int, FaceDbEntry] = {}
@@ -680,6 +920,9 @@ class FaceRecoPipeline:
                     "cluster": cluster_num,
                     "cropFileName": crop_name,
                     "confidence": sample.confidence,
+                    "matchScore": sample.match_score,
+                    "matchMargin": sample.match_margin,
+                    "matchRunnerUp": sample.match_runner_up,
                     "Body": sample.body.raw_body,
                     "embedding": {
                         "dtype": "float32",
@@ -805,6 +1048,9 @@ class FaceRecoPipeline:
                     "Body": sample.body.raw_body,
                     "cropFileName": sample.crop_file_name,
                     "confidence": sample.confidence,
+                    "matchScore": sample.match_score,
+                    "matchMargin": sample.match_margin,
+                    "matchRunnerUp": sample.match_runner_up,
                     "embedding": {
                         "dtype": "float32",
                         "shape": [int(emb.shape[0])],

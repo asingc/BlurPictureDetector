@@ -53,13 +53,21 @@ class FaceRecoStage(ProcessStage):
         self,
         output_dir: Path,
         face_db_dir: Path | None = None,
-        face_db_match_threshold: float = 0.80,
+        face_db_match_threshold: float | None = None,
+        face_db_match_margin: float | None = None,
+        face_db_prototype_threshold: float | None = None,
+        use_face_db_calibration: bool = True,
+        min_face_crop_px: int = 32,
         align_faces: bool = False,
         debug_align: bool = False,
     ) -> None:
         self.output_dir = output_dir
         self.face_db_dir = face_db_dir
         self.face_db_match_threshold = face_db_match_threshold
+        self.face_db_match_margin = face_db_match_margin
+        self.face_db_prototype_threshold = face_db_prototype_threshold
+        self.use_face_db_calibration = use_face_db_calibration
+        self.min_face_crop_px = min_face_crop_px
         self.align_faces = align_faces
         self.debug_align = debug_align
 
@@ -95,6 +103,10 @@ class FaceRecoStage(ProcessStage):
             facereco_config = FaceRecoConfig(
                 face_db_dir=self.face_db_dir,
                 face_db_match_threshold=self.face_db_match_threshold,
+                face_db_match_margin=self.face_db_match_margin,
+                face_db_prototype_threshold=self.face_db_prototype_threshold,
+                use_face_db_calibration=self.use_face_db_calibration,
+                min_face_crop_px=self.min_face_crop_px,
                 align_faces=self.align_faces,
                 debug_align=self.debug_align,
             )

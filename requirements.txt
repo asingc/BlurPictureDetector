@@ -13,9 +13,9 @@ opencv-python>=4.10.0
 numpy>=1.26.0
 scikit-learn>=1.3.0
 
-# Optional but required for 4_face_reco.py with --provider dlib
+# Optional but required when using the dlib face-recognition provider
 face-recognition>=1.3.0
 dlib>=19.24.0
 
-# Optional but required for 4_face_reco.py with --provider facenet
+# Optional but required when using the facenet face-recognition provider
 facenet-pytorch>=2.6.0

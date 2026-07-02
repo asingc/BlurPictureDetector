@@ -300,6 +300,7 @@ class JerseyCountingStage(ProcessStage):
                               frame.path.name, body.cloth_color)
                     continue
 
+               
                 # Team colour check (polled from all frames).
                 if team_target_lab is not None:
                     blab = _body_lab(body)

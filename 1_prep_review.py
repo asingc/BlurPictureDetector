@@ -1307,7 +1307,7 @@ def _run_facereco(
     output_dir: Path,
     sensitivity_threshold: float,
     face_db_dir: Path | None = None,
-    face_db_match_threshold: float = 0.80,
+    face_db_match_threshold: float | None = None,
 ) -> None:
     """Run face recognition pipeline on the Phase 1 output."""
     if not _FACERECO_AVAILABLE:
@@ -1422,11 +1422,60 @@ def main() -> None:
     parser.add_argument(
         "--face-db-match-threshold",
         type=float,
-        default=0.72,
+        default=None,
         metavar="THRESHOLD",
         help=(
             "Cosine similarity threshold for matching a cluster against the face DB "
-            "(default: 0.72).  Higher = stricter matching."
+            "(higher = stricter matching). Use RebuildFaceDB.py against your "
+            "face DB to pick a data-driven value (it calibrates by default). "
+            "If omitted, this script auto-loads the provider-specific "
+            "recommended value from <face-db>/calibration.json when available."
+        ),
+    )
+    parser.add_argument(
+        "--face-db-match-margin",
+        type=float,
+        default=None,
+        metavar="MARGIN",
+        help=(
+            "Minimum cosine-similarity gap required between the best-matching "
+            "person and the best-matching DIFFERENT person. "
+            "A face whose top-2 candidates are nearly tied is left unmatched "
+            "instead of guessed -- this is what prevents similar-looking people "
+            "from being mixed up. If omitted, this script auto-loads the "
+            "provider-specific recommended margin from <face-db>/calibration.json "
+            "when available."
+        ),
+    )
+    parser.add_argument(
+        "--face-db-prototype-threshold",
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help=(
+            "Cosine similarity used to split EACH PERSON's own positive "
+            "embeddings into visually-cohesive prototypes when the face DB is "
+            "loaded. If omitted, this script auto-loads the calibrated "
+            "prototype threshold from <face-db>/calibration.json when available, "
+            "else falls back to 0.62."
+        ),
+    )
+    parser.add_argument(
+        "--disable-face-db-calibration",
+        action="store_true",
+        help=(
+            "Ignore <face-db>/calibration.json even when present.  Use only the "
+            "explicit CLI thresholds (or hardcoded fallback defaults when omitted)."
+        ),
+    )
+    parser.add_argument(
+        "--min-face-crop-px",
+        type=int,
+        default=32,
+        metavar="PX",
+        help=(
+            "Minimum short-edge size (pixels) of a face crop for its embedding "
+            "to be trusted (default: 32). Smaller crops are skipped entirely."
         ),
     )
     parser.add_argument(
@@ -1554,6 +1603,10 @@ def main() -> None:
             output_dir,
             face_db_dir=face_db_dir,
             face_db_match_threshold=args.face_db_match_threshold,
+            face_db_match_margin=args.face_db_match_margin,
+            face_db_prototype_threshold=args.face_db_prototype_threshold,
+            use_face_db_calibration=not args.disable_face_db_calibration,
+            min_face_crop_px=args.min_face_crop_px,
             align_faces=args.align_faces,
             debug_align=args.debug_align,
         ).process(frames, app_config)

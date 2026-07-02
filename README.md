@@ -71,7 +71,10 @@ python 1_prep_review.py <image_or_directory> [options]
 | `--output <dir>` | `output/<timestamp>-<input>/` | Root output directory |
 | `--skip-facereco` | off | Don't run face-recognition clustering |
 | `--face-db <dir>` | none | Match clusters against an existing face DB |
-| `--face-db-match-threshold <n>` | `0.72` | Cosine similarity required for a face-DB match |
+| `--face-db-match-threshold <n>` | `0.72` | Cosine similarity required between a face and its closest-matching person prototype |
+| `--face-db-match-margin <n>` | `0.05` | Minimum similarity gap required over the best-matching different person before accepting a match |
+| `--face-db-prototype-threshold <n>` | `0.62` | Cosine similarity used to split each DB person's own photos into visual sub-clusters |
+| `--min-face-crop-px <n>` | `32` | Minimum short-edge crop size (pixels) trusted for matching/clustering |
 | `--align-faces` | off | Similarity-align faces to a 5-point template before embedding |
 | `--debug-align` | off | Write alignment QA images to `.FaceReco/.debug` |
 
@@ -92,7 +95,7 @@ Scores every image and writes an output folder:
 
 **Face Recognition (optional):**
 
-By default, after annotation previews are generated, face recognition automatically clusters qualifying faces using the Facenet provider. The output is stored in `.FaceReco/` within the same output directory. You can re-run independently with a different provider via `4_face_reco.py`, or disable the auto-run with `--skip-facereco`.
+By default, after annotation previews are generated, face recognition automatically clusters qualifying faces using the Facenet provider. The output is stored in `.FaceReco/` within the same output directory. Disable the auto-run with `--skip-facereco` if needed.
 
 **Sensitivity thresholds** (score ≤ threshold → blurry):
 
@@ -154,19 +157,17 @@ Propagates `Blur/` and `Skipped/` decisions from one already-applied directory t
 
 ## Face recognition
 
-Face recognition runs automatically at the end of Step 1 (unless `--skip-facereco`). To run it independently with different parameters:
-
-```
-python 4_face_reco.py <prep_output_dir> [options]
-```
+Face recognition runs automatically at the end of Step 1 (unless `--skip-facereco`).
 
 | Option | Default | Description |
 |---|---|---|
-| `--provider dlib\|facenet` | `facenet` | Embedding provider |
 | `--cluster-threshold <n>` | `0.72` | Cosine similarity for clustering (higher = tighter clusters) |
 | `--face-buffer-ratio <n>` | `0.15` | Extra crop padding around the face box (per side) |
 | `--face-db <dir>` | none | Match faces against an existing face DB |
-| `--face-db-match-threshold <n>` | `0.80` | Per-face cosine similarity required for a DB match |
+| `--face-db-match-threshold <n>` | `0.72` | Cosine similarity required between a face and its closest-matching person prototype |
+| `--face-db-match-margin <n>` | `0.05` | Minimum similarity gap required over the best-matching different person before accepting a match |
+| `--face-db-prototype-threshold <n>` | `0.62` | Cosine similarity used to split each DB person's own photos into visual sub-clusters ("prototypes") |
+| `--min-face-crop-px <n>` | `32` | Minimum short-edge crop size (pixels) trusted for matching/clustering; smaller crops are skipped |
 | `--align-faces` | off | Similarity-align faces before embedding |
 | `--debug-align` | off | Write alignment QA images to `.FaceReco/.debug` |
 | `--open-viewer` | off | Open the generated `.FaceReco/` folder afterwards |
@@ -174,10 +175,24 @@ python 4_face_reco.py <prep_output_dir> [options]
 **What it does:**
 
 1. Loads per-body data from `results.json`.
-2. Extracts face embeddings from qualifying bodies (via the selected provider).
-3. Clusters likely same-person faces by cosine similarity (agglomerative, average linkage).
-4. Optionally matches faces against a face DB and names matched clusters.
+2. Extracts face embeddings from qualifying bodies (via the selected provider), skipping crops smaller than `--min-face-crop-px`.
+3. Optionally matches faces against a face DB and names matched clusters (see **How face-DB matching works** below).
+4. Clusters the remaining (unmatched) faces by cosine similarity (agglomerative, average linkage).
 5. Writes face crops and metadata to `<prep_output_dir>/.FaceReco/`.
+
+### How face-DB matching works
+
+A real person's reference photos rarely form one tight blob in embedding space - glasses on/off, lighting, angle, and expression all shift the embedding. Loading the face DB therefore splits **each person's own positive embeddings** into visually-cohesive **prototypes** (sub-clusters, via the same cosine agglomerative clustering used elsewhere) instead of treating a person as one blended average. A query face is scored against every person's single *closest* prototype.
+
+A face is only assigned to a person when **all** of the following hold:
+
+1. **Absolute floor** - the best prototype similarity meets `--face-db-match-threshold`.
+2. **Margin over the runner-up** - the best-matching person must beat the best-matching *different* person by at least `--face-db-match-margin`. Two near-tied candidates is exactly the failure mode that mixes up similar-looking people; when the margin isn't met the face is left unmatched (and falls into ordinary clustering) rather than guessed.
+3. **Not vetoed** - the face isn't at least as similar to that person's curated `Negative/` examples as it is to the match.
+
+Each matched face's `matchScore`, `matchMargin`, and `matchRunnerUp` are written into `face.json` so a match can be audited after the fact.
+
+Don't guess `--face-db-match-threshold` / `--face-db-match-margin` - calibrate them from your own face DB with `RebuildFaceDB.py` (below), which calibrates automatically every time it rebuilds.
 
 Output layout:
 
@@ -193,7 +208,9 @@ Output layout:
         face.json
 ```
 
-Each `face.json` stores editable person metadata (`name`, `playernum`) and a `faces` list with the original filename, original body JSON payload, crop file name, confidence, an `aligned` flag, and a base64-encoded float32 embedding.
+Each `face.json` stores editable person metadata (`name`, `playernum`) and a `faces` list with the original filename, original body JSON payload, crop file name, confidence, match diagnostics (`matchScore`/`matchMargin`/`matchRunnerUp`, set only for face-DB matches), an `aligned` flag, and a base64-encoded float32 embedding.
+
+> **Note:** a *rebuilt* face DB (see below) uses a different, flatter `faces` schema — just a list of `{dtype, shape, encoding, value}` embeddings with no wrapper. That's the schema `--face-db` / `FaceDb.load` actually reads; the richer per-face metadata above is only present in the unlabeled `.FaceReco/` output of a fresh run, before `RebuildFaceDB.py` strips it down.
 
 ### Provider modules (`algo/`)
 
@@ -202,15 +219,24 @@ Each `face.json` stores editable person metadata (`name`, `playernum`) and a `fa
 - `algo/facenet_provider.py` — FaceNet (facenet-pytorch / VGGFace2) implementation
 - `algo/face_crop_embed.py` — shared crop → detect → (optional align) → embed pipeline used by both prediction and DB rebuild
 
-### Rebuilding a face DB
+### Rebuilding (and calibrating) a face DB
 
 ```
-python RebuildFaceDB.py <facedb_dir> [--align-faces]
+python RebuildFaceDB.py <facedb_dir> [--align-faces] [--prototype-threshold 0.62] [--skip-calibration]
 ```
 
-Recomputes every embedding in a `.FaceReco/` directory from its saved crop images. Use `--align-faces` only if the database was originally built with alignment — the rebuild and prediction must use the same flag so embeddings live in the same space.
+One command does both steps:
+
+1. **Rebuild** — recomputes every embedding in a `.FaceReco/` directory from its saved crop images. Use `--align-faces` only if the database was originally built with alignment — the rebuild and prediction must use the same flag so embeddings live in the same space.
+2. **Calibrate** (runs automatically afterwards; pass `--skip-calibration` to skip it) — runs leave-one-out cross-validation over the just-rebuilt DB: every photo is temporarily held out, scored against its own person's remaining photos (genuine similarity) and against every other person (impostor similarity) — exactly the comparison a real query faces. It reports:
+   - A recommended `--face-db-match-threshold` (nearest the equal-error-rate point) and `--face-db-match-margin`.
+   - **Confusions** — specific photos where a *different* person scored as high or higher than the true person. This is the most actionable signal for "faces are getting mixed up": it names the exact photo and the exact other person it's confused with, which is almost always either a genuine look-alike pair or a mislabeled crop sitting in the wrong person's `Face/` folder.
+   - Pairwise prototype overlap — which people are closest to each other in embedding space overall.
+
+Run it whenever the face DB changes meaningfully (new people, new photos) rather than reusing the default thresholds blindly — it only takes one command.
 
 ---
+
 
 ## Installation
 
