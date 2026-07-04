@@ -20,6 +20,7 @@ from .facereco_provider import BodyRecord, FaceRecoProvider, Player
 
 _MODEL: InceptionResnetV1 | None = None
 _DEVICE: "torch.device" | None = None
+_MODEL_DEVICE_NAME: str | None = None
 
 
 @dataclass
@@ -78,10 +79,7 @@ class FaceNetFaceRecoProvider(FaceRecoProvider):
         )
 
     def _get_model(self) -> InceptionResnetV1:
-        global _MODEL, _DEVICE
-
-        if _MODEL is not None:
-            return _MODEL
+        global _MODEL, _DEVICE, _MODEL_DEVICE_NAME
 
         if torch is None or InceptionResnetV1 is None:
             raise RuntimeError(
@@ -89,6 +87,10 @@ class FaceNetFaceRecoProvider(FaceRecoProvider):
             )
 
         device_name = self.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        if _MODEL is not None and _MODEL_DEVICE_NAME == device_name:
+            return _MODEL
+
         _DEVICE = torch.device(device_name)
         _MODEL = InceptionResnetV1(pretrained=self.model_name).eval().to(_DEVICE)
+        _MODEL_DEVICE_NAME = device_name
         return _MODEL

@@ -7,11 +7,24 @@
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 #   pip install -r requirements.txt
 
-ultralytics>=8.3.0
 rawpy>=0.18.0
 opencv-python>=4.10.0
-numpy>=1.26.0
+# Pinned <2: torch 2.2.2's compiled extensions (and facenet-pytorch) use the
+# NumPy 1.x ABI; NumPy 2.x breaks torch's Tensor.numpy() bridge with
+# "RuntimeError: Numpy is not available". mediapipe's declared opencv-contrib
+# dependency wants numpy>=2 but works fine at runtime with 1.26.x.
+numpy>=1.26.0,<2
 scikit-learn>=1.3.0
+
+# Default detection/pose/face-landmark engine (--engine mediapipe, the default).
+# Permissively licensed (Apache-2.0), unlike the optional YOLO engine below.
+# torchvision (installed alongside torch — see quick-start above) supplies the
+# person-detector half of the hybrid body-detection pipeline (BSD-3-Clause).
+mediapipe>=0.10.14
+
+# Optional legacy engine (--engine yolo). Ultralytics YOLO models are
+# AGPL-3.0 / GPL-3.0 licensed — see README licensing notes before enabling.
+ultralytics>=8.3.0
 
 # Optional but required when using the dlib face-recognition provider
 face-recognition>=1.3.0

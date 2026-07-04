@@ -1,5 +1,6 @@
 # Downloaded model weights (large binaries — auto-downloaded on first run)
 *.pt
+*.task
 
 # Python cache
 __pycache__/

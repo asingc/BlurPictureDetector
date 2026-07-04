@@ -43,7 +43,7 @@ from algo.stage import ProcessStage
 from algo.stages.annotation import AnnotationStage
 from algo.stages.face_reco import FaceRecoStage
 from algo.stages.grading import GradingStage
-from algo.stages.image_analysis import ImageAnalysisStage
+from algo.stages.image_analysis import ImageAnalysisStage, MediaPipeImageAnalysisStage
 from algo.stages.jersey_counting import JerseyCountingStage
 from algo.scorers import (
     BodyArrayScorer,
@@ -886,6 +886,72 @@ def _ensure_face_model() -> Path:
     return _FACE_MODEL_PATH
 
 
+_FACE_DB_DIR_CANDIDATES: tuple[str, ...] = (".FaceReco", ".facereco", ".Facereco")
+
+
+def _find_face_db_in_directory(directory: Path) -> Path | None:
+    """Return the first face-DB directory under *directory*, if any."""
+    for name in _FACE_DB_DIR_CANDIDATES:
+        candidate = directory / name
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
+def _walk_to_root(start: Path) -> list[Path]:
+    """Return [start, parent, ..., root] for an existing path lineage."""
+    chain: list[Path] = []
+    current = start.resolve()
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return chain
+
+
+def _resolve_face_db_dir(
+    explicit_path: str | None,
+    output_dir: Path,
+    input_path: Path,
+) -> Path | None:
+    """Resolve face DB path using ordered fallback search.
+
+    Order:
+      1) explicit --face-db path (authoritative)
+      2) current working directory (.FaceReco/.facereco/.Facereco)
+      3) walk upward from output directory
+      4) walk upward from source directory (or parent for single file input)
+    """
+    if explicit_path:
+        candidate = Path(explicit_path).resolve()
+        if candidate.is_dir():
+            log.info("Face DB resolved (explicit): %s", candidate)
+            return candidate
+        log.error("--face-db directory not found: %s", candidate)
+        return None
+
+    found = _find_face_db_in_directory(Path.cwd())
+    if found is not None:
+        log.info("Face DB resolved (current directory): %s", found)
+        return found
+
+    for directory in _walk_to_root(output_dir):
+        found = _find_face_db_in_directory(directory)
+        if found is not None:
+            log.info("Face DB resolved (target ancestry): %s", found)
+            return found
+
+    source_start = input_path if input_path.is_dir() else input_path.parent
+    for directory in _walk_to_root(source_start):
+        found = _find_face_db_in_directory(directory)
+        if found is not None:
+            log.info("Face DB resolved (source ancestry): %s", found)
+            return found
+
+    return None
+
+
 def collect_images(input_path: Path) -> list[Path]:
     if input_path.is_file():
         return [input_path] if input_path.suffix.lower() in IMAGE_EXTENSIONS else []
@@ -1333,7 +1399,7 @@ def _run_facereco(
             face_db_dir=face_db_dir,
             face_db_match_threshold=face_db_match_threshold,
         )
-        pipeline = FaceRecoPipeline(provider=provider, config=config)
+        pipeline = FaceRecoPipeline(provider=provider, config=config, cpu_only=False)
         facereco_dir = pipeline.run(output_dir)
         log.info("Face recognition complete: %s", facereco_dir)
     except Exception as exc:
@@ -1416,7 +1482,9 @@ def main() -> None:
         help=(
             "Path to a face-DB directory.  Each sub-directory must represent a "
             "person and contain a face.json with positive embeddings.  "
-            "Matched clusters will be stored in a folder named after that person."
+            "Matched clusters will be stored in a folder named after that person. "
+            "If omitted, auto-discovery is used: current dir -> target dir ancestry -> "
+            "source dir ancestry."
         ),
     )
     parser.add_argument(
@@ -1479,22 +1547,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--align-faces",
-        action="store_true",
-        help=(
-            "Similarity-align each face to a canonical 5-point template before "
-            "computing its embedding.  Must match the setting used to build the "
-            "face DB (RebuildFaceDB.py --align-faces).  Use for alignment A/B "
-            "comparison."
-        ),
-    )
-    parser.add_argument(
         "--debug-align",
         action="store_true",
         help=(
             "Write per-face alignment QA images (annotated crop + aligned face) "
             "to <output>/.FaceReco/.debug for visual inspection of landmark "
             "order and alignment quality."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help=(
+            "Force model inference onto CPU for benchmarking or environments "
+            "without usable CUDA."
         ),
     )
     parser.add_argument(
@@ -1506,11 +1572,24 @@ def main() -> None:
             "are scored regardless of jersey colour. Overrides --jerseycolor."
         ),
     )
+    parser.add_argument(
+        "--engine",
+        choices=("mediapipe", "yolo"),
+        default="mediapipe",
+        help=(
+            "Detection/pose/face-landmark engine (default: mediapipe). "
+            "mediapipe is Apache-2.0 licensed; yolo is the legacy engine "
+            "(AGPL-3.0/GPL-3.0 — see README licensing notes) kept for "
+            "comparison/rollback."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_console_logging()
     log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s face_db=%s",
               args.path, args.sensitivity, args.output, args.jerseycolor, args.skip_facereco, args.noteam, args.face_db)
+    if args.cpu_only:
+        log.info("CPU-only mode enabled: forcing YOLO and FaceReco providers to CPU")
 
     input_path = Path(args.path).resolve()
     if not input_path.exists():
@@ -1552,20 +1631,27 @@ def main() -> None:
     _add_file_logging(output_dir / "run.log")
     log.debug("Output directory: %s", output_dir.resolve())
 
-    log.info("Loading models …")
-    pose_model = YOLO("yolov8n-pose.pt")
-    face_model = YOLO(_ensure_face_model())
+    log.info("Loading models … (engine=%s)", args.engine)
+    if args.engine == "yolo":
+        pose_model = YOLO("yolov8n-pose.pt")
+        face_model = YOLO(_ensure_face_model())
+        if args.cpu_only:
+            pose_model.to("cpu")
+            face_model.to("cpu")
+        analysis_stage: ProcessStage = ImageAnalysisStage(input_path, pose_model, face_model)
+    else:
+        from algo.mediapipe_provider import load_face_landmarker, load_pose_landmarker
+        from algo.torchvision_provider import load_person_detector
+        person_detector = load_person_detector()
+        pose_landmarker = load_pose_landmarker(num_poses=1)
+        face_landmarker = load_face_landmarker(num_faces=1)
+        analysis_stage = MediaPipeImageAnalysisStage(input_path, person_detector, pose_landmarker, face_landmarker)
 
-    face_db_dir: Path | None = None
-    if args.face_db is not None:
-        face_db_dir = Path(args.face_db).resolve()
-        if not face_db_dir.is_dir():
-            log.error("--face-db directory not found: %s", face_db_dir)
-            face_db_dir = None
+    face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, input_path)
 
     jersey_stage = JerseyCountingStage(forced_colors, regular_colors, no_team=args.noteam)
     stages: list[ProcessStage] = [
-        ImageAnalysisStage(input_path, pose_model, face_model),
+        analysis_stage,
         GradingStage(sensitivity_threshold),
         jersey_stage,
         AnnotationStage(output_dir),
@@ -1599,17 +1685,21 @@ def main() -> None:
         log.info("")
 
     if frames and not args.skip_facereco:
-        FaceRecoStage(
-            output_dir,
-            face_db_dir=face_db_dir,
-            face_db_match_threshold=args.face_db_match_threshold,
-            face_db_match_margin=args.face_db_match_margin,
-            face_db_prototype_threshold=args.face_db_prototype_threshold,
-            use_face_db_calibration=not args.disable_face_db_calibration,
-            min_face_crop_px=args.min_face_crop_px,
-            align_faces=args.align_faces,
-            debug_align=args.debug_align,
-        ).process(frames, app_config)
+        if face_db_dir is None:
+            log.info("Face recognition skipped: no face DB found.")
+        else:
+            FaceRecoStage(
+                output_dir,
+                face_db_dir=face_db_dir,
+                face_db_match_threshold=args.face_db_match_threshold,
+                face_db_match_margin=args.face_db_match_margin,
+                face_db_prototype_threshold=args.face_db_prototype_threshold,
+                use_face_db_calibration=not args.disable_face_db_calibration,
+                min_face_crop_px=args.min_face_crop_px,
+                debug_align=args.debug_align,
+                cpu_only=args.cpu_only,
+                engine=args.engine,
+            ).process(frames, app_config)
 
     if frames:
         log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)

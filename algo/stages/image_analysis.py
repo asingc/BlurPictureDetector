@@ -336,3 +336,129 @@ class ImageAnalysisStage(ProcessStage):
         log.info("[ImageAnalysisStage] %d frame(s) constructed from %d file(s)",
                  len(result), len(files))
         return result
+
+
+# ---------------------------------------------------------------------------
+# MediaPipe engine (default) — same Body/Face schema, different detectors
+# ---------------------------------------------------------------------------
+
+def detect_qualified_persons_mp(
+    image: np.ndarray,
+    person_detector,
+    pose_landmarker,
+    face_landmarker,
+) -> tuple[list[Body], bool]:
+    """Hybrid counterpart to :func:`detect_qualified_persons`.
+
+    Same contract: returns ``(bodies, had_persons)`` with up to 8 Body
+    objects (largest-first), matched faces and keypoints populated, no
+    threshold filtering here.
+
+    MediaPipe's own person detector (bundled in Pose Landmarker) badly
+    under-recalls on busy multi-person sports photos (verified empirically:
+    ~1 body/image vs YOLOv8-pose's ~4.2 bodies/image on the same test set).
+    So body BOXES come from a torchvision Faster R-CNN person detector
+    instead (see ``algo/torchvision_provider.py``), and MediaPipe Pose
+    Landmarker only supplies the 33 body keypoints, run on a close-range
+    per-person crop (mirroring the face-detection two-pass approach).
+    Faces are likewise derived per-body via a close-range head-region crop
+    (see :func:`algo.mediapipe_provider.detect_face_for_body_mp`).
+    *pose_landmarker* / *face_landmarker* should be ``num_poses=1`` /
+    ``num_faces=1`` instances.
+    """
+    from algo.mediapipe_provider import detect_face_for_body_mp, extract_body_keypoints_for_box_mp
+    from algo.torchvision_provider import extract_person_boxes_tv
+
+    h, w = image.shape[:2]
+    person_boxes = extract_person_boxes_tv(image, person_detector)
+    if not person_boxes:
+        return [], False
+
+    bodies: list[Body] = []
+    for box in person_boxes:
+        keypoints = extract_body_keypoints_for_box_mp(image, box, pose_landmarker)
+        bodies.append(Body(
+            crop=np.empty((0, 0, 3), dtype=np.uint8),
+            bbox=box.padded(10, w, h),
+            faces=[],
+            keypoints=keypoints,
+        ))
+
+    for body in bodies:
+        face = detect_face_for_body_mp(image, body, face_landmarker)
+        if face is not None:
+            body.faces = [face]
+            fx1, fy1, fx2, fy2 = face.bbox.as_px_ints(w, h)
+            body.crop = image[fy1:fy2, fx1:fx2]
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(w, h)
+            log.debug("[detect:mp]   body bbox=(%d,%d,%d,%d): face found, crop %.0fx%.0f",
+                      bx1, by1, bx2, by2,
+                      face.bbox.width * w, face.bbox.height * h)
+        else:
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(w, h)
+            log.debug("[detect:mp]   body bbox=(%d,%d,%d,%d): no face found", bx1, by1, bx2, by2)
+
+    log.debug("[detect:mp] result: %d body(ies) returned", len(bodies))
+    return bodies, True
+
+
+class MediaPipeImageAnalysisStage(ProcessStage):
+    """Hybrid-engine counterpart to :class:`ImageAnalysisStage`.
+
+    Loads every image under *input_path*, runs a torchvision person detector
+    (body boxes) plus MediaPipe Pose Landmarker (33 keypoints per crop) and
+    Face Landmarker (face + landmarks per crop), and returns a
+    fully-populated list of Frame objects using the exact same Body/Face
+    schema as the YOLO stage — every downstream stage (grading, jersey
+    counting, annotation, face recognition) works unchanged.
+
+    This hybrid design exists because MediaPipe's own person detector badly
+    under-recalls on busy multi-person sports photos (see
+    :func:`detect_qualified_persons_mp`).  MediaPipe/torchvision models are
+    Apache-2.0/BSD-3-Clause licensed (unlike YOLO's AGPL-3.0/GPL-3.0), and
+    this is the default engine (see ``--engine`` on 1_prep_review.py /
+    RebuildFaceDB.py).
+
+    The *frames* argument passed to :meth:`process` is ignored — this stage
+    always constructs a fresh list from the images on disk.
+    """
+
+    def __init__(self, input_path: Path, person_detector, pose_landmarker, face_landmarker) -> None:
+        self.input_path = input_path
+        self.person_detector = person_detector
+        self.pose_landmarker = pose_landmarker
+        self.face_landmarker = face_landmarker
+
+    def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
+        files = collect_images(self.input_path)
+        result: list[Frame] = []
+        width = len(str(len(files)))
+
+        for idx, path in enumerate(files, 1):
+            log.debug("[MediaPipeImageAnalysisStage] [%*d/%d] %s", width, idx, len(files), path.name)
+            image = _read_image(path)
+            if image is None:
+                log.error("[MediaPipeImageAnalysisStage] %s — cannot read image file", path.name)
+                continue
+
+            normalized = cap_long_edge(image, config.normalized_img_max_long_edge)
+            log.debug("[MediaPipeImageAnalysisStage] %s — original %dx%d  normalized %dx%d",
+                      path.name, image.shape[1], image.shape[0],
+                      normalized.shape[1], normalized.shape[0])
+
+            bodies, had_persons = detect_qualified_persons_mp(
+                normalized, self.person_detector, self.pose_landmarker, self.face_landmarker
+            )
+            if not had_persons:
+                log.debug("[MediaPipeImageAnalysisStage] %s — no person detected", path.name)
+
+            result.append(Frame(
+                path=path,
+                bodies=bodies,
+                image=image,
+                normalized_image=normalized,
+            ))
+
+        log.info("[MediaPipeImageAnalysisStage] %d frame(s) constructed from %d file(s)",
+                 len(result), len(files))
+        return result

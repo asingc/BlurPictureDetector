@@ -10,8 +10,8 @@ Runs two YOLO models (body pose + face detection) on a folder of images, filters
 
 ```
 Image → normalize size (long edge = 1800 px)
-      → YOLOv8n-pose  → body bounding boxes + 17 COCO keypoints
-      → YOLOv8n-face  → face bounding boxes + 5 landmarks
+      → Pose model      → body bounding boxes + 17 COCO keypoints
+      → Face model       → face bounding boxes + 5 landmarks
       → match faces to bodies (head-keypoint overlap)
       → grade sharpness of each person's face crop
       → poll jersey colours → keep only your team (+ forced colours)
@@ -19,6 +19,13 @@ Image → normalize size (long edge = 1800 px)
       → write results.json / info.json / blurry.csv / blur.lst
       → (optional) cluster faces into .FaceReco/
 ```
+
+Detection runs on a pluggable **engine** (`--engine mediapipe` default, or `--engine yolo`):
+
+| Engine | Pose | Face | License |
+|---|---|---|---|
+| `mediapipe` *(default)* | BlazePose (Pose Landmarker) | BlazeFace + FaceMesh-V2 (Face Landmarker) | Apache-2.0 (permissive) |
+| `yolo` | YOLOv8n-pose | YOLOv8n-face | AGPL-3.0 / GPL-3.0 (copyleft — see licensing note below) |
 
 The pipeline is a sequence of stages (`algo/stages/`):
 
@@ -66,6 +73,7 @@ python 1_prep_review.py <image_or_directory> [options]
 | Option | Default | Description |
 |---|---|---|
 | `--sensitivity low\|medium\|high\|<n>` | `medium` | Blur threshold; or pass a numeric value (0–1) directly |
+| `--engine mediapipe\|yolo` | `mediapipe` | Detection/pose/face-landmark engine. `mediapipe` is Apache-2.0 licensed (default); `yolo` is the legacy engine, kept for comparison/rollback (AGPL-3.0/GPL-3.0 — see Licensing below) |
 | `--jerseycolor "COLOR[;COLOR...]"` | `blue;white;+purple;+orange;+light blue;+pink` | Team colours; `+` = forced-include; empty string disables filtering |
 | `--noteam` | off | Disable jersey filtering (score every detected person) |
 | `--output <dir>` | `output/<timestamp>-<input>/` | Root output directory |
@@ -255,9 +263,29 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 
-`yolov8n-pose.pt` is downloaded automatically by Ultralytics on first run.  
-`yolov8n-face.pt` is downloaded automatically from the
-[akanametov/yolo-face](https://github.com/akanametov/yolo-face) release on first run.
+Models are downloaded automatically on first run:
+
+- **mediapipe engine (default):** `pose_landmarker_full.task` and `face_landmarker.task`, downloaded from Google's
+  [MediaPipe model zoo](https://storage.googleapis.com/mediapipe-models/) (Apache-2.0 licensed).
+- **yolo engine (`--engine yolo`):** `yolov8n-pose.pt` via Ultralytics, and `yolov8n-face.pt` from the
+  [akanametov/yolo-face](https://github.com/akanametov/yolo-face) release.
+
+### Licensing
+
+The default `mediapipe` engine (BlazePose / BlazeFace / FaceMesh-V2) is Apache-2.0 licensed — permissive, no
+copyleft obligations. `facenet-pytorch` (MIT) and `dlib`/`face-recognition` (BSL-1.0/MIT) used for face
+recognition are also permissive.
+
+The optional `--engine yolo` path uses Ultralytics YOLO models, which are **AGPL-3.0** (or a paid Enterprise
+license) for the pose model, and **GPL-3.0** for the `akanametov/yolo-face` model. These are copyleft licenses
+with source-disclosure obligations for derivative/networked works — review them before enabling `--engine yolo`
+in any distributed or hosted use of this tool.
+
+### Known limitation (mediapipe engine)
+
+MediaPipe's Face Landmarker does not expose a reliable per-landmark occlusion/visibility score the way the YOLO
+face model does, so `face_coverage_min_visible` (the check that disqualifies a face with too few visible
+landmarks) is effectively a pass-through under `--engine mediapipe`.
 
 ---
 

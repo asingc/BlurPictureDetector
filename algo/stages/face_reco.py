@@ -52,14 +52,15 @@ class FaceRecoStage(ProcessStage):
     def __init__(
         self,
         output_dir: Path,
+        cpu_only: bool,
         face_db_dir: Path | None = None,
         face_db_match_threshold: float | None = None,
         face_db_match_margin: float | None = None,
         face_db_prototype_threshold: float | None = None,
         use_face_db_calibration: bool = True,
         min_face_crop_px: int = 32,
-        align_faces: bool = False,
         debug_align: bool = False,
+        engine: str = "mediapipe",
     ) -> None:
         self.output_dir = output_dir
         self.face_db_dir = face_db_dir
@@ -68,8 +69,9 @@ class FaceRecoStage(ProcessStage):
         self.face_db_prototype_threshold = face_db_prototype_threshold
         self.use_face_db_calibration = use_face_db_calibration
         self.min_face_crop_px = min_face_crop_px
-        self.align_faces = align_faces
         self.debug_align = debug_align
+        self.cpu_only = cpu_only
+        self.engine = engine
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         sharp_body_count = sum(
@@ -87,7 +89,7 @@ class FaceRecoStage(ProcessStage):
 
         try:
             if _FACENET_AVAILABLE:
-                provider = FaceNetFaceRecoProvider()
+                provider = FaceNetFaceRecoProvider(device="cpu" if self.cpu_only else None)
             elif _DLIB_AVAILABLE:
                 log.warning("[FaceRecoStage] FaceNet unavailable; falling back to dlib.")
                 provider = DlibFaceRecoProvider(
@@ -107,10 +109,10 @@ class FaceRecoStage(ProcessStage):
                 face_db_prototype_threshold=self.face_db_prototype_threshold,
                 use_face_db_calibration=self.use_face_db_calibration,
                 min_face_crop_px=self.min_face_crop_px,
-                align_faces=self.align_faces,
                 debug_align=self.debug_align,
+                engine=self.engine,
             )
-            pipeline = FaceRecoPipeline(provider=provider, config=facereco_config)
+            pipeline = FaceRecoPipeline(provider=provider, config=facereco_config, cpu_only=self.cpu_only)
             facereco_dir = pipeline.run(self.output_dir)
             log.info("[FaceRecoStage] face recognition complete: %s", facereco_dir)
         except Exception as exc:

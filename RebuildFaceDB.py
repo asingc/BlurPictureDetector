@@ -26,7 +26,7 @@ a face DB:
   crop or a genuine look-alike pair before it causes a wrong match.
 
 Usage:
-    python RebuildFaceDB.py <facedb_dir> [--align-faces] [--skip-calibration]
+    python RebuildFaceDB.py <facedb_dir> [--skip-calibration]
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from algo.face_crop_embed import embed_face_crop, load_face_model
-from algo.facereco import FaceDb, FaceDbEntry, normalize_embedding, build_prototypes
+from algo.face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model
+from algo.facereco import FaceDb, FaceDbEntry, FaceRecoConfig, normalize_embedding, build_prototypes
 
 log = logging.getLogger("RebuildFaceDB")
 
@@ -108,10 +108,11 @@ def _serialize_embedding(emb: np.ndarray) -> dict:
 
 def _embed_directory(
     image_dir: Path,
+    annotated_dir: Path,
     provider,
     face_model,
     label: str,
-    align: bool = False,
+    align: bool,
 ) -> list[dict]:
     """Compute embeddings for every image in *image_dir*.
 
@@ -135,12 +136,32 @@ def _embed_directory(
             skipped += 1
             continue
 
-        player = embed_face_crop(provider, face_model, image, align=align)
+        player, debug = embed_face_crop(
+            provider,
+            face_model,
+            image,
+            align=align,
+            collect_debug=True,
+        )
         emb = player.internal.get("embedding")
         if emb is None:
             log.warning("[%s] no embedding returned for %s — skipped", label, img_path.name)
             skipped += 1
             continue
+
+        annotated_dir.mkdir(parents=True, exist_ok=True)
+        annotated = annotate_face_crop(
+            image,
+            debug.get("face_bbox"),
+            debug.get("narrow_face_bbox"),
+            debug.get("landmarks_px", []),
+            player.confidence,
+        )
+        cv2.imwrite(
+            str(annotated_dir / img_path.name),
+            annotated,
+            [cv2.IMWRITE_PNG_COMPRESSION, 3],
+        )
 
         emb_arr = np.asarray(emb, dtype=np.float32)
         records.append(_serialize_embedding(emb_arr))
@@ -156,7 +177,12 @@ def _embed_directory(
 # Per-cluster rebuild
 # ---------------------------------------------------------------------------
 
-def _rebuild_cluster(cluster_dir: Path, face_model, align: bool = False) -> None:
+def _rebuild_cluster(
+    cluster_dir: Path,
+    face_model,
+    annotated_root: Path,
+    align: bool,
+) -> None:
     face_json_path = cluster_dir / "face.json"
     if not face_json_path.exists():
         log.warning("No face.json in %s — skipping", cluster_dir.name)
@@ -168,13 +194,29 @@ def _rebuild_cluster(cluster_dir: Path, face_model, align: bool = False) -> None
     provider_name: str = meta.get("provider", "facenet")
     name: str = meta.get("name", "")
     playernum = meta.get("playernum", None)
+    player_dir_name = name or cluster_dir.name
 
     log.info("--- name=%r  provider=%s ---",  name, provider_name)
 
     provider = _build_provider(provider_name)
 
-    faces = _embed_directory(cluster_dir / "Face", provider, face_model, "positive", align=align)
-    negatives = _embed_directory(cluster_dir / "Negative", provider, face_model, "negative", align=align)
+    player_annotated_dir = annotated_root / player_dir_name
+    faces = _embed_directory(
+        cluster_dir / "Face",
+        player_annotated_dir / "Face",
+        provider,
+        face_model,
+        "positive",
+        align=align,
+    )
+    negatives = _embed_directory(
+        cluster_dir / "Negative",
+        player_annotated_dir / "Negative",
+        provider,
+        face_model,
+        "negative",
+        align=align,
+    )
 
     payload = {
         "name": name,
@@ -454,15 +496,6 @@ def main() -> None:
         help="Path to the .FaceReco/ directory (contains one subdirectory per person).",
     )
     parser.add_argument(
-        "--align-faces",
-        action="store_true",
-        help=(
-            "Similarity-align each crop to a canonical 5-point template before "
-            "embedding.  Must match the setting used at prediction time "
-            "(1_prep_review.py --align-faces)."
-        ),
-    )
-    parser.add_argument(
         "--prototype-threshold",
         type=float,
         default=0.62,
@@ -476,6 +509,17 @@ def main() -> None:
         "--skip-calibration",
         action="store_true",
         help="Only rebuild embeddings; skip the leave-one-out calibration report that runs afterwards by default.",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("mediapipe", "yolo"),
+        default="mediapipe",
+        help=(
+            "Detector engine used for the per-crop face-landmark refinement "
+            "pass (default: mediapipe). Must match the engine used at "
+            "prediction time (1_prep_review.py --engine) so embeddings live "
+            "in the same space."
+        ),
     )
     args = parser.parse_args()
 
@@ -491,14 +535,16 @@ def main() -> None:
 
     log.info("Face DB : %s", facedb_dir)
     log.info("Clusters: %d", len(cluster_dirs))
-    log.info("Face alignment: %s", "ENABLED" if args.align_faces else "disabled")
+    align_faces = FaceRecoConfig().align_faces
+    log.info("Face alignment: %s", "ENABLED" if align_faces else "disabled")
 
-    face_model = load_face_model()
+    face_model = load_face_model(force_cpu=False, engine=args.engine)
+    annotated_root = facedb_dir / datetime.now().strftime("Annotated.%y%m%d-%H%M%S")
 
     ok = errors = 0
     for cluster_dir in cluster_dirs:
         try:
-            _rebuild_cluster(cluster_dir, face_model, align=args.align_faces)
+            _rebuild_cluster(cluster_dir, face_model, annotated_root, align=align_faces)
             ok += 1
         except Exception as exc:
             log.error(
@@ -507,6 +553,7 @@ def main() -> None:
             errors += 1
 
     log.info("Done: %d cluster(s) rebuilt, %d error(s)", ok, errors)
+    log.info("Annotated rebuild crops: %s", annotated_root)
 
     if args.skip_calibration:
         log.info("--skip-calibration set: not running the calibration report.")

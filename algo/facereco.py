@@ -11,7 +11,7 @@ import numpy as np
 import rawpy
 from sklearn.cluster import AgglomerativeClustering
 
-from .face_crop_embed import embed_face_crop, load_face_model, make_alignment_debug_image
+from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model, make_alignment_debug_image
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 
 log = logging.getLogger("BlurPictureDetector")
@@ -28,7 +28,7 @@ class FaceRecoConfig:
     # template before its embedding is computed.  Must match the setting used
     # to build the face DB (RebuildFaceDB.py --align-faces) for matching to
     # work.  Provided as an on/off switch for alignment A/B comparison.
-    align_faces: bool = False
+    align_faces: bool = True
     # When True, write per-face alignment QA images (annotated crop + aligned
     # face) to ``<output_dir>/.FaceReco/.debug`` so the landmark order and
     # alignment quality can be inspected visually.
@@ -76,8 +76,10 @@ class FaceRecoConfig:
     # below this size are routed straight to skipped/unmatched instead of
     # being compared against the DB or clustered.
     min_face_crop_px: int = 32
-
-
+    # Which detector/landmark engine to use for the per-crop face-landmark
+    # refinement pass (see algo/face_crop_embed.py:load_face_model).
+    # "mediapipe" (default, Apache-2.0) or "yolo" (legacy, AGPL-3.0/GPL-3.0).
+    engine: str = "mediapipe"
 @dataclass
 class FaceSample:
     body: BodyRecord
@@ -85,6 +87,7 @@ class FaceSample:
     confidence: float | None
     crop_file_name: str
     crop_image: np.ndarray | None
+    annotated_image: np.ndarray | None = None
     # Diagnostics populated only for face-DB matches (see
     # _match_samples_to_facedb) -- kept on the sample so they can be written
     # into face.json for human auditing of *why* a face was matched.
@@ -284,9 +287,10 @@ class _QualifiedBody:
 
 
 class FaceRecoPipeline:
-    def __init__(self, provider: FaceRecoProvider, config: FaceRecoConfig) -> None:
+    def __init__(self, provider: FaceRecoProvider, config: FaceRecoConfig, cpu_only: bool) -> None:
         self.provider = provider
         self.config = config
+        self.cpu_only = cpu_only
         self._effective_face_db_match_threshold = (
             config.face_db_match_threshold if config.face_db_match_threshold is not None else 0.72
         )
@@ -550,8 +554,8 @@ class FaceRecoPipeline:
         self,
         qualified: list[_QualifiedBody],
         debug_dir: Path | None = None,
-    ) -> list[tuple[_QualifiedBody, Player, np.ndarray]]:
-        predicted: list[tuple[_QualifiedBody, Player, np.ndarray]] = []
+    ) -> list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]]:
+        predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]] = []
         total = len(qualified)
         skipped_load = skipped_embedding = skipped_crop = 0
         log.debug("FaceReco [embed]: processing %d qualified body/bodies", total)
@@ -586,22 +590,27 @@ class FaceRecoPipeline:
                 continue
             result = embed_face_crop(
                 self.provider,
-                load_face_model(),
+                load_face_model(force_cpu=self.cpu_only, engine=self.config.engine),
                 crop,
                 fallback_confidence=item.body.confidence,
                 align=self.config.align_faces,
-                collect_debug=debug_dir is not None,
+                collect_debug=True,
             )
+            player, debug = result
             if debug_dir is not None:
-                player, debug = result
                 self._write_align_debug(debug_dir, item, crop, debug)
-            else:
-                player = result
             embedding = player.internal.get("embedding")
             if embedding is None:
                 skipped_embedding += 1
                 log.debug("FaceReco [embed]: %s — no embedding returned by provider, skipped", tag)
                 continue
+            annotated = annotate_face_crop(
+                crop,
+                debug.get("face_bbox"),
+                debug.get("narrow_face_bbox"),
+                debug.get("landmarks_px", []),
+                player.confidence,
+            )
             emb_arr = np.asarray(embedding, dtype=np.float32)
             log.debug(
                 "FaceReco [embed]: %s — embedding dim=%d  norm=%.4f  provider_conf=%s",
@@ -609,7 +618,7 @@ class FaceRecoPipeline:
                 f"{player.confidence:.3f}" if player.confidence is not None else "n/a",
             )
             log.debug("FaceReco [embed]: %s — crop %dx%d  ✓", tag, crop.shape[1], crop.shape[0])
-            predicted.append((item, player, crop))
+            predicted.append((item, player, crop, annotated))
             if index == 1 or index % 50 == 0 or index == total:
                 log.info("FaceReco [embed]: %d/%d processed  embedded=%d", index, total, len(predicted))
         log.info(
@@ -639,7 +648,7 @@ class FaceRecoPipeline:
 
     def _cluster_samples(
         self,
-        predicted: list[tuple[_QualifiedBody, Player, np.ndarray]],
+        predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]],
         start_id: int = 0,
     ) -> list[Cluster]:
         """Cluster the *residual* (DB-unmatched) face embeddings by cosine distance.
@@ -676,7 +685,7 @@ class FaceRecoPipeline:
         # a no-op, and cosine distance is scale-invariant either way.
         embeddings: list[np.ndarray] = [
             self._normalize(np.asarray(player.internal["embedding"], dtype=np.float32))
-            for _item, player, _crop in predicted
+            for _item, player, _crop, _annotated in predicted
         ]
         matrix = np.array(embeddings, dtype=np.float32)
         n_samples = len(embeddings)
@@ -704,7 +713,7 @@ class FaceRecoPipeline:
                  len(unique_labels), unique_labels)
 
         cluster_map: dict[int, Cluster] = {}
-        for i, (label, (item, player, crop)) in enumerate(zip(labels.tolist(), predicted)):
+        for i, (label, (item, player, crop, annotated)) in enumerate(zip(labels.tolist(), predicted)):
             cid = int(label) + start_id
             if cid not in cluster_map:
                 cluster_map[cid] = Cluster(cluster_id=cid, samples=[])
@@ -714,6 +723,7 @@ class FaceRecoPipeline:
                 confidence=player.confidence,
                 crop_file_name="",
                 crop_image=crop,
+                annotated_image=annotated,
             )
             cluster_map[cid].samples.append(sample)
             log.debug(
@@ -750,9 +760,9 @@ class FaceRecoPipeline:
 
     def _match_samples_to_facedb(
         self,
-        predicted: list[tuple[_QualifiedBody, Player, np.ndarray]],
+        predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]],
         face_db: FaceDb,
-    ) -> tuple[list[Cluster], dict[int, FaceDbEntry], list[tuple[_QualifiedBody, Player, np.ndarray]]]:
+    ) -> tuple[list[Cluster], dict[int, FaceDbEntry], list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]]]:
         """Assign each face directly to a face-DB person, before any clustering.
 
         Every face is compared independently against every person's closest
@@ -804,9 +814,9 @@ class FaceRecoPipeline:
         # Preserve discovery order of people for stable cluster numbering.
         person_samples: dict[str, list[FaceSample]] = {}
         person_entry: dict[str, FaceDbEntry] = {}
-        unmatched: list[tuple[_QualifiedBody, Player, np.ndarray]] = []
+        unmatched: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]] = []
 
-        for item, player, crop in predicted:
+        for item, player, crop, annotated in predicted:
             emb = self._normalize(np.asarray(player.internal["embedding"], dtype=np.float32))
             tag = f"{item.body.orig_filename} body#{item.body.body_index}"
 
@@ -822,13 +832,13 @@ class FaceRecoPipeline:
             margin = best_score - second_score
 
             if best_score < threshold:
-                unmatched.append((item, player, crop))
+                unmatched.append((item, player, crop, annotated))
                 log.debug("FaceReco [match]: %s — no DB match (best_sim=%.4f < %.3f)",
                           tag, best_score, threshold)
                 continue
 
             if margin < margin_floor:
-                unmatched.append((item, player, crop))
+                unmatched.append((item, player, crop, annotated))
                 log.debug(
                     "FaceReco [match]: %s — ambiguous: %s=%.4f vs %s=%.4f (margin=%.4f < %.3f) → unmatched",
                     tag, best_entry.name, best_score,
@@ -842,7 +852,7 @@ class FaceRecoPipeline:
             best_negs = normalised_negs.get(best_entry.name, [])
             neg_sim = max((float(np.dot(emb, ne)) for ne in best_negs), default=-1.0)
             if neg_sim >= best_score:
-                unmatched.append((item, player, crop))
+                unmatched.append((item, player, crop, annotated))
                 log.debug(
                     "FaceReco [match]: %s — vetoed by negative of %s (pos_sim=%.4f neg_sim=%.4f) → unmatched",
                     tag, best_entry.name, best_score, neg_sim,
@@ -855,6 +865,7 @@ class FaceRecoPipeline:
                 confidence=player.confidence,
                 crop_file_name="",
                 crop_image=crop,
+                annotated_image=annotated,
                 match_score=best_score,
                 match_margin=margin,
                 match_runner_up=second_entry.name if second_entry is not None else None,
@@ -959,6 +970,7 @@ class FaceRecoPipeline:
             dir_name = db_entry.name if db_entry is not None else cluster_num
             cluster_dir = out_root / dir_name
             face_dir = cluster_dir / "Face"
+            face_annotated_dir = cluster_dir / "Face.annotated"
             negative_dir = cluster_dir / "Negative"
             face_dir.mkdir(parents=True, exist_ok=True)
             negative_dir.mkdir(parents=True, exist_ok=True)
@@ -966,6 +978,7 @@ class FaceRecoPipeline:
             written = 0
             for sample in cluster.samples:
                 crop = sample.crop_image
+                annotated = sample.annotated_image
                 if crop is None:
                     log.debug("FaceReco [write]: cluster %s — %s body#%d has no crop image",
                               cluster_num, sample.body.orig_filename, sample.body.body_index)
@@ -975,8 +988,16 @@ class FaceRecoPipeline:
                 # reproduce the prediction embedding exactly on rebuild.
                 crop_name = f"{cluster_num}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
                 cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                if annotated is not None:
+                    face_annotated_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(
+                        str(face_annotated_dir / crop_name),
+                        annotated,
+                        [cv2.IMWRITE_PNG_COMPRESSION, 3],
+                    )
                 sample.crop_file_name = crop_name
                 sample.crop_image = None
+                sample.annotated_image = None
                 written += 1
                 log.debug("FaceReco [write]: cluster %s — saved crop %s  (%dx%d)",
                           cluster_num, crop_name, crop.shape[1], crop.shape[0])
