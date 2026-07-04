@@ -272,14 +272,34 @@ Models are downloaded automatically on first run:
 
 ### Licensing
 
-The default `mediapipe` engine (BlazePose / BlazeFace / FaceMesh-V2) is Apache-2.0 licensed — permissive, no
-copyleft obligations. `facenet-pytorch` (MIT) and `dlib`/`face-recognition` (BSL-1.0/MIT) used for face
-recognition are also permissive.
+**Permissive, no copyleft obligations** — everything used by the default `mediapipe` engine and default face
+recognition path:
 
-The optional `--engine yolo` path uses Ultralytics YOLO models, which are **AGPL-3.0** (or a paid Enterprise
-license) for the pose model, and **GPL-3.0** for the `akanametov/yolo-face` model. These are copyleft licenses
-with source-disclosure obligations for derivative/networked works — review them before enabling `--engine yolo`
-in any distributed or hosted use of this tool.
+| Component | Used for | License |
+|---|---|---|
+| mediapipe (BlazePose / BlazeFace / FaceMesh-V2) | default pose/face engine | Apache-2.0 |
+| torch / torchvision | hybrid engine's person-box detector (`fasterrcnn_resnet50_fpn_v2`) | BSD-3-Clause |
+| facenet-pytorch | face embedding (default provider) | MIT |
+| dlib | optional face embedding provider | Boost Software License 1.0 |
+| face-recognition | wraps dlib's face models | MIT |
+| numpy, scikit-learn | array ops, clustering | BSD-3-Clause |
+| opencv-python | image I/O and processing | MIT (wrapper) + Apache-2.0 (OpenCV itself) |
+
+**Weak copyleft (LGPL), used only as dynamically-linked binaries** — no source-disclosure obligation for this
+project's own code, but keep in mind if you redistribute the binaries themselves:
+
+- `rawpy` (MIT) wraps **LibRaw**, dual-licensed LGPL-2.1 or CDDL (or a paid commercial license). The PyPI wheel
+  links it dynamically, which is the standard LGPL-compatible way to use it from a closed-source app.
+- `opencv-python`'s prebuilt wheels bundle **FFmpeg** (LGPLv2.1); non-headless Linux wheels additionally bundle
+  **Qt5** (LGPLv3). Not applicable to Windows/macOS wheels or `opencv-python-headless`.
+
+**Copyleft — opt-in only, not the default:** the `--engine yolo` path uses Ultralytics YOLO models, which are
+**AGPL-3.0** (or a paid Enterprise license) for the pose model, and **GPL-3.0** for the `akanametov/yolo-face`
+model. These carry source-disclosure obligations for derivative/networked works — review them before enabling
+`--engine yolo` in any distributed or hosted use of this tool.
+
+All model weight files (`*.pt`, `*.task`) are `.gitignore`d and downloaded at runtime — none are committed to
+or redistributed with this repository.
 
 ### Known limitation (mediapipe engine)
 
