@@ -87,20 +87,35 @@ class AppConfig:
 
     # Jersey team-colour matching by weighted L*a*b* distance (preferred).
     # When True (default) the polled team-colour check compares each body's
-    # measured mean L*a*b* against the team's target colour using a Euclidean
-    # distance in which the L* (brightness) axis is down-weighted by
-    # jersey_lab_l_weight.  This matches a jersey by its underlying colour
-    # (its a*/b* chromaticity) while tolerating the large brightness swings
-    # caused by light and shadow.  Takes precedence over jersey_binary_lightness;
-    # set both to False to fall back to exact shade/hue matching.
+    # measured L*a*b* against the team's target colour using a distance
+    # decomposed into Lightness (L*), Chroma (C*, saturation) and Hue (H*)
+    # components — the same decomposition CIE94/CIEDE2000 use for perceptual
+    # colour differences:
+    #     dist = sqrt(l_weight*dL^2 + c_weight*dC^2 + h_weight*dH^2)
+    # Hue is what makes a jersey "yellow" vs. "green" and is largely
+    # invariant to brightness/shadow, so it stays at full weight.  Lightness
+    # and Chroma both swing heavily with lighting/shadow (shadows both darken
+    # *and* desaturate a jersey) so they are down-weighted.  This tolerates
+    # brightness/shadow variation while still rejecting an actual hue change.
+    # Takes precedence over jersey_binary_lightness; set both to False to
+    # fall back to exact shade/hue matching.
     jersey_lab_match:    bool  = True
-    # Weight applied to the L* (brightness) squared difference; a*/b* always
-    # weigh 1.0.  Smaller = more forgiving of brightness.  At 0.0 brightness is
-    # ignored entirely (white and black would then be indistinguishable, which
-    # is why a small non-zero weight is kept so achromatic jerseys still split
-    # by lightness).
+    # Weight applied to the L* (brightness) squared difference.
+    # Smaller = more forgiving of brightness.  At 0.0 brightness is ignored
+    # entirely (white and black would then be indistinguishable, which is why
+    # a small non-zero weight is kept so achromatic jerseys still split by
+    # lightness).
     jersey_lab_l_weight: float = 0.15
-    # Maximum weighted L*a*b* distance for a body to match the team colour.
+    # Weight applied to the C* (chroma / saturation) squared difference.
+    # Smaller = more forgiving of a jersey looking more washed-out or more
+    # vivid depending on lighting (shadow desaturates; direct sun saturates).
+    jersey_lab_c_weight: float = 0.30
+    # Weight applied to the H* (hue) squared difference.  Kept at full weight
+    # by default since hue is the primary perceptual "which colour is this"
+    # signal and should stay discriminative even when brightness/chroma are
+    # forgiven.
+    jersey_lab_h_weight: float = 1.0
+    # Maximum weighted LCh distance for a body to match the team colour.
     jersey_lab_max_dist: float = 22.0
 
 

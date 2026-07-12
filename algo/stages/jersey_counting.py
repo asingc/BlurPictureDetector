@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import statistics
 
 from algo.config import AppConfig
 from algo.frame import Frame
@@ -91,17 +92,34 @@ def _weighted_lab_distance(
     lab_a: tuple[float, float, float],
     lab_b: tuple[float, float, float],
     l_weight: float,
+    c_weight: float = 1.0,
+    h_weight: float = 1.0,
 ) -> float:
-    """Euclidean L*a*b* distance with the L* (brightness) axis down-weighted.
+    """LCh-decomposed colour distance between two L*a*b* colours.
 
-    a*/b* (the colour direction) always weigh 1.0; *l_weight* scales the squared
-    L* difference, so a small value makes the match forgiving of brightness while
-    still keeping achromatic colours (white vs black) apart.
+    Decomposes the raw a*/b* difference into a Chroma (saturation magnitude)
+    component and a Hue (colour angle) component — the same split
+    CIE94/CIEDE2000 use for perceptual colour differences — instead of a flat
+    Euclidean distance over a*/b*.  This matters because lighting/shadow moves
+    a jersey's Lightness *and* Chroma a lot (shadows both darken and desaturate)
+    while barely touching its Hue (a yellow jersey in shadow is still "yellow",
+    just darker/less vivid).  By down-weighting L and C while keeping H at
+    (near) full weight, the same real-world jersey colour matches across a wide
+    brightness/shadow range without becoming forgiving of an actual colour
+    (hue) change, e.g. yellow vs. green.
+
+    ``ΔH² = Δa² + Δb² - ΔC²`` is the exact algebraic decomposition of the a*/b*
+    Euclidean distance into its chroma and hue parts (no trig needed); clamped
+    to >= 0 to guard against floating-point noise.
     """
     dL = lab_a[0] - lab_b[0]
     da = lab_a[1] - lab_b[1]
     db = lab_a[2] - lab_b[2]
-    return (l_weight * dL * dL + da * da + db * db) ** 0.5
+    c_a = (lab_a[1] ** 2 + lab_a[2] ** 2) ** 0.5
+    c_b = (lab_b[1] ** 2 + lab_b[2] ** 2) ** 0.5
+    dC = c_a - c_b
+    dH_sq = max(0.0, da * da + db * db - dC * dC)
+    return (l_weight * dL * dL + c_weight * dC * dC + h_weight * dH_sq) ** 0.5
 
 
 def _allowed_reference_labs(allowed_colors: frozenset[str]) -> list[tuple[float, float, float]]:
@@ -146,7 +164,9 @@ def _matches_lab_refs(
     if blab is None:
         return False
     return any(
-        _weighted_lab_distance(blab, ref, config.jersey_lab_l_weight) <= config.jersey_lab_max_dist
+        _weighted_lab_distance(
+            blab, ref, config.jersey_lab_l_weight, config.jersey_lab_c_weight, config.jersey_lab_h_weight
+        ) <= config.jersey_lab_max_dist
         for ref in ref_labs
     )
 
@@ -168,11 +188,13 @@ def _poll_team_target_lab(
                 if mean and len(mean) == 3:
                     samples.append((float(mean[0]), float(mean[1]), float(mean[2])))
     if samples:
-        n = len(samples)
+        # Per-channel median across bodies (not a plain mean) so a single
+        # outlier body — e.g. one still sitting mostly in deep shadow — can't
+        # skew the whole team's anchor colour.
         return (
-            sum(s[0] for s in samples) / n,
-            sum(s[1] for s in samples) / n,
-            sum(s[2] for s in samples) / n,
+            statistics.median(s[0] for s in samples),
+            statistics.median(s[1] for s in samples),
+            statistics.median(s[2] for s in samples),
         )
     return _REF_LAB_BY_LABEL.get(our_label)
 
@@ -260,9 +282,11 @@ class JerseyCountingStage(ProcessStage):
             team_target_lab = _poll_team_target_lab(frames, our_color.label)
             forced_labs = _allowed_reference_labs(self.forced_colors)
             allowed_labs = _allowed_reference_labs(self.allowed_colors)
-            log.info("[JerseyCountingStage] LAB-distance mode — team target L*a*b*: %s (l_weight=%.2f, max_dist=%.1f)",
+            log.info("[JerseyCountingStage] LAB-distance mode — team target L*a*b*: %s "
+                     "(l_weight=%.2f, c_weight=%.2f, h_weight=%.2f, max_dist=%.1f)",
                      tuple(round(v, 1) for v in team_target_lab) if team_target_lab else "N/A",
-                     config.jersey_lab_l_weight, config.jersey_lab_max_dist)
+                     config.jersey_lab_l_weight, config.jersey_lab_c_weight,
+                     config.jersey_lab_h_weight, config.jersey_lab_max_dist)
         elif config.jersey_binary_lightness:
             team_bucket = _poll_lightness_bucket(frames, config)
             self.our_bucket = team_bucket
@@ -305,7 +329,10 @@ class JerseyCountingStage(ProcessStage):
                 if team_target_lab is not None:
                     blab = _body_lab(body)
                     dist = (
-                        _weighted_lab_distance(blab, team_target_lab, config.jersey_lab_l_weight)
+                        _weighted_lab_distance(
+                            blab, team_target_lab,
+                            config.jersey_lab_l_weight, config.jersey_lab_c_weight, config.jersey_lab_h_weight,
+                        )
                         if blab is not None else None
                     )
                     if dist is None or dist > config.jersey_lab_max_dist:

@@ -38,6 +38,7 @@ effectively a pass-through under this engine — see README.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import urllib.request
@@ -162,6 +163,33 @@ def load_face_landmarker(num_faces: int = 8):
         _FACE_LANDMARKERS[num_faces] = landmarker
         log.info("MediaPipe Face Landmarker loaded (num_faces=%d)", num_faces)
     return landmarker
+
+
+@atexit.register
+def _close_landmarkers() -> None:
+    """Explicitly close cached landmarkers before interpreter shutdown.
+
+    Without this, the singletons are only closed by their ``__del__`` during
+    interpreter teardown, at which point mediapipe's internal C dispatcher
+    module globals may already be cleared to ``None``, causing a noisy (but
+    harmless) ``TypeError: 'NoneType' object is not callable`` traceback to
+    be printed. ``close()`` is idempotent (no-ops if already closed), so
+    calling it here makes the later ``__del__`` call a no-op instead.
+    """
+    global _POSE_LANDMARKER, _POSE_LANDMARKER_NUM_POSES
+    if _POSE_LANDMARKER is not None:
+        try:
+            _POSE_LANDMARKER.close()
+        except Exception:
+            log.debug("Error closing Pose Landmarker at exit", exc_info=True)
+        _POSE_LANDMARKER = None
+        _POSE_LANDMARKER_NUM_POSES = None
+    for landmarker in _FACE_LANDMARKERS.values():
+        try:
+            landmarker.close()
+        except Exception:
+            log.debug("Error closing Face Landmarker at exit", exc_info=True)
+    _FACE_LANDMARKERS.clear()
 
 
 def _to_mp_image(image_bgr: np.ndarray):

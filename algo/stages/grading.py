@@ -35,7 +35,13 @@ class ClothColorPredictor:
     2. Resize the crop to a small 24 × 24 sample grid.
     3. Convert to CIE L*a*b* and assign each pixel to the nearest reference
        color by Euclidean distance.  Skin-tone pixels are skipped.
-    4. The colour with the most votes is returned.
+    4. The colour with the most votes is returned.  ``mean_lab`` (in the
+       returned detail dict) is the per-channel *median* L*a*b* of only the
+       pixels that voted for the winning color — restricting to the winning
+       color's pixels avoids diluting the value with shadowed folds, jersey
+       numbers/logos or background bleed at the crop edges, and the median
+       (vs. a plain mean) limits the influence of any remaining outlier
+       pixels (specular highlights, stray contamination).
     """
 
     _TORSO_KP_INDICES: tuple[int, ...] = (5, 6, 11, 12)
@@ -82,21 +88,26 @@ class ClothColorPredictor:
         is_skin    = skin_dists < self._SKIN_DIST_THRESH
 
         votes: dict[int, int] = {}
-        valid_pixels: list[np.ndarray] = []
+        pixels_by_color: dict[int, list[np.ndarray]] = {}
         for i, (idx, skip) in enumerate(zip(nearest_idx.tolist(), is_skin.tolist())):
             if skip:
                 continue
             votes[idx] = votes.get(idx, 0) + 1
-            valid_pixels.append(pixels[i])
+            pixels_by_color.setdefault(idx, []).append(pixels[i])
 
         if not votes:
             return "Unknown", {"votes": {}, "mean_lab": None}
         winner_idx = max(votes, key=votes.__getitem__)
         winner     = colors[winner_idx]
-        mean_lab   = (
-            [round(float(v), 1) for v in np.mean(valid_pixels, axis=0)]
-            if valid_pixels else None
-        )
+        # Use only the pixels that actually voted for the winning color — mixing
+        # in pixels nearest to *other* reference colors (shadowed folds, jersey
+        # numbers, background bleed at the crop edges) would drag the average
+        # away from the true jersey color instead of just reflecting brightness.
+        # A per-channel median (not mean) further limits the influence of any
+        # remaining small contaminated patch (specular highlight, stray
+        # background pixels) within the winning-color pixel set.
+        winner_pixels = pixels_by_color[winner_idx]
+        mean_lab = [round(float(v), 1) for v in np.median(winner_pixels, axis=0)]
         votes_by_label = {colors[k].label: v for k, v in votes.items()}
         return winner.label, {"votes": votes_by_label, "mean_lab": mean_lab}
 
