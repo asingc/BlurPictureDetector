@@ -10,6 +10,7 @@ from algo.config import AppConfig
 from algo.frame import Frame
 from algo.models import Box, Face
 from algo.stage import ProcessStage
+from algo.utils import apply_auto_adjustment
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -84,7 +85,7 @@ def _annotate_frame(
         return
 
     overall_blurry = not frame.is_sharp()
-    annotated = frame.image.copy()
+    annotated = apply_auto_adjustment(frame.image, frame.auto_adjustment).copy()
     overlay   = annotated.copy()
     h_out, w_out = annotated.shape[:2]
     sx = w_out

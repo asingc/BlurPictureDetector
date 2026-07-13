@@ -5,11 +5,25 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from algo.models import Box, ColorLab, Face
+from algo.models import AutoAdjustment, Box, ColorLab, Face
 
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
 _HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+
+def apply_auto_adjustment(image: np.ndarray, adjustment: AutoAdjustment | None) -> np.ndarray:
+    """Apply a simple EV (exposure/brightness) correction to a BGR *image*.
+
+    ``adjustment.ev`` multiplies pixel values by ``2 ** ev`` (a stop-based
+    exposure compensation). Returns *image* unchanged (same array, not a
+    copy) when there is nothing to apply.
+    """
+    if adjustment is None or adjustment.is_noop:
+        return image
+    out = image.astype(np.float32)
+    out *= 2.0 ** adjustment.ev
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:

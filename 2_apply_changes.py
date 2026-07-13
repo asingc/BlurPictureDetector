@@ -39,6 +39,12 @@ import shutil
 import sys
 from pathlib import Path
 
+import cv2
+
+from algo.models import AutoAdjustment
+from algo.stages.image_analysis import _read_image
+from algo.utils import apply_auto_adjustment
+
 log = logging.getLogger("2_apply_changes")
 
 
@@ -70,6 +76,46 @@ def _move(src: Path, dest_dir: Path) -> bool:
         return False
     shutil.move(str(src), str(dest))
     log.info("  Moved %-40s → %s", src.name, dest_dir)
+    return True
+
+
+def _load_auto_adjustments(ref_dir: Path) -> dict[str, AutoAdjustment]:
+    """Read results.json and return {source filename: AutoAdjustment prescription}."""
+    results_path = ref_dir / "results.json"
+    if not results_path.exists():
+        log.debug("results.json not found — auto adjustment disabled: %s", results_path)
+        return {}
+    with open(results_path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    adjustments: dict[str, AutoAdjustment] = {}
+    for entry in payload.get("results", []):
+        adj = entry.get("auto_adjustment")
+        if not adj:
+            continue
+        adjustments[Path(entry["file"]).name] = AutoAdjustment(ev=float(adj.get("ev", 0.0)))
+    return adjustments
+
+
+def _write_auto_adjusted(
+    src_file: Path,
+    adjustments: dict[str, AutoAdjustment],
+    dest_dir: Path,
+) -> bool:
+    """Apply the stored auto-adjustment prescription to *src_file* and save the
+    corrected result as a JPEG under *dest_dir*.  Returns True on success."""
+    adjustment = adjustments.get(src_file.name)
+    if adjustment is None or adjustment.is_noop:
+        log.debug("  No auto-adjustment recorded for: %s", src_file.name)
+        return False
+    image = _read_image(src_file)
+    if image is None:
+        log.warning("  Cannot read for auto adjustment: %s", src_file.name)
+        return False
+    corrected = apply_auto_adjustment(image, adjustment)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / (src_file.stem + ".jpg")
+    cv2.imwrite(str(dest_path), corrected, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    log.info("  Auto-adjusted (EV%+.1f) → %s", adjustment.ev, dest_path)
     return True
 
 
@@ -121,13 +167,17 @@ def main() -> None:
     log.info("Reference   : %s", ref_dir)
     log.info("Timestamp   : %s", info.get("Timestamp", ""))
 
-    blur_dest        = src_dir / "Blur"
-    skipped_dest     = src_dir / "Skipped"
-    anno_blur_dir    = ref_dir / "anno_blur"
-    anno_sharp_dir   = ref_dir / "anno_sharp"
-    anno_skipped_dir = ref_dir / "anno_skipped"
+    blur_dest         = src_dir / "Blur"
+    skipped_dest      = src_dir / "Skipped"
+    auto_adjust_dest  = src_dir / "auto adjusted"
+    anno_blur_dir     = ref_dir / "anno_blur"
+    anno_sharp_dir    = ref_dir / "anno_sharp"
+    anno_skipped_dir  = ref_dir / "anno_skipped"
 
-    moved_blur = moved_skipped = left_in_place = skipped_missing = 0
+    auto_adjustments = _load_auto_adjustments(ref_dir)
+    log.info("Auto adjustment prescriptions loaded: %d", len(auto_adjustments))
+
+    moved_blur = moved_skipped = left_in_place = skipped_missing = auto_adjusted = 0
 
     # ------------------------------------------------------------------
     # Anno_Blur — preview kept → Blur/;  preview deleted → leave in place
@@ -147,6 +197,8 @@ def main() -> None:
         else:
             log.info("  Preview deleted — leaving in place: %s", src_name)
             left_in_place += 1
+            if _write_auto_adjusted(src_file, auto_adjustments, auto_adjust_dest):
+                auto_adjusted += 1
 
     # ------------------------------------------------------------------
     # Anno_Sharp — preview kept → leave in place;  preview deleted → Blur/
@@ -163,6 +215,8 @@ def main() -> None:
         if (anno_sharp_dir / anno_name).exists():
             log.debug("  Preview present — leaving in place: %s", src_name)
             left_in_place += 1
+            if _write_auto_adjusted(src_file, auto_adjustments, auto_adjust_dest):
+                auto_adjusted += 1
         else:
             log.info("   Preview deleted — moving to Blur: %s", src_name)
             if _move(src_file, blur_dest):
@@ -192,8 +246,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     log.info(
         "Done — moved to Blur: %d  |  moved to Skipped: %d  "
-        "|  left in place: %d  |  source not found: %d",
-        moved_blur, moved_skipped, left_in_place, skipped_missing,
+        "|  left in place: %d  |  auto-adjusted: %d  |  source not found: %d",
+        moved_blur, moved_skipped, left_in_place, auto_adjusted, skipped_missing,
     )
 
 

@@ -118,5 +118,18 @@ class AppConfig:
     # Maximum weighted LCh distance for a body to match the team colour.
     jersey_lab_max_dist: float = 22.0
 
+    # ------------------------------------------------------------------
+    # Auto adjustment (exposure / brightness)
+    # ------------------------------------------------------------------
+    # Target mean brightness (0-1 gray level) the auto-exposure correction
+    # aims for, measured on a 50/50 blend of the whole image and the main
+    # subject's face crop.
+    auto_adjust_target_brightness: float = 0.45
+    # EV correction is rounded to the nearest multiple of this step
+    # (e.g. 0.5 → corrections read as EV +0.5, EV -1.0, …).
+    auto_adjust_ev_step:           float = 0.5
+    # Clamp on the magnitude of the EV correction, in stops.
+    auto_adjust_max_ev:            float = 2.0
+
 
 app_config = AppConfig()

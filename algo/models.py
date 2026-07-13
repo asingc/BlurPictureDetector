@@ -133,3 +133,17 @@ class ColorLab:
     def label(self) -> str:
         """Combined label used for cloth_color: 'Hue:Shade'."""
         return f"{self.hue}:{self.shade}"
+
+
+@dataclass
+class AutoAdjustment:
+    """A simple, discretised auto exposure (brightness) correction prescription.
+
+    Deliberately kept coarse (e.g. EV +0.5, not EV +0.4231) so the correction
+    stays easy to reason about, log, and re-apply later from JSON.
+    """
+    ev: float = 0.0  # exposure compensation in stops; output *= 2**ev
+
+    @property
+    def is_noop(self) -> bool:
+        return self.ev == 0.0

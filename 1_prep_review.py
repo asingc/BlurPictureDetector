@@ -41,6 +41,7 @@ from algo.frame import Frame
 from algo.models import Body, Box, ColorLab, Face, Point, PredictedKeyPoint
 from algo.stage import ProcessStage
 from algo.stages.annotation import AnnotationStage
+from algo.stages.auto_adjust import AutoAdjustStage
 from algo.stages.face_reco import FaceRecoStage
 from algo.stages.grading import GradingStage
 from algo.stages.image_analysis import ImageAnalysisStage, MediaPipeImageAnalysisStage
@@ -1189,8 +1190,12 @@ def write_results_json(frames: list[Frame], json_path: Path, *, our_jersey_color
     serializable = []
     for frame in frames:
         norm_img = frame.normalized_image
+        auto_adj = frame.auto_adjustment
+        auto_adj_entry = (
+            {"ev": auto_adj.ev} if auto_adj is not None else None
+        )
         if not frame.bodies:
-            entry: dict = {"file": str(frame.path), "status": "skipped"}
+            entry: dict = {"file": str(frame.path), "status": "skipped", "auto_adjustment": auto_adj_entry}
         else:
             overall_blurry = not frame.is_sharp()
             passing = [b for b in frame.bodies if b.passed]
@@ -1202,6 +1207,7 @@ def write_results_json(frames: list[Frame], json_path: Path, *, our_jersey_color
                 "sharpness_grade":    round(best.sharpness_score * 100, 1),
                 "laplacian_variance": round(best.lap_var, 2),
                 "tenengrad_score":    round(best.ten, 2),
+                "auto_adjustment":    auto_adj_entry,
                 "annotation_data": {
                     "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
                     "overall_blurry":   overall_blurry,
@@ -1583,6 +1589,15 @@ def main() -> None:
             "comparison/rollback."
         ),
     )
+    parser.add_argument(
+        "--autoadjust",
+        action="store_true",
+        help=(
+            "Compute a simple auto-exposure (brightness) correction per image, "
+            "shown in the annotated previews and written to results.json for "
+            "2_apply_changes.py to apply. Off by default."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_console_logging()
@@ -1654,8 +1669,10 @@ def main() -> None:
         analysis_stage,
         GradingStage(sensitivity_threshold),
         jersey_stage,
-        AnnotationStage(output_dir),
     ]
+    if args.autoadjust:
+        stages.append(AutoAdjustStage())
+    stages.append(AnnotationStage(output_dir))
     frames: list[Frame] = []
     for stage in stages:
         frames = stage.process(frames, app_config)

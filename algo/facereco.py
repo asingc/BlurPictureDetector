@@ -445,6 +445,14 @@ class FaceRecoPipeline:
 
         next_id = max((c.cluster_id for c in matched_clusters), default=-1) + 1
         residual_clusters = self._cluster_samples(unmatched, start_id=next_id)
+
+        # Sort unmatched clusters by size (most faces first) and renumber
+        # them accordingly, so the biggest new-person buckets get the
+        # lowest cluster ids/folder names — easiest to spot when reviewing.
+        residual_clusters.sort(key=lambda c: len(c.samples), reverse=True)
+        for offset, cluster in enumerate(residual_clusters):
+            cluster.cluster_id = next_id + offset
+
         clusters = matched_clusters + residual_clusters
         log.info(
             "FaceReco: %d cluster(s) total — %d matched person bucket(s) + %d new cluster(s)  (sizes: %s)",
