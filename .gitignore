@@ -26,3 +26,5 @@ TestImages/
 # VS Code workspace settings (personal, not shared)
 .vscode/
 .Facereco/
+.FaceReco.backup*/
+*.log
