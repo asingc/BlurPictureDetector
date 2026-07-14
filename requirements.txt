@@ -32,3 +32,9 @@ dlib>=19.24.0
 
 # Optional but required when using the facenet face-recognition provider
 facenet-pytorch>=2.6.0
+
+# Web UI for face-reco cluster tagging (face_tag_ui.py). Permissive licenses
+# (FastAPI MIT, uvicorn/starlette BSD-3-Clause).
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

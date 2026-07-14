@@ -30,11 +30,20 @@ import argparse
 import csv
 import json
 import logging
+import os
+import socket
+import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    import msvcrt  # Windows-only: lets the tagging-UI wait prompt be skipped with 'C'.
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
 
 from algo.config import AppConfig, app_config
 from algo.frame import Frame
@@ -1412,6 +1421,67 @@ def _run_facereco(
         log.error("Face recognition failed: %s", exc, exc_info=True)
 
 
+def _find_free_port(start: int = 8000, limit: int = 1000) -> int:
+    """Return the first available localhost TCP port at or after ``start``.
+
+    Scans sequentially with a plain bind/release probe per port — pure
+    socket-module behaviour, identical on every platform — rather than
+    asking the OS to hand back a random ephemeral port.
+    """
+    for port in range(start, start + limit):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"No free port found in range {start}-{start + limit - 1}")
+
+
+def _launch_face_tag_ui(output_dir: Path) -> None:
+    """Launch the face-tagging web UI as a hidden background process, scoped
+    to this run's ``output_dir`` album, on the first free port from 8000.
+
+    Waits (polling) for the process to exit on its own — e.g. its own
+    heartbeat watchdog firing once the browser tab is closed — so the
+    reviewer has a natural checkpoint before moving on. Pressing "C" skips
+    the wait without terminating the background process.
+    """
+    script = Path(__file__).resolve().parent / "face_tag_ui.py"
+    if not script.is_file():
+        log.warning("face_tag_ui.py not found — skipping face tagging UI launch.")
+        return
+
+    port = _find_free_port()
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script), "--album", str(output_dir), "--port", str(port)],
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log.warning("Could not launch face tagging UI: %s", exc)
+        return
+
+    log.info("")
+    log.info('Tagging faces, close the browser when you are done.  Press "C" to skip waiting...')
+    try:
+        while proc.poll() is None:
+            if msvcrt is not None and msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch.lower() == b"c":
+                    log.info("Skipping wait — face tagging UI keeps running in the background.")
+                    return
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        log.info("Interrupted — face tagging UI keeps running in the background.")
+        return
+
+    log.info("Face tagging UI closed.")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1717,6 +1787,7 @@ def main() -> None:
                 cpu_only=args.cpu_only,
                 engine=args.engine,
             ).process(frames, app_config)
+            _launch_face_tag_ui(output_dir)
 
     if frames:
         log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)

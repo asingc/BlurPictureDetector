@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Face Tag UI</title>
+  <link rel="stylesheet" href="https://code.jquery.com/ui/1.13.2/themes/base/jquery-ui.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="topbar-left">
+      <button id="backBtn" class="btn" style="display:none">&larr; Albums</button>
+      <h1 id="title">Face Tag UI</h1>
+    </div>
+    <div class="topbar-right">
+      <span id="dirtyBadge" class="badge" style="display:none">unsaved changes</span>
+      <button id="saveBtn" class="btn btn-primary" style="display:none" disabled>Save</button>
+    </div>
+  </header>
+
+  <main id="content">
+    <!-- Home / album picker -->
+    <section id="homeView" style="display:none">
+      <h2>Select an album</h2>
+      <ul id="albumList" class="album-list"></ul>
+      <p id="noAlbums" class="muted" style="display:none">
+        No albums with a <code>.FaceReco</code> folder were found under the output directory.
+      </p>
+    </section>
+
+    <!-- Album / cluster bands -->
+    <section id="albumView" style="display:none">
+      <div id="albumMeta" class="muted"></div>
+      <div id="bands"></div>
+    </section>
+  </main>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://code.jquery.com/ui/1.13.2/jquery-ui.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
