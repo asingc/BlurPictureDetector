@@ -16,7 +16,9 @@ setlocal EnableDelayedExpansion
 ::      (no git required) and updates the local app folder in place (existing
 ::      output\ and other local-only data are never deleted).
 ::   5. Installs dlib via conda-forge (prebuilt Windows binary - no C++
-::      compiler / CMake needed), then the rest of requirements.txt via pip.
+::      compiler / CMake needed) - GPU-accelerated build + cudnn when an
+::      NVIDIA GPU was detected, otherwise the CPU build - then the rest of
+::      requirements.txt via pip.
 ::   6. Installs face_recognition_models straight from source (PyPI releases
 ::      of it are unreliable and can leave face-recognition non-functional).
 ::   7. Writes a small RunPhotoProcessing.bat launcher.
@@ -118,11 +120,13 @@ if exist "%ENV_PY%" (
 echo [3/9] Detecting NVIDIA GPU / CUDA driver...
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
-    echo       NVIDIA driver found - will install CUDA-enabled PyTorch ^(cu126^).
+    echo       NVIDIA driver found - will install CUDA-enabled PyTorch ^(cu126^) and GPU-accelerated dlib.
     set "TORCH_INDEX=--index-url https://download.pytorch.org/whl/cu126"
+    set "HAS_NVIDIA_GPU=1"
 ) else (
-    echo       No NVIDIA driver detected - will install CPU-only PyTorch.
+    echo       No NVIDIA driver detected - will install CPU-only PyTorch and dlib.
     set "TORCH_INDEX="
+    set "HAS_NVIDIA_GPU=0"
 )
 
 :: ----------------------------------------------------------------------------
@@ -163,9 +167,43 @@ if errorlevel 8 (
 :: ----------------------------------------------------------------------------
 :: [5/9] Hard-to-build native dependency: dlib (via conda-forge, prebuilt)
 :: ----------------------------------------------------------------------------
-echo [5/9] Installing dlib ^(conda-forge prebuilt binary - no compiler required^)...
-"%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge dlib
-if errorlevel 1 goto :fail
+:: Prefer the GPU build when an NVIDIA GPU was detected in step 3. conda-forge
+:: ships dlib-cpu/dlib-gpu as separate packages; unlike the plain "dlib"
+:: metapackage (which only requires cudnn to BUILD the CUDA variant, not to
+:: run it), we explicitly install "cudnn" alongside dlib-gpu here so
+:: cudnn_ops64_9.dll etc. actually exist at runtime - otherwise dlib fails
+:: with "Could not locate cudnn_ops64_9.dll" / "Invalid handle. Cannot load
+:: symbol cudnnCreateTensorDescriptor" (PyTorch's own bundled cuDNN from its
+:: pip wheel is invisible to dlib, a separate native library). Falls back to
+:: the CPU build if the GPU install fails for any reason (e.g. no compatible
+:: cudnn/CUDA version available for this driver).
+::
+:: Notes from hands-on testing:
+:: - Remove any previously installed dlib/dlib-cpu/dlib-gpu first: solving
+::   with an existing (different-variant) dlib already in the env produces
+::   unsatisfiable conflicts across dozens of historical dlib-gpu/cuda
+::   builds and can take several minutes before failing.
+:: - "--override-channels -c conda-forge" avoids also pulling in the slower
+::   "defaults" channel, which otherwise makes the solve far slower.
+:: - Installing dlib-gpu can pull in a newer numpy (e.g. 2.x) as a conda
+::   dependency, silently corrupting the pip-installed numpy<2 (torch 2.2.2
+::   needs numpy<2 - see requirements.txt comment). Step 7 below re-asserts
+::   the numpy<2 pin via pip --force-reinstall to fix this deterministically
+::   regardless of which branch ran here.
+"%CONDA_DIR%\Scripts\conda.exe" remove -y -p "%ENV_DIR%" dlib dlib-cpu dlib-gpu --force >nul 2>nul
+if "%HAS_NVIDIA_GPU%"=="1" (
+    echo [5/9] Installing dlib-gpu + cudnn ^(conda-forge, CUDA-accelerated^)...
+    "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-gpu cudnn
+    if errorlevel 1 (
+        echo       dlib-gpu install failed - falling back to CPU-only dlib.
+        "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-cpu
+        if errorlevel 1 goto :fail
+    )
+) else (
+    echo [5/9] Installing dlib-cpu ^(conda-forge prebuilt binary - no compiler required^)...
+    "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-cpu
+    if errorlevel 1 goto :fail
+)
 
 :: ----------------------------------------------------------------------------
 :: [6/9] PyTorch
@@ -183,6 +221,10 @@ echo [7/9] Installing remaining dependencies from requirements.txt...
 set "REQ_FILTERED=%WORK_DIR%\requirements.filtered.txt"
 findstr /V /R "^dlib" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
 "%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
+if errorlevel 1 goto :fail
+
+echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency can bump it to 2.x, which breaks torch's Tensor.numpy^(^) bridge^)...
+"%ENV_PY%" -m pip install --force-reinstall "numpy>=1.26.0,<2"
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
