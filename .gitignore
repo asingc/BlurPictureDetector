@@ -28,3 +28,5 @@ TestImages/
 .Facereco/
 .FaceReco.backup*/
 *.log
+Test/
+test[0-9]*/
