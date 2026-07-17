@@ -6,9 +6,13 @@ setlocal EnableDelayedExpansion
 :: ----------------------------------------------------------------------------
 :: One-shot / re-runnable bootstrapper for BlurPictureDetector.
 ::
-:: What it does, assuming Anaconda or Miniconda is already installed and
-:: "conda" is available on PATH (e.g. run from an "Anaconda Prompt"):
-::   1. Verifies conda is installed and locates its base installation directory.
+:: What it does. Designed to be downloaded and run on its own (no git clone,
+:: no pre-opened "Anaconda Prompt" required) - it only needs Anaconda or
+:: Miniconda to already be installed SOMEWHERE on the machine:
+::   1. Looks for an existing Anaconda/Miniconda installation - first on PATH,
+::      then in common per-user/per-machine install folders - so it works from
+::      a plain Command Prompt, not just an "Anaconda Prompt". If none is
+::      found anywhere, it prints an install URL and stops.
 ::   2. Creates an isolated conda environment (Python 3.12) for the project.
 ::   3. Detects an NVIDIA GPU/driver (nvidia-smi) and installs CUDA-enabled
 ::      PyTorch if found, otherwise CPU-only PyTorch.
@@ -23,11 +27,13 @@ setlocal EnableDelayedExpansion
 ::      of it are unreliable and can leave face-recognition non-functional).
 ::   7. Writes a small RunPhotoProcessing.bat launcher.
 ::
-:: Requires: Anaconda or Miniconda already installed, with "conda" on PATH
-:: (run this from an "Anaconda Prompt", or a shell where conda has been
-:: added to PATH). Get it from:
+:: Requires: Anaconda or Miniconda already installed somewhere on this
+:: machine (does not need to be on PATH - common install folders are
+:: searched automatically). If it isn't installed yet, get it from:
 ::   https://www.anaconda.com/download
 ::   https://docs.conda.io/en/latest/miniconda.html
+:: then re-run this script (a plain Command Prompt/double-click is fine,
+:: an "Anaconda Prompt" is not required).
 ::
 :: Safe to re-run at any time: it re-checks/updates the environment,
 :: dependencies, and pulls the latest app code.
@@ -67,27 +73,56 @@ set "WORK_DIR=%INSTALL_ROOT%\_setup_tmp"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
 :: ----------------------------------------------------------------------------
-:: [1/9] Verify Anaconda / Miniconda is already installed
+:: [1/9] Find an existing Anaconda / Miniconda installation
 :: ----------------------------------------------------------------------------
+:: Checks PATH first (fast path when run from an "Anaconda Prompt"), then
+:: falls back to scanning common per-user / per-machine install folders so
+:: this also works from a plain Command Prompt where conda was never added
+:: to PATH. Does not install anything itself - if nothing is found, it
+:: prints the download URL and stops so the user can install once and
+:: re-run this script.
 echo [1/9] Checking for an existing Anaconda/Miniconda installation...
+set "CONDA_DIR="
+
 where conda >nul 2>nul
-if errorlevel 1 (
-    echo ERROR: no "conda" command found on PATH.
+if not errorlevel 1 (
+    for /f "usebackq delims=" %%B in (`conda info --base 2^>nul`) do set "CONDA_DIR=%%B"
+)
+
+if not defined CONDA_DIR (
+    echo       "conda" not found on PATH - checking common install locations...
+    for %%D in (
+        "%USERPROFILE%\miniconda3"
+        "%USERPROFILE%\anaconda3"
+        "%LOCALAPPDATA%\miniconda3"
+        "%LOCALAPPDATA%\anaconda3"
+        "%LOCALAPPDATA%\Continuum\anaconda3"
+        "%ProgramData%\miniconda3"
+        "%ProgramData%\anaconda3"
+        "C:\miniconda3"
+        "C:\anaconda3"
+    ) do (
+        if not defined CONDA_DIR (
+            if exist "%%~D\Scripts\conda.exe" set "CONDA_DIR=%%~D"
+        )
+    )
+)
+
+if not defined CONDA_DIR (
+    echo ERROR: no Anaconda/Miniconda installation found ^(checked PATH and
+    echo common install folders^).
     echo.
-    echo This script requires Anaconda or Miniconda to already be installed,
-    echo with "conda" available on PATH ^(e.g. run this from an "Anaconda
-    echo Prompt", or open a regular prompt after adding conda to PATH^).
-    echo.
-    echo Get Anaconda/Miniconda from:
-    echo   https://www.anaconda.com/download
+    echo This script requires Anaconda or Miniconda to be installed first.
+    echo Install Miniconda ^(smaller, recommended^) or Anaconda, then re-run
+    echo this script:
     echo   https://docs.conda.io/en/latest/miniconda.html
+    echo   https://www.anaconda.com/download
     goto :fail
 )
 
-for /f "usebackq delims=" %%B in (`conda info --base`) do set "CONDA_DIR=%%B"
 if not exist "%CONDA_DIR%\Scripts\conda.exe" (
-    echo ERROR: found "conda" on PATH but could not determine its base
-    echo installation directory ^(via "conda info --base"^).
+    echo ERROR: found a possible conda installation at "%CONDA_DIR%" but
+    echo "%CONDA_DIR%\Scripts\conda.exe" is missing.
     goto :fail
 )
 echo       Found conda at "%CONDA_DIR%".
