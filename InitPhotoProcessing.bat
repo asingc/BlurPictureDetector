@@ -14,18 +14,23 @@ setlocal EnableDelayedExpansion
 ::      a plain Command Prompt, not just an "Anaconda Prompt". If none is
 ::      found anywhere, it prints an install URL and stops.
 ::   2. Creates an isolated conda environment (Python 3.12) for the project.
-::   3. Detects an NVIDIA GPU/driver (nvidia-smi) and installs CUDA-enabled
+::   3. Pins setuptools<81 right away, immediately after the conda environment
+::      is created, so pkg_resources stays available for
+::      face_recognition_models - done first, before the much slower GPU
+::      detection/download/dlib/PyTorch/requirements.txt steps below, so a
+::      broken pip environment is caught fast instead of after a long wait.
+::   4. Detects an NVIDIA GPU/driver (nvidia-smi) and installs CUDA-enabled
 ::      PyTorch if found, otherwise CPU-only PyTorch.
-::   4. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
+::   5. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
 ::      (no git required) and updates the local app folder in place (existing
 ::      output\ and other local-only data are never deleted).
-::   5. Installs dlib via conda-forge (prebuilt Windows binary - no C++
+::   6. Installs dlib via conda-forge (prebuilt Windows binary - no C++
 ::      compiler / CMake needed) - GPU-accelerated build + cudnn when an
 ::      NVIDIA GPU was detected, otherwise the CPU build - then the rest of
 ::      requirements.txt via pip.
-::   6. Installs face_recognition_models straight from source (PyPI releases
+::   7. Installs face_recognition_models straight from source (PyPI releases
 ::      of it are unreliable and can leave face-recognition non-functional).
-::   7. Writes a small RunPhotoProcessing.bat launcher.
+::   8. Writes a small RunPhotoProcessing.bat launcher.
 ::
 :: Requires: Anaconda or Miniconda already installed somewhere on this
 :: machine (does not need to be on PATH - common install folders are
@@ -73,7 +78,7 @@ set "WORK_DIR=%INSTALL_ROOT%\_setup_tmp"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
 :: ----------------------------------------------------------------------------
-:: [1/9] Find an existing Anaconda / Miniconda installation
+:: [1/10] Find an existing Anaconda / Miniconda installation
 :: ----------------------------------------------------------------------------
 :: Checks PATH first (fast path when run from an "Anaconda Prompt"), then
 :: falls back to scanning common per-user / per-machine install folders so
@@ -81,7 +86,7 @@ if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 :: to PATH. Does not install anything itself - if nothing is found, it
 :: prints the download URL and stops so the user can install once and
 :: re-run this script.
-echo [1/9] Checking for an existing Anaconda/Miniconda installation...
+echo [1/10] Checking for an existing Anaconda/Miniconda installation...
 set "CONDA_DIR="
 
 where conda >nul 2>nul
@@ -135,24 +140,40 @@ set "ENV_DIR=%INSTALL_ROOT%\envs\%ENV_NAME%"
 set "ENV_PY=%ENV_DIR%\python.exe"
 
 :: ----------------------------------------------------------------------------
-:: [2/9] Conda environment
+:: [2/10] Conda environment
 :: ----------------------------------------------------------------------------
 echo       Accepting Anaconda Terms of Service for default channels (best effort)...
 "%CONDA_DIR%\Scripts\conda.exe" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >nul 2>nul
 "%CONDA_DIR%\Scripts\conda.exe" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >nul 2>nul
 
 if exist "%ENV_PY%" (
-    echo [2/9] Conda environment "%ENV_NAME%" already present - skipping creation.
+    echo [2/10] Conda environment "%ENV_NAME%" already present - skipping creation.
 ) else (
-    echo [2/9] Creating conda environment "%ENV_NAME%" ^(python %PYTHON_VERSION%^)...
+    echo [2/10] Creating conda environment "%ENV_NAME%" ^(python %PYTHON_VERSION%^)...
     "%CONDA_DIR%\Scripts\conda.exe" create -y -p "%ENV_DIR%" python=%PYTHON_VERSION%
     if errorlevel 1 goto :fail
 )
 
 :: ----------------------------------------------------------------------------
-:: [3/9] Detect CUDA / NVIDIA GPU
+:: [3/10] Pin setuptools (pkg_resources compatibility for face_recognition_models)
 :: ----------------------------------------------------------------------------
-echo [3/9] Detecting NVIDIA GPU / CUDA driver...
+:: face_recognition_models' __init__.py still imports the old `pkg_resources`
+:: API (from setuptools). Recent setuptools versions (81+) dropped
+:: pkg_resources, which makes that import raise ModuleNotFoundError - caught
+:: by face_recognition's own broad except clause and re-reported as the
+:: misleading "please install face_recognition_models" message even though
+:: the package IS installed. Pin setuptools<81 to keep pkg_resources
+:: available. Done as early as possible (right after env creation, before
+:: the much slower dlib/PyTorch/requirements.txt installs below) so a
+:: broken pip/environment is caught immediately instead of after a long wait.
+echo [3/10] Pinning setuptools ^(pkg_resources compatibility for face_recognition_models^)...
+"%ENV_PY%" -m pip install "setuptools<81"
+if errorlevel 1 goto :fail
+
+:: ----------------------------------------------------------------------------
+:: [4/10] Detect CUDA / NVIDIA GPU
+:: ----------------------------------------------------------------------------
+echo [4/10] Detecting NVIDIA GPU / CUDA driver...
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
     echo       NVIDIA driver found - will install CUDA-enabled PyTorch ^(cu126^) and GPU-accelerated dlib.
@@ -165,9 +186,9 @@ if not errorlevel 1 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [4/9] Download latest app code (no git required)
+:: [5/10] Download latest app code (no git required)
 :: ----------------------------------------------------------------------------
-echo [4/9] Downloading latest source from GitHub ^(%REPO_OWNER%/%REPO_NAME%@%REPO_BRANCH%^)...
+echo [5/10] Downloading latest source from GitHub ^(%REPO_OWNER%/%REPO_NAME%@%REPO_BRANCH%^)...
 set "APP_ZIP=%WORK_DIR%\source.zip"
 if exist "%APP_ZIP%" del /f /q "%APP_ZIP%"
 call :download "https://github.com/%REPO_OWNER%/%REPO_NAME%/archive/refs/heads/%REPO_BRANCH%.zip" "%APP_ZIP%"
@@ -200,9 +221,9 @@ if errorlevel 8 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [5/9] Hard-to-build native dependency: dlib (via conda-forge, prebuilt)
+:: [6/10] Hard-to-build native dependency: dlib (via conda-forge, prebuilt)
 :: ----------------------------------------------------------------------------
-:: Prefer the GPU build when an NVIDIA GPU was detected in step 3. conda-forge
+:: Prefer the GPU build when an NVIDIA GPU was detected in step 4. conda-forge
 :: ships dlib-cpu/dlib-gpu as separate packages; unlike the plain "dlib"
 :: metapackage (which only requires cudnn to BUILD the CUDA variant, not to
 :: run it), we explicitly install "cudnn" alongside dlib-gpu here so
@@ -222,12 +243,12 @@ if errorlevel 8 (
 ::   "defaults" channel, which otherwise makes the solve far slower.
 :: - Installing dlib-gpu can pull in a newer numpy (e.g. 2.x) as a conda
 ::   dependency, silently corrupting the pip-installed numpy<2 (torch 2.2.2
-::   needs numpy<2 - see requirements.txt comment). Step 7 below re-asserts
+::   needs numpy<2 - see requirements.txt comment). Step 8 below re-asserts
 ::   the numpy<2 pin via pip --force-reinstall to fix this deterministically
 ::   regardless of which branch ran here.
 "%CONDA_DIR%\Scripts\conda.exe" remove -y -p "%ENV_DIR%" dlib dlib-cpu dlib-gpu --force >nul 2>nul
 if "%HAS_NVIDIA_GPU%"=="1" (
-    echo [5/9] Installing dlib-gpu + cudnn ^(conda-forge, CUDA-accelerated^)...
+    echo [6/10] Installing dlib-gpu + cudnn ^(conda-forge, CUDA-accelerated^)...
     "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-gpu cudnn
     if errorlevel 1 (
         echo       dlib-gpu install failed - falling back to CPU-only dlib.
@@ -235,24 +256,24 @@ if "%HAS_NVIDIA_GPU%"=="1" (
         if errorlevel 1 goto :fail
     )
 ) else (
-    echo [5/9] Installing dlib-cpu ^(conda-forge prebuilt binary - no compiler required^)...
+    echo [6/10] Installing dlib-cpu ^(conda-forge prebuilt binary - no compiler required^)...
     "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-cpu
     if errorlevel 1 goto :fail
 )
 
 :: ----------------------------------------------------------------------------
-:: [6/9] PyTorch
+:: [7/10] PyTorch
 :: ----------------------------------------------------------------------------
-echo [6/9] Installing PyTorch...
+echo [7/10] Installing PyTorch...
 "%ENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
 "%ENV_PY%" -m pip install torch torchvision !TORCH_INDEX!
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
-:: [7/9] Remaining Python dependencies (dlib already handled by conda above)
+:: [8/10] Remaining Python dependencies (dlib already handled by conda above)
 :: ----------------------------------------------------------------------------
-echo [7/9] Installing remaining dependencies from requirements.txt...
+echo [8/10] Installing remaining dependencies from requirements.txt...
 set "REQ_FILTERED=%WORK_DIR%\requirements.filtered.txt"
 findstr /V /R "^dlib" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
 "%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
@@ -263,21 +284,19 @@ echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency c
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
-:: [8/9] face_recognition_models (PyPI releases of this are unreliable / can
+:: [9/10] face_recognition_models (PyPI releases of this are unreliable / can
 :: silently fail to register; installing straight from the source repo is
 :: the fix the upstream face_recognition project itself recommends). Without
 :: this, the dlib face-recognition provider fails at runtime with
 :: "Please install `face_recognition_models`..." even though face-recognition
 :: itself installed fine above.
 ::
-:: face_recognition_models' __init__.py still imports the old `pkg_resources`
-:: API (from setuptools). Recent setuptools versions (81+) dropped
-:: pkg_resources, which makes that import raise ModuleNotFoundError - caught
-:: by face_recognition's own broad except clause and re-reported as the same
-:: misleading "please install face_recognition_models" message even though
-:: the package IS installed. Pin setuptools<81 to keep pkg_resources available.
+:: setuptools<81 was already pinned early in step 3 (so pkg_resources stays
+:: available for face_recognition_models' __init__.py); re-assert it here
+:: too since torch/requirements.txt installs above could have pulled in a
+:: newer setuptools as a transitive dependency.
 :: ----------------------------------------------------------------------------
-echo [8/9] Pinning setuptools ^(pkg_resources compatibility for face_recognition_models^)...
+echo [9/10] Re-asserting setuptools^<81 pin ^(pkg_resources compatibility^)...
 "%ENV_PY%" -m pip install "setuptools<81"
 if errorlevel 1 goto :fail
 
@@ -293,9 +312,9 @@ if errorlevel 1 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [9/9] Convenience launcher
+:: [10/10] Convenience launcher
 :: ----------------------------------------------------------------------------
-echo [9/9] Writing launcher...
+echo [10/10] Writing launcher...
 (
     echo @echo off
     echo "%ENV_PY%" "%APP_DIR%\1_prep_review.py" %%*
