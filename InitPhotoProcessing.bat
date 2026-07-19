@@ -315,8 +315,15 @@ if errorlevel 1 (
 :: [10/10] Convenience launcher
 :: ----------------------------------------------------------------------------
 echo [10/10] Writing launcher...
+:: Prepend the env's native-library folders (Library\bin has cudnn/cuda DLLs,
+:: e.g. cudnn_ops64_9.dll for GPU dlib; Scripts/DLLs are the usual conda-env
+:: PATH entries) to PATH before invoking python.exe directly - without this,
+:: Windows' DLL search can fail to locate cuDNN even though it IS installed
+:: in the env, causing "Could not locate cudnn_ops64_9.dll" / "Invalid
+:: handle. Cannot load symbol cudnnCreateTensorDescriptor" at runtime.
 (
     echo @echo off
+    echo set "PATH=%ENV_DIR%\Library\bin;%ENV_DIR%\Scripts;%ENV_DIR%;%%PATH%%"
     echo "%ENV_PY%" "%APP_DIR%\1_prep_review.py" %%*
 ) > "%INSTALL_ROOT%\RunPhotoProcessing.bat"
 

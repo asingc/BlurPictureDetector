@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Import — Photo Culling{% endblock %}
+{% block content %}
+<h2>Import Photos</h2>
+<div class="panel">
+  <h3>Source Folder</h3>
+  <p class="muted">Choose the folder containing the photos to process.</p>
+  <div class="row">
+    <input type="text" id="importPathInput" placeholder="C:\path\to\photos" style="min-width:420px" />
+    <button id="browseFolderBtn" class="btn">Browse…</button>
+  </div>
+  <p id="lastImportHint" class="muted"></p>
+</div>
+<div class="row actions">
+  <span id="importStatus" class="muted"></span>
+  <button id="startProcessingBtn" class="btn btn-primary">Start Processing</button>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/import.js"></script>
+{% endblock %}

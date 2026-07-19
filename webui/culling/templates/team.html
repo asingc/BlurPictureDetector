@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Team Setup — Photo Culling{% endblock %}
+{% block content %}
+<h2>Team Setup</h2>
+
+<div class="panel">
+  <h3>Jersey Colors</h3>
+  <p class="muted">Colors your team wears. Mark a color as "Special/Goalie" to always include it (e.g. a goalie's different kit).</p>
+  <div id="jerseyList" class="tag-list"></div>
+  <div class="row">
+    <input type="text" id="jerseyColorInput" placeholder="e.g. Blue" />
+    <label class="inline-check"><input type="checkbox" id="jerseyForcedInput" /> Special/Goalie</label>
+    <button id="addJerseyBtn" class="btn">Add</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Players</h3>
+  <table id="playerTable" class="data-table">
+    <thead><tr><th>Name</th><th>Number</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted">Paste one player per line, as <code>Name, Number</code> (number is optional). Blank lines are ignored.</p>
+  <textarea id="playerBulkInput" class="bulk-textarea" rows="4" placeholder="Jane Smith, 7
+Alex Lee, 14
+Sam Rivera"></textarea>
+  <div class="row">
+    <button id="addPlayerBtn" class="btn">Add player(s)</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>OpenAI API Key</h3>
+  <p class="muted">Optional. Used only for UI-related AI assist features. Stored locally in <code>team.json</code>.</p>
+  <div class="row">
+    <input type="password" id="openaiKeyInput" placeholder="sk-…" style="min-width:320px" />
+    <button id="toggleKeyVisibilityBtn" class="btn">Show</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Blur Sensitivity</h3>
+  <div id="sensitivityPresets" class="sensitivity-options">
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="low" />
+      <span class="option-text">
+        <span class="option-title">Low <span class="muted">(0.35)</span></span>
+        <span class="option-desc muted">Allows through all but the most severely blurred images.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="medium" />
+      <span class="option-text">
+        <span class="option-title">Medium <span class="muted">(0.50)</span></span>
+        <span class="option-desc muted">Allows through mildly soft images; noticeably blurry ones are filtered out.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="high" />
+      <span class="option-text">
+        <span class="option-title">High <span class="muted">(0.70)</span></span>
+        <span class="option-desc muted">Keeps only sharply focused faces.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="custom" />
+      <span class="option-text">
+        <span class="option-title">Custom</span>
+        <span class="option-desc muted">Set your own threshold below.</span>
+      </span>
+    </label>
+  </div>
+  <div class="row">
+    <input type="range" id="sensitivityCustomSlider" min="0" max="0.99" step="0.01" value="0.50" />
+    <span id="sensitivityCustomValue" class="muted">0.50</span>
+  </div>
+</div>
+
+<div class="row actions">
+  <span id="teamSaveStatus" class="muted"></span>
+  <button id="saveTeamBtn" class="btn btn-primary">Save &amp; Continue</button>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/team.js"></script>
+{% endblock %}

@@ -30,3 +30,17 @@ TestImages/
 *.log
 Test/
 test[0-9]*/
+
+# Photo Culling web UI — local, per-machine data (never committed)
+/team.json
+/.culling_state.json
+
+# InitPhotoProcessing.bat run directly from the repo root (install_root
+# defaults to CWD) - local conda env / downloaded app copy / scratch files,
+# never committed. Same-named folders under test*/ are already covered by
+# the test[0-9]*/ pattern above.
+/app/
+/envs/
+/_setup_tmp/
+/RunPhotoProcessing.bat
+

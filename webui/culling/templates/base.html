@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Photo Culling{% endblock %}</title>
+  <link rel="stylesheet" href="https://code.jquery.com/ui/1.13.2/themes/base/jquery-ui.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark">&#9679;</span>
+      <h1 id="title">Photo Culling</h1>
+    </div>
+    <nav id="steps" class="stepper">
+      {% set step_labels = [("team", "Team"), ("import", "Import"), ("review", "Review"), ("cluster", "Faces"), ("apply", "Apply")] %}
+      {% for key, label in step_labels %}
+      <a class="step {{ 'active' if active_step == key else '' }}" href="/{{ key }}">
+        <span class="step-index">{{ loop.index }}</span>
+        <span class="step-label">{{ label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+  </header>
+
+  <main id="content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://code.jquery.com/ui/1.13.2/jquery-ui.min.js"></script>
+  <script src="/static/js/common.js"></script>
+  {% block extra_scripts %}{% endblock %}
+</body>
+</html>
