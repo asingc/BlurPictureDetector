@@ -6,7 +6,6 @@ const Team = {
   jerseyColors: [],
   players: [],
   openaiApiKey: "",
-  sensitivity: { mode: "medium", customValue: 0.50 },
 };
 
 function renderJerseyList() {
@@ -37,31 +36,15 @@ function renderPlayerTable() {
   });
 }
 
-function applySensitivityToUI() {
-  const mode = Team.sensitivity.mode || "medium";
-  $(`input[name="sensMode"][value="${mode}"]`).prop("checked", true);
-  const custom = Team.sensitivity.customValue ?? 0.50;
-  $("#sensitivityCustomSlider").val(custom);
-  $("#sensitivityCustomValue").text(Number(custom).toFixed(2));
-}
-
-function readSensitivityFromUI() {
-  const mode = $('input[name="sensMode"]:checked').val() || "medium";
-  const customValue = parseFloat($("#sensitivityCustomSlider").val()) || 0;
-  return { mode, customValue };
-}
-
 async function loadTeam() {
   const data = await apiGet("/api/team");
   Object.assign(Team, data);
   renderJerseyList();
   renderPlayerTable();
   $("#openaiKeyInput").val(Team.openaiApiKey || "");
-  applySensitivityToUI();
 }
 
 async function saveTeam() {
-  Team.sensitivity = readSensitivityFromUI();
   Team.openaiApiKey = $("#openaiKeyInput").val();
   $("#saveTeamBtn").prop("disabled", true);
   $("#teamSaveStatus").text("Saving…");
@@ -98,14 +81,6 @@ $(function () {
     });
     $("#playerBulkInput").val("");
     renderPlayerTable();
-  });
-
-  $('input[name="sensMode"]').on("change", function () {
-    // no-op: slider stays interactive regardless of selected mode
-  });
-  $("#sensitivityCustomSlider").on("input", function () {
-    $("#sensitivityCustomValue").text(Number($(this).val()).toFixed(2));
-    $('input[name="sensMode"][value="custom"]').prop("checked", true);
   });
 
   $("#toggleKeyVisibilityBtn").on("click", function () {

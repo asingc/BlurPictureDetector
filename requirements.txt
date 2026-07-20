@@ -9,6 +9,10 @@
 
 rawpy>=0.18.0
 opencv-python>=4.10.0
+# EXIF capture-time reading for the Review page's burst grouping (culling_app.py).
+# Already an indirect dependency of torchvision/facenet-pytorch, listed here
+# explicitly since we now import it directly.
+Pillow>=10.0.0
 # Pinned <2: torch 2.2.2's compiled extensions (and facenet-pytorch) use the
 # NumPy 1.x ABI; NumPy 2.x breaks torch's Tensor.numpy() bridge with
 # "RuntimeError: Numpy is not available". mediapipe's declared opencv-contrib

@@ -2,7 +2,26 @@
 {% block title %}Face Clustering — Photo Culling{% endblock %}
 {% block content %}
 <h2>Face Clustering</h2>
-<p class="muted">Coming soon — group and label face clusters.</p>
+<div id="clusterEmpty" class="panel" style="display:none">
+  <p class="muted">
+    No processed album selected yet. Run <a href="/import">Import &amp; Processing</a>,
+    or pick a previously processed album from the <a href="/team">Team</a> page.
+  </p>
+</div>
+<div id="clusterReady" style="display:none">
+  <div class="panel cluster-toolbar">
+    <div>
+      <h3 id="clusterAlbumName"></h3>
+      <p class="muted" id="clusterAlbumSrc" style="margin:0"></p>
+    </div>
+    <div class="row" style="margin-top:0">
+      <span id="clusterDirtyBadge" class="badge" style="display:none">Unsaved changes</span>
+      <button id="clusterSaveBtn" class="btn btn-primary" disabled>Save</button>
+    </div>
+  </div>
+  <div id="clusterBands"></div>
+</div>
+<p id="clusterStatus" class="muted"></p>
 {% endblock %}
 {% block extra_scripts %}
 <script src="/static/js/cluster.js"></script>

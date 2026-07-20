@@ -1,20 +1,72 @@
 {% extends "base.html" %}
-{% block title %}Import — Photo Culling{% endblock %}
+{% block title %}Select Album — Photo Culling{% endblock %}
 {% block content %}
-<h2>Import Photos</h2>
-<div class="panel">
-  <h3>Source Folder</h3>
-  <p class="muted">Choose the folder containing the photos to process.</p>
+<h2>Select Album</h2>
+
+<div class="panel" id="createAlbumPanel">
+  <h3>Create New Album</h3>
+  <p class="muted">Choose the folder containing the photos to process, or drag &amp; drop a folder anywhere in this box.</p>
   <div class="row">
     <input type="text" id="importPathInput" placeholder="C:\path\to\photos" style="min-width:420px" />
     <button id="browseFolderBtn" class="btn">Browse…</button>
   </div>
   <p id="lastImportHint" class="muted"></p>
+  <p id="dropHint" class="muted"></p>
+
+  <h3 style="margin-top:24px">Blur Sensitivity</h3>
+  <div id="sensitivityPresets" class="sensitivity-options">
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="low" />
+      <span class="option-text">
+        <span class="option-title">Low <span class="muted">(0.35)</span></span>
+        <span class="option-desc muted">Allows through all but the most severely blurred images.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="medium" />
+      <span class="option-text">
+        <span class="option-title">Medium <span class="muted">(0.50)</span></span>
+        <span class="option-desc muted">Allows through mildly soft images; noticeably blurry ones are filtered out.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="high" />
+      <span class="option-text">
+        <span class="option-title">High <span class="muted">(0.70)</span></span>
+        <span class="option-desc muted">Keeps only sharply focused faces.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="sensMode" value="custom" />
+      <span class="option-text">
+        <span class="option-title">Custom</span>
+        <span class="option-desc muted">Set your own threshold below.</span>
+      </span>
+    </label>
+  </div>
+  <div class="row">
+    <input type="range" id="sensitivityCustomSlider" min="0" max="0.99" step="0.01" value="0.50" />
+    <span id="sensitivityCustomValue" class="muted">0.50</span>
+  </div>
+
+  <h3 style="margin-top:24px">Face Recognition</h3>
+  <label class="inline-check"><input type="checkbox" id="recognizeFacesInput" checked /> Recognize Faces</label>
+  <p class="muted">Groups detected faces into clusters so they can be tagged with player names on the Face Clustering page.</p>
+
+  <div id="processingSection" style="display:none">
+    <h3 style="margin-top:24px">Processing Output</h3>
+    <textarea id="processingOutput" class="output-box" rows="18" readonly></textarea>
+  </div>
+
+  <div class="row actions">
+    <span id="importStatus" class="muted"></span>
+    <button id="startProcessingBtn" class="btn btn-primary">Start Processing</button>
+  </div>
 </div>
-<div class="row actions">
-  <span id="importStatus" class="muted"></span>
-  <button id="startProcessingBtn" class="btn btn-primary">Start Processing</button>
-</div>
+
+<h2 style="margin-top:36px">Previously Processed Albums</h2>
+<div id="albumGallery" class="polaroid-grid"></div>
+<p id="noAlbums" class="muted" style="display:none">No processed albums found yet under <code>output/</code>.</p>
 {% endblock %}
 {% block extra_scripts %}
 <script src="/static/js/import.js"></script>

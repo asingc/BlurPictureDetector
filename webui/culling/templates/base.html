@@ -8,14 +8,14 @@
   <link rel="stylesheet" href="/static/style.css" />
   {% block extra_head %}{% endblock %}
 </head>
-<body>
+<body class="page-{{ active_step }}">
   <header id="topbar">
     <div class="brand">
       <span class="brand-mark">&#9679;</span>
       <h1 id="title">Photo Culling</h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("team", "Team"), ("import", "Import"), ("review", "Review"), ("cluster", "Faces"), ("apply", "Apply")] %}
+      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Review"), ("cluster", "Faces"), ("apply", "Apply")] %}
       {% for key, label in step_labels %}
       <a class="step {{ 'active' if active_step == key else '' }}" href="/{{ key }}">
         <span class="step-index">{{ loop.index }}</span>

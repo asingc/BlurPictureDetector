@@ -1552,6 +1552,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-tag-ui",
+        action="store_true",
+        help=(
+            "Do not launch the interactive face-tagging web UI (face_tag_ui.py) "
+            "after face recognition completes, and don't wait for it. Useful for "
+            "headless/automated invocations (e.g. from another web UI) where no "
+            "one will open the browser tab."
+        ),
+    )
+    parser.add_argument(
         "--face-db",
         default=None,
         metavar="DIR",
@@ -1787,7 +1797,8 @@ def main() -> None:
                 cpu_only=args.cpu_only,
                 engine=args.engine,
             ).process(frames, app_config)
-            _launch_face_tag_ui(output_dir)
+            if not args.no_tag_ui:
+                _launch_face_tag_ui(output_dir)
 
     if frames:
         log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)

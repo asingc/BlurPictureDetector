@@ -1,8 +1,55 @@
 {% extends "base.html" %}
 {% block title %}Review — Photo Culling{% endblock %}
 {% block content %}
-<h2>Review Images</h2>
-<p class="muted">Coming soon — sort images between blur / sharp / skipped.</p>
+<div id="reviewEmpty" class="panel" style="display:none">
+  <p class="muted">
+    No processed album selected yet. Pick one from
+    <a href="/import">Select Album</a>.
+  </p>
+</div>
+
+<div id="reviewApp" style="display:none">
+  <div class="review-toolbar">
+    <div class="review-tabs" id="reviewTabs">
+      <button type="button" class="review-tab active" data-category="blur">Blur <span class="tab-count" id="countBlur">0</span></button>
+      <button type="button" class="review-tab" data-category="sharp">Sharp <span class="tab-count" id="countSharp">0</span></button>
+      <button type="button" class="review-tab" data-category="skipped">Skipped <span class="tab-count" id="countSkipped">0</span></button>
+    </div>
+    <div class="review-controls">
+      <label class="inline-check">Sort
+        <select id="reviewSort">
+          <option value="size">Largest group first</option>
+          <option value="old">Oldest first</option>
+          <option value="new">Newest first</option>
+        </select>
+      </label>
+      <label class="inline-check">Show
+        <select id="reviewPreviewCount">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </label>
+      <button type="button" id="reviewApplyBtn" class="btn btn-primary">Apply Changes</button>
+    </div>
+  </div>
+  <p id="reviewStatus" class="muted" style="display:none"></p>
+
+  <div class="review-body">
+    <nav id="reviewNav" class="review-nav"></nav>
+    <div class="review-main">
+      <div id="reviewPreview" class="review-preview"></div>
+      <div id="reviewStrip" class="review-strip"></div>
+    </div>
+  </div>
+
+  <p class="muted review-hotkeys">
+    <strong>w</strong>/<strong>s</strong> previous/next group &middot;
+    <strong>a</strong>/<strong>d</strong> previous/next image &middot;
+    <strong>space</strong> toggle keep/drop
+  </p>
+</div>
 {% endblock %}
 {% block extra_scripts %}
 <script src="/static/js/review.js"></script>

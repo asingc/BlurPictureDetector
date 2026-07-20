@@ -210,6 +210,104 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 .tag-remove:hover { color: var(--danger); }
 
 /* ------------------------------------------------------------------ *
+ * Drag & drop zone (Create New Album box)
+ * ------------------------------------------------------------------ */
+#createAlbumPanel.drag-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: 8px;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+#dropHint:not(:empty) {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------ *
+ * Polaroid album gallery (Select Album page)
+ * ------------------------------------------------------------------ */
+.polaroid-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-top: 16px;
+}
+.polaroid {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  box-shadow: var(--shadow-md);
+  padding: 10px 10px 6px;
+  width: 180px;
+  cursor: pointer;
+  position: relative;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.polaroid:nth-child(3n+1) { transform: rotate(-2deg); }
+.polaroid:nth-child(3n+2) { transform: rotate(1.5deg); }
+.polaroid:nth-child(3n) { transform: rotate(-1deg); }
+.polaroid:hover {
+  transform: rotate(0deg) translateY(-4px) scale(1.04);
+  box-shadow: 0 12px 26px rgba(20, 20, 30, 0.16);
+  z-index: 2;
+}
+.polaroid-photo {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+.polaroid-photo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.polaroid-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: 12px;
+}
+.polaroid-caption {
+  padding: 12px 4px 12px;
+  text-align: center;
+}
+.polaroid-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.polaroid-date {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.polaroid-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(20, 20, 30, 0.55);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+.polaroid:hover .polaroid-delete { opacity: 1; }
+.polaroid-delete:hover { background: var(--danger); }
+
+/* ------------------------------------------------------------------ *
  * Player table
  * ------------------------------------------------------------------ */
 .data-table { width: 100%; border-collapse: collapse; }
@@ -260,4 +358,323 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 .option-text { display: flex; flex-direction: column; gap: 1px; }
 .option-title { font-size: 13.5px; font-weight: 500; }
 .option-desc { font-size: 12.5px; }
+
+/* ------------------------------------------------------------------ *
+ * Processing output box (readonly, auto-scrolling)
+ * ------------------------------------------------------------------ */
+.output-box {
+  width: 100%;
+  background: #1e1f24;
+  color: #d8dae0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 12px 14px;
+  font-family: "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+.output-box:focus { outline: none; }
+
+/* ------------------------------------------------------------------ *
+ * Face clustering — native cluster/thumbnail review UI
+ * ------------------------------------------------------------------ */
+.page-cluster #content { max-width: 1100px; }
+
+.cluster-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.cluster-toolbar h3 { margin-bottom: 2px; }
+
+.badge {
+  background: #fdf3d9;
+  color: #92710f;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.band {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+.band.selected { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.band-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  user-select: none;
+}
+.band-title { font-weight: 600; }
+.band-title .kind {
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 8px;
+  font-size: 12px;
+}
+.band-title .kind.pending { color: #b8790f; }
+.band-count { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+.band-tools {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px 12px;
+  flex-wrap: wrap;
+}
+.band.selected .band-tools { display: flex; }
+.band-tools label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--muted); }
+.band-tools input[type="text"] { min-width: 220px; }
+
+.thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 16px 16px;
+}
+
+.thumb {
+  position: relative;
+  width: 110px;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 6px;
+}
+.thumb.checked { border-color: var(--accent); }
+.thumb img {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 4px;
+  display: block;
+  background: #000;
+  cursor: zoom-in;
+}
+.thumb .thumb-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 16px;
+  height: 16px;
+  z-index: 3;
+  cursor: pointer;
+}
+.thumb .assigned-badge {
+  margin-top: 5px;
+  font-size: 11px;
+  color: #1f8a4c;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* pending-deletion mask */
+.thumb.pending-delete .mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(30, 20, 20, 0.6);
+  border-radius: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffb3ad;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+.thumb .mask { display: none; }
+
+/* jQuery UI autocomplete on the light theme */
+.ui-autocomplete {
+  max-height: 260px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  z-index: 100;
+}
+
+/* ------------------------------------------------------------------ *
+ * Review — native culling UI (blur / sharp / skipped tabs)
+ * Full-height app-style layout instead of the usual scrolling column.
+ * ------------------------------------------------------------------ */
+body.page-review {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+body.page-review #topbar { flex: 0 0 auto; position: static; }
+body.page-review #content {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-width: none;
+  margin: 0;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+}
+#reviewApp {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+.review-tabs { display: flex; gap: 6px; }
+.review-tab {
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.review-tab .tab-count { color: var(--muted); margin-left: 4px; font-size: 12px; }
+.review-tab.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.review-tab.active .tab-count { color: rgba(255, 255, 255, 0.85); }
+.review-controls { display: flex; align-items: center; gap: 14px; }
+.review-controls select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.review-hotkeys { flex: 0 0 auto; margin: 8px 0 0; font-size: 12px; }
+
+.review-body {
+  display: flex;
+  gap: 16px;
+  margin-top: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Nav pane — burst groups as rows of small keep/drop dots (~1/8 width). */
+.review-nav {
+  flex: 0 0 12.5%;
+  min-width: 90px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-nav-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 3px;
+  padding: 5px;
+  border-radius: 6px;
+  cursor: pointer;
+  min-height: 14px;
+}
+.review-nav-row:hover { background: var(--surface-2); }
+.review-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
+.review-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 1px;
+  flex: 0 0 auto;
+}
+.review-dot.keep { background: #3a6fd8; }
+.review-dot.drop { background: var(--danger); }
+
+/* Main pane — multi-image preview + in-group thumbnail strip (~7/8 width). */
+.review-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.review-preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  transition: background-color 0.2s ease;
+  padding: 10px;
+}
+.review-preview.keep-bg { background: var(--accent-soft); }
+.review-preview.drop-bg { background: var(--danger-soft); }
+.review-preview-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.review-preview-cell img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 4px;
+  cursor: zoom-in;
+}
+.review-preview-cell img.zoomed { object-fit: none; cursor: zoom-out; }
+
+.review-strip {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+.review-strip-thumb {
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  padding: 2px;
+  cursor: pointer;
+  background: var(--surface-2);
+}
+.review-strip-thumb.keep { box-shadow: inset 0 0 0 1px #3a6fd8; }
+.review-strip-thumb.drop { box-shadow: inset 0 0 0 1px var(--danger); }
+.review-strip-thumb.active { border-color: var(--accent); }
+.review-strip-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 4px;
+  display: block;
+}
 
