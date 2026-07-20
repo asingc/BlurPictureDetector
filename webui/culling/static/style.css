@@ -631,8 +631,8 @@ body.page-review #content {
   transition: background-color 0.2s ease;
   padding: 10px;
 }
-.review-preview.keep-bg { background: var(--accent-soft); }
-.review-preview.drop-bg { background: var(--danger-soft); }
+.review-preview.keep-bg { background: #b9c6f5; }
+.review-preview.drop-bg { background: #f2b3ac; }
 .review-preview-cell {
   flex: 1 1 0;
   min-width: 0;

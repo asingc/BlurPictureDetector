@@ -194,7 +194,10 @@ function toggleActiveKeep() {
 
 // ------------------------------------------------------------------ //
 // Hotkeys — w/s move between groups, a/d move within a group, space toggles.
+// Arrow keys are aliases: Up=w, Down=s, Left=a, Right=d.
 // ------------------------------------------------------------------ //
+const ARROW_KEY_ALIASES = { ArrowUp: "w", ArrowDown: "s", ArrowLeft: "a", ArrowRight: "d" };
+
 $(document).on("keydown", (e) => {
   const activeTag = (document.activeElement && document.activeElement.tagName || "").toLowerCase();
   if (activeTag === "select" || activeTag === "input" || activeTag === "textarea") return;
@@ -204,7 +207,9 @@ $(document).on("keydown", (e) => {
   if (!data) return;
   const group = data.groups[data.activeGroup];
 
-  switch (e.key) {
+  const key = ARROW_KEY_ALIASES[e.key] || e.key;
+  if (ARROW_KEY_ALIASES[e.key]) e.preventDefault();
+  switch (key) {
     case "w":
       if (data.activeGroup > 0) {
         data.activeGroup--;
@@ -236,6 +241,9 @@ $(document).on("keydown", (e) => {
     case " ":
       e.preventDefault();
       toggleActiveKeep();
+      break;
+    case "Escape":
+      $("#reviewPreview .review-preview-cell img").removeClass("zoomed").css("object-position", "");
       break;
     default:
       return;
