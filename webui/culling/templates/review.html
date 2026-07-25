@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Review — Photo Culling{% endblock %}
+{% block title %}Culling — Photo Culling{% endblock %}
 {% block content %}
 <div id="reviewEmpty" class="panel" style="display:none">
   <p class="muted">
@@ -11,8 +11,8 @@
 <div id="reviewApp" style="display:none">
   <div class="review-toolbar">
     <div class="review-tabs" id="reviewTabs">
-      <button type="button" class="review-tab active" data-category="blur">Blur <span class="tab-count" id="countBlur">0</span></button>
-      <button type="button" class="review-tab" data-category="sharp">Sharp <span class="tab-count" id="countSharp">0</span></button>
+      <button type="button" class="review-tab active" data-category="sharp">Sharp <span class="tab-count" id="countSharp">0</span></button>
+      <button type="button" class="review-tab" data-category="blur">Blur <span class="tab-count" id="countBlur">0</span></button>
       <button type="button" class="review-tab" data-category="skipped">Skipped <span class="tab-count" id="countSkipped">0</span></button>
     </div>
     <div class="review-controls">
@@ -40,6 +40,7 @@
     <nav id="reviewNav" class="review-nav"></nav>
     <div class="review-main">
       <div id="reviewPreview" class="review-preview"></div>
+      <div id="reviewRankInfo" class="review-rank-info" style="display:none"></div>
       <div id="reviewStrip" class="review-strip"></div>
     </div>
   </div>
@@ -48,10 +49,12 @@
     <strong>w</strong>/<strong>s</strong> previous/next group &middot;
     <strong>a</strong>/<strong>d</strong> previous/next image &middot;
     <strong>space</strong> toggle keep/drop &middot;
+    <strong>scroll</strong> zoom preview &middot;
+    <strong>1</strong> zoom to 100% &middot;
     <strong>esc</strong> reset zoom
   </p>
 </div>
 {% endblock %}
 {% block extra_scripts %}
-<script src="/static/js/review.js"></script>
+<script src="{{ static_url('js/review.js') }}"></script>
 {% endblock %}

@@ -72,8 +72,8 @@ class AutoAdjustStage(ProcessStage):
     """Compute a simple auto exposure (brightness) correction per frame.
 
     The prescription is stored on ``frame.auto_adjustment`` so downstream
-    stages (preview annotation) and 2_apply_changes.py (final output) can
-    apply the exact same correction without recomputing it.
+    stages (preview annotation, final export) can apply the exact same
+    correction without recomputing it.
     """
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:

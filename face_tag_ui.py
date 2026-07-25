@@ -14,7 +14,7 @@ Save then, in one batch:
     ``face.json`` entry),
   * rewrites every affected ``face.json``,
   * deletes emptied numeric ("pending") clusters,
-  * writes the assigned player name / number back into ``results.json`` for
+  * writes the assigned player name / number back into ``album.json`` for
     the matching body (matched by ``body_bbox``).
 
 The ``--face-db`` folder is used **read-only**, purely as the source of the
@@ -23,7 +23,7 @@ name-autocomplete dictionary; it is never modified.
 Usage::
 
     python face_tag_ui.py [--album PATH] [--face-db PATH]
-                          [--output-dir ./output] [--host 127.0.0.1]
+                          [--output-dir ./albums] [--host 127.0.0.1]
                           [--port 8000]
 """
 
@@ -59,7 +59,7 @@ FACE_ANNOTATED_SUBDIR = "Face.annotated"
 
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 
-# Matching tolerance for body_bbox floats when writing back to results.json.
+# Matching tolerance for body_bbox floats when writing back to album.json.
 BBOX_EPS = 1e-6
 
 
@@ -72,7 +72,7 @@ class AppState:
         output_dir: Path,
         album: Path | None,
         face_db_dir: Path | None,
-        heartbeat_timeout: float = 30.0,
+        heartbeat_timeout: float = 180.0,
     ) -> None:
         self.output_dir = output_dir
         self.album = album
@@ -371,13 +371,13 @@ def _boxes_match(a: dict | None, b: dict | None) -> bool:
 
 
 def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
-    """Write player_name / player_number onto matching results.json bodies.
+    """Write player_name / player_number onto matching album.json bodies.
 
     ``assignments`` is a list of {origFilename, body_bbox, name, playernum}.
     """
     if not assignments:
         return
-    results_fp = album_path / "results.json"
+    results_fp = album_path / "album.json"
     if not results_fp.is_file():
         return
     with open(results_fp, encoding="utf-8") as fh:
@@ -572,11 +572,11 @@ def main() -> None:
                         help="Restrict to a single album directory (path).")
     parser.add_argument("--face-db", type=str, default=None,
                         help="Face-DB folder used read-only for name autocomplete.")
-    parser.add_argument("--output-dir", type=str, default="./output",
-                        help="Directory containing album folders (default: ./output).")
+    parser.add_argument("--output-dir", type=str, default="./albums",
+                        help="Directory containing album folders (default: ./albums).")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--heartbeat-timeout", type=float, default=30.0,
+    parser.add_argument("--heartbeat-timeout", type=float, default=180.0,
                         help="Seconds without a browser heartbeat before the "
                              "server exits automatically. Use 0 to disable.")
     args = parser.parse_args()

@@ -183,6 +183,158 @@ def build_prototypes(embeddings: list[np.ndarray], similarity_threshold: float) 
     return prototypes
 
 
+def select_diverse_subset(
+    embeddings: list[np.ndarray],
+    max_count: int,
+    prototype_threshold: float = 0.62,
+) -> list[int]:
+    """Pick up to *max_count* indices into *embeddings* that maximise visual
+    coverage while minimising near-duplicate repeats of the same "look".
+
+    Intended for curating a face database: a burst of 100 near-identical
+    crops of one person should contribute only a handful of genuinely
+    different examples (angle/lighting/expression), not clog the database
+    with near-duplicates that don't meaningfully improve recognition.
+
+    Strategy:
+      1. Group embeddings into prototypes (visually-cohesive sub-clusters —
+         the same average-linkage cosine agglomerative clustering used by
+         :func:`build_prototypes`), each representing one distinct "look".
+      2. Pick each prototype's *medoid* (the member closest to its centroid)
+         first, largest prototypes first — this guarantees every distinct
+         look is represented at least once before any look gets a second
+         slot.
+      3. If budget remains, repeatedly add whichever remaining candidate has
+         the LOWEST maximum cosine similarity to everything already picked
+         (greedy farthest-point sampling) — this fills the rest of the
+         budget with the most additionally-informative examples rather than
+         more near-duplicates of an already-covered look.
+
+    Returns every index (order preserved) unchanged when
+    ``len(embeddings) <= max_count`` — nothing needs to be trimmed.
+    """
+    n = len(embeddings)
+    if max_count <= 0:
+        return []
+    if n <= max_count:
+        return list(range(n))
+
+    normed = [normalize_embedding(e.astype(np.float32)) for e in embeddings]
+    eps = max(1e-6, 1.0 - prototype_threshold)
+    matrix = np.array(normed, dtype=np.float32)
+    labels = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=eps,
+    ).fit_predict(matrix).tolist()
+
+    groups: dict[int, list[int]] = {}
+    for idx, label in enumerate(labels):
+        groups.setdefault(int(label), []).append(idx)
+
+    def medoid(indices: list[int]) -> int:
+        centroid = normalize_embedding(np.mean([normed[i] for i in indices], axis=0))
+        return max(indices, key=lambda i: float(np.dot(normed[i], centroid)))
+
+    # Round 1: one medoid per prototype (largest prototypes first, so a
+    # budget smaller than the number of prototypes still favours the most
+    # common looks).
+    ordered_groups = sorted(groups.values(), key=len, reverse=True)
+    selected: list[int] = []
+    remaining: set[int] = set(range(n))
+    for members in ordered_groups:
+        if len(selected) >= max_count:
+            break
+        pick = medoid(members)
+        selected.append(pick)
+        remaining.discard(pick)
+
+    # Round 2: greedy farthest-point fill from whatever's left.
+    while len(selected) < max_count and remaining:
+        best_idx, best_score = None, float("inf")
+        for i in remaining:
+            sim = max(float(np.dot(normed[i], normed[j])) for j in selected)
+            if sim < best_score:
+                best_score, best_idx = sim, i
+        selected.append(best_idx)
+        remaining.discard(best_idx)
+
+    return selected
+
+
+def select_useful_subset(
+    embeddings: list[np.ndarray],
+    redundancy_threshold: float = 0.93,
+    prototype_threshold: float = 0.62,
+) -> list[int]:
+    """Pick which indices into *embeddings* are worth keeping in a face
+    database, so the rest can be retired as redundant.
+
+    Unlike :func:`select_diverse_subset` (which trims down to a fixed target
+    *count*), this has no target size -- it keeps growing the kept set for
+    as long as a candidate exists that isn't a near-duplicate (cosine
+    similarity >= *redundancy_threshold*) of something already kept, i.e.
+    for as long as a candidate would still meaningfully expand this person's
+    visual coverage. Everything left over contributes nothing new and can be
+    safely retired without hurting recognition accuracy.
+
+    Every prototype (visually-cohesive sub-cluster, see :func:`build_prototypes`)
+    contributes its medoid unconditionally first, so no distinct "look" is
+    ever entirely lost regardless of the redundancy threshold.
+
+    Returns every index (order preserved) unchanged when there are 0 or 1
+    embeddings -- nothing to compare, nothing to retire.
+    """
+    n = len(embeddings)
+    if n <= 1:
+        return list(range(n))
+
+    normed = [normalize_embedding(e.astype(np.float32)) for e in embeddings]
+    eps = max(1e-6, 1.0 - prototype_threshold)
+    matrix = np.array(normed, dtype=np.float32)
+    labels = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=eps,
+    ).fit_predict(matrix).tolist()
+
+    groups: dict[int, list[int]] = {}
+    for idx, label in enumerate(labels):
+        groups.setdefault(int(label), []).append(idx)
+
+    def medoid(indices: list[int]) -> int:
+        centroid = normalize_embedding(np.mean([normed[i] for i in indices], axis=0))
+        return max(indices, key=lambda i: float(np.dot(normed[i], centroid)))
+
+    # Round 1: one medoid per prototype (largest prototypes first) -- always
+    # kept, so every distinct look survives no matter how redundant.
+    kept: list[int] = []
+    remaining: set[int] = set(range(n))
+    for members in sorted(groups.values(), key=len, reverse=True):
+        pick = medoid(members)
+        kept.append(pick)
+        remaining.discard(pick)
+
+    # Round 2: keep greedily adding whichever remaining candidate is LEAST
+    # similar to everything already kept, stopping as soon as the best
+    # remaining candidate is itself a near-duplicate (>= redundancy_threshold)
+    # of something already kept -- i.e. nothing left would add real coverage.
+    while remaining:
+        best_idx, best_score = None, 1.0
+        for i in remaining:
+            sim = max(float(np.dot(normed[i], normed[j])) for j in kept)
+            if sim < best_score:
+                best_score, best_idx = sim, i
+        if best_idx is None or best_score >= redundancy_threshold:
+            break
+        kept.append(best_idx)
+        remaining.discard(best_idx)
+
+    return kept
+
+
 @dataclass
 class FaceDbEntry:
     """One person loaded from the face database."""
@@ -313,7 +465,7 @@ class FaceRecoPipeline:
 
     def run(self, prep_output_dir: Path) -> Path:
         prep_output_dir = prep_output_dir.resolve()
-        results_path = prep_output_dir / "results.json"
+        results_path = prep_output_dir / "album.json"
         info_path = prep_output_dir / "info.json"
 
         log.info("FaceReco: starting  prep_dir=%s", prep_output_dir)

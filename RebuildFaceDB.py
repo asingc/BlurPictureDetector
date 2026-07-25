@@ -8,14 +8,26 @@ a face DB:
     1. Read face.json to get the provider name, person name, and player number.
     2. Run YOLOv8-face (two-pass, same strategy as 1_prep_review.py) on each
        crop in Face/ to detect the face bbox and refined landmarks, then call
-       the provider to extract an embedding.
+       the provider to extract an embedding. Crops whose cropFileName already
+       has an embedding in the previous face.json (same alignment setting)
+       reuse it as-is instead of re-running detection — only genuinely NEW
+       crops pay the embedding cost.
     3. Do the same for every crop in Negative/.
     4. Rewrite face.json with only what matters:
          { name, playernum, provider, cluster, faces: [...], negative_faces: [...] }
        Each entry contains just cropFileName + embedding (base64 float32).
        Stale Body objects and original file paths are dropped.
 
-  STEP 2 — CALIBRATE (runs automatically afterwards, pass --skip-calibration
+  STEP 2 — RETIRE REDUNDANT FACES.  After embedding every positive crop in a
+  cluster's Face/ directory, group them into visually-cohesive "look"
+  prototypes and keep each prototype's medoid unconditionally (so no
+  distinct look is ever lost), plus any other crop that isn't a
+  near-duplicate (cosine similarity >= --redundancy-threshold) of something
+  already kept. Crops that don't survive are MOVED (never deleted) to
+  Face/Retired/ and dropped from face.json, so they're automatically
+  excluded from future rebuilds too. Negative/ crops are left untouched.
+
+  STEP 3 — CALIBRATE (runs automatically afterwards, pass --skip-calibration
   to opt out).  Loads the just-rebuilt DB and runs leave-one-out cross-
   validation: every photo is temporarily held out, scored against its own
   person's remaining photos (genuine similarity) and against every other
@@ -26,7 +38,7 @@ a face DB:
   crop or a genuine look-alike pair before it causes a wrong match.
 
 Usage:
-    python RebuildFaceDB.py <facedb_dir> [--skip-calibration]
+    python RebuildFaceDB.py <facedb_dir> [--skip-calibration] [--redundancy-threshold 0.93]
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ import base64
 from datetime import datetime
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -43,7 +56,15 @@ import cv2
 import numpy as np
 
 from algo.face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model
-from algo.facereco import FaceDb, FaceDbEntry, FaceRecoConfig, normalize_embedding, build_prototypes
+from algo.facereco import (
+    FaceDb,
+    FaceDbEntry,
+    FaceRecoConfig,
+    normalize_embedding,
+    build_prototypes,
+    select_useful_subset,
+    _decode_embedding,
+)
 
 log = logging.getLogger("RebuildFaceDB")
 
@@ -113,10 +134,18 @@ def _embed_directory(
     face_model,
     label: str,
     align: bool,
+    existing_by_crop: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Compute embeddings for every image in *image_dir*.
 
-    Returns a list of { cropFileName, embedding } dicts.
+    *existing_by_crop* maps cropFileName -> the previous face.json entry for
+    that crop (see ``_rebuild_cluster``). When a crop's name is found there
+    with a usable embedding, that embedding is reused as-is instead of
+    re-running detection+embedding on it — a rebuild then only pays the
+    (relatively expensive) landmark+embedding cost for genuinely NEW crops,
+    not every crop that was already embedded in a previous run.
+
+    Returns a list of { cropFileName, dtype, shape, encoding, value } dicts.
     """
     if not image_dir.is_dir():
         log.debug("[%s] directory missing: %s", label, image_dir)
@@ -127,9 +156,16 @@ def _embed_directory(
     )
     log.info("[%s] %d image(s) in %s", label, len(images), image_dir.name)
 
+    existing_by_crop = existing_by_crop or {}
     records: list[dict] = []
-    ok = skipped = 0
+    ok = skipped = reused = 0
     for img_path in images:
+        cached = existing_by_crop.get(img_path.name)
+        if cached is not None and cached.get("value"):
+            records.append(cached)
+            reused += 1
+            continue
+
         image = cv2.imread(str(img_path))
         if image is None:
             log.warning("[%s] cannot read %s — skipped", label, img_path.name)
@@ -164,12 +200,12 @@ def _embed_directory(
         )
 
         emb_arr = np.asarray(emb, dtype=np.float32)
-        records.append(_serialize_embedding(emb_arr))
+        records.append({"cropFileName": img_path.name, **_serialize_embedding(emb_arr)})
         ok += 1
         log.debug("[%s] %s  dim=%d  norm=%.4f", label, img_path.name,
                   emb_arr.shape[0], float(np.linalg.norm(emb_arr)))
 
-    log.info("[%s] done: ok=%d  skipped=%d", label, ok, skipped)
+    log.info("[%s] done: new=%d  reused=%d  skipped=%d", label, ok, reused, skipped)
     return records
 
 
@@ -177,11 +213,60 @@ def _embed_directory(
 # Per-cluster rebuild
 # ---------------------------------------------------------------------------
 
+def _retire_redundant_faces(
+    face_dir: Path,
+    faces: list[dict],
+    redundancy_threshold: float,
+    prototype_threshold: float,
+) -> list[dict]:
+    """Move positive face crops that don't meaningfully expand this person's
+    visual coverage into Face/Retired/, and drop them from the embeddings
+    returned (so they're excluded from the rewritten face.json). Retired
+    crops are kept on disk -- never deleted -- and automatically excluded
+    from future rebuilds since Retired/ isn't scanned by _embed_directory().
+    """
+    if len(faces) <= 1:
+        return faces
+
+    decoded = [(f, _decode_embedding(f)) for f in faces]
+    usable = [(f, e) for f, e in decoded if e is not None]
+    if len(usable) <= 1:
+        return faces
+
+    kept_idx = set(select_useful_subset(
+        [e for _, e in usable],
+        redundancy_threshold=redundancy_threshold,
+        prototype_threshold=prototype_threshold,
+    ))
+
+    kept_faces: list[dict] = []
+    retired_names: list[str] = []
+    retired_dir = face_dir / "Retired"
+    for i, (f, _e) in enumerate(usable):
+        if i in kept_idx:
+            kept_faces.append(f)
+            continue
+        crop_name = f.get("cropFileName", "")
+        src = face_dir / crop_name
+        if src.is_file():
+            retired_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(retired_dir / crop_name))
+        retired_names.append(crop_name)
+
+    if retired_names:
+        log.info("  retired %d redundant face(s) -> %s: %s",
+                 len(retired_names), retired_dir, ", ".join(retired_names))
+
+    return kept_faces
+
+
 def _rebuild_cluster(
     cluster_dir: Path,
     face_model,
     annotated_root: Path,
     align: bool,
+    redundancy_threshold: float,
+    prototype_threshold: float,
 ) -> None:
     face_json_path = cluster_dir / "face.json"
     if not face_json_path.exists():
@@ -200,6 +285,19 @@ def _rebuild_cluster(
 
     provider = _build_provider(provider_name)
 
+    # Reuse embeddings from the previous face.json for crops that are still
+    # present (keyed by cropFileName) -- but only when the previous run used
+    # the same alignment setting, since alignment changes the embedding.
+    reuse_cache = bool(meta.get("aligned")) == bool(align)
+    existing_faces_by_crop = (
+        {f["cropFileName"]: f for f in meta.get("faces", []) if f.get("cropFileName")}
+        if reuse_cache else {}
+    )
+    existing_negatives_by_crop = (
+        {f["cropFileName"]: f for f in meta.get("negative_faces", []) if f.get("cropFileName")}
+        if reuse_cache else {}
+    )
+
     player_annotated_dir = annotated_root / player_dir_name
     faces = _embed_directory(
         cluster_dir / "Face",
@@ -208,6 +306,11 @@ def _rebuild_cluster(
         face_model,
         "positive",
         align=align,
+        existing_by_crop=existing_faces_by_crop,
+    )
+    faces_before = len(faces)
+    faces = _retire_redundant_faces(
+        cluster_dir / "Face", faces, redundancy_threshold, prototype_threshold,
     )
     negatives = _embed_directory(
         cluster_dir / "Negative",
@@ -216,6 +319,7 @@ def _rebuild_cluster(
         face_model,
         "negative",
         align=align,
+        existing_by_crop=existing_negatives_by_crop,
     )
 
     payload = {
@@ -231,8 +335,8 @@ def _rebuild_cluster(
         json.dump(payload, fh, indent=2)
 
     log.info(
-        "Wrote face.json for cluster %s: %d positive, %d negative",
-        cluster_dir.name, len(faces), len(negatives),
+        "Wrote face.json for cluster %s: %d positive (%d retired), %d negative",
+        cluster_dir.name, len(faces), faces_before - len(faces), len(negatives),
     )
 
 
@@ -506,6 +610,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--redundancy-threshold",
+        type=float,
+        default=0.93,
+        help=(
+            "Cosine similarity above which a positive face crop is considered a "
+            "near-duplicate of one already kept, and gets retired to Face/Retired/ "
+            "(default: 0.93). Every visual 'look' prototype always keeps at least "
+            "one crop regardless of this threshold."
+        ),
+    )
+    parser.add_argument(
         "--skip-calibration",
         action="store_true",
         help="Only rebuild embeddings; skip the leave-one-out calibration report that runs afterwards by default.",
@@ -544,7 +659,11 @@ def main() -> None:
     ok = errors = 0
     for cluster_dir in cluster_dirs:
         try:
-            _rebuild_cluster(cluster_dir, face_model, annotated_root, align=align_faces)
+            _rebuild_cluster(
+                cluster_dir, face_model, annotated_root, align=align_faces,
+                redundancy_threshold=args.redundancy_threshold,
+                prototype_threshold=args.prototype_threshold,
+            )
             ok += 1
         except Exception as exc:
             log.error(

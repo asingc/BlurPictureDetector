@@ -308,6 +308,14 @@ async function save() {
 // Heartbeat — tells the server this page is still open. The server exits
 // automatically if it stops receiving these (e.g. the tab/browser was
 // closed), so we don't leave orphaned local servers running.
+//
+// Sent from a dedicated Worker (heartbeat-worker.js) instead of a plain
+// setInterval on this page, because browsers throttle a backgrounded tab's
+// own timers (Chrome clamps to ~once/minute after ~5 min hidden) — longer
+// than the server's heartbeat timeout — which was causing the server to
+// shut itself down mid-run whenever the tab was left in the background.
+// Worker timers aren't throttled that way. Falls back to a plain
+// setInterval if Workers aren't available.
 // ------------------------------------------------------------------ //
 const HEARTBEAT_INTERVAL_MS = 10000;
 
@@ -315,6 +323,19 @@ function sendHeartbeat() {
   // Best-effort; a single dropped heartbeat is fine, the server tolerates
   // multiple missed intervals before exiting.
   fetch("/api/heartbeat", { method: "POST" }).catch(() => {});
+}
+
+function startHeartbeat() {
+  if (window.Worker) {
+    try {
+      new Worker("/static/heartbeat-worker.js");
+      return;
+    } catch (err) {
+      // fall through to main-thread heartbeat below
+    }
+  }
+  sendHeartbeat();
+  setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 }
 
 // ------------------------------------------------------------------ //
@@ -331,8 +352,7 @@ $(function () {
     if (isDirty()) { e.preventDefault(); e.returnValue = ""; }
   });
 
-  sendHeartbeat();
-  setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+  startHeartbeat();
 
   loadHome().catch((err) => alert("Failed to load: " + err.message));
 });

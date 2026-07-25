@@ -33,10 +33,10 @@ class FaceRecoStage(ProcessStage):
 
     Iterates through all frames and logs which bodies qualify (``passed=True``).
     The heavy lifting is delegated to :class:`FaceRecoPipeline`, which reads
-    ``results.json`` from *output_dir* and writes its output under
+    ``album.json`` from *output_dir* and writes its output under
     ``<output_dir>/.FaceReco/``.
 
-    *output_dir* must therefore contain a valid ``results.json`` before this
+    *output_dir* must therefore contain a valid ``album.json`` before this
     stage runs (written by an upstream output step).
 
     Parameters

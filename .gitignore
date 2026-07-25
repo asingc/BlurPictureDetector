@@ -8,7 +8,7 @@ __pycache__/
 *.pyo
 
 # Output artefacts
-output/
+albums/
 annotated/
 blurry.csv
 blur.lst

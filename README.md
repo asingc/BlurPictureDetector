@@ -16,7 +16,7 @@ Image → normalize size (long edge = 1800 px)
       → grade sharpness of each person's face crop
       → poll jersey colours → keep only your team (+ forced colours)
       → annotate preview image
-      → write results.json / info.json / blurry.csv / blur.lst
+      → write album.json / info.json / blurry.csv / blur.lst
       → (optional) cluster faces into .FaceReco/
 ```
 
@@ -76,7 +76,7 @@ python 1_prep_review.py <image_or_directory> [options]
 | `--engine mediapipe\|yolo` | `mediapipe` | Detection/pose/face-landmark engine. `mediapipe` is Apache-2.0 licensed (default); `yolo` is the legacy engine, kept for comparison/rollback (AGPL-3.0/GPL-3.0 — see Licensing below) |
 | `--jerseycolor "COLOR[;COLOR...]"` | `blue;white;+purple;+orange;+light blue;+pink` | Team colours; `+` = forced-include; empty string disables filtering |
 | `--noteam` | off | Disable jersey filtering (score every detected person) |
-| `--output <dir>` | `output/<timestamp>-<input>/` | Root output directory |
+| `--output <dir>` | `albums/<timestamp>-<input>/` | Root output directory |
 | `--skip-facereco` | off | Don't run face-recognition clustering |
 | `--face-db <dir>` | none | Match clusters against an existing face DB |
 | `--face-db-match-threshold <n>` | `0.72` | Cosine similarity required between a face and its closest-matching person prototype |
@@ -93,7 +93,7 @@ Scores every image and writes an output folder:
     anno_blur/        ← annotated previews of images scored as blurry
     anno_sharp/       ← annotated previews of images scored as sharp
     anno_skipped/     ← annotated previews where no person was detected
-    results.json      ← full per-body data (used by face recognition)
+    album.json      ← full per-body data (used by face recognition)
     info.json         ← classification results (used by step 2)
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
@@ -137,29 +137,7 @@ Open the `anno_*` folders in your photo viewer and **delete any preview images y
 
 Leave previews you agree with untouched.
 
-### Step 3 — Apply
-
-```
-python 2_apply_changes.py <ref_dir>
-```
-
-Compares what previews remain against `info.json` and moves original source files accordingly:
-
-| Preview in | Preview present | Preview deleted |
-|---|---|---|
-| `anno_blur/` | Move original → `<SrcDir>/Blur/` | Leave original in place |
-| `anno_sharp/` | Leave original in place | Move original → `<SrcDir>/Blur/` |
-| `anno_skipped/` | Move original → `<SrcDir>/Skipped/` | Leave original in place |
-
-No files are ever deleted. Writes an `apply.log` to `<ref_dir>` when done.
-
-### Step 4 — Sync to sibling folders (optional)
-
-```
-python 3_sync_results.py <target_dir>
-```
-
-Propagates `Blur/` and `Skipped/` decisions from one already-applied directory to all of its sibling directories. For each image whose filename stem matches a file already sorted into `<target_dir>/blur/` or `<target_dir>/skipped/`, the matching original in each sibling folder is moved into that sibling's own `blur/` or `skipped/` sub-folder. Useful when the same shoot was exported into multiple format folders (e.g. JPG and RAW). No files are ever deleted; a `sync_results.log` is written to `target_dir`.
+Then use the web app (`culling_app.py`) to review, tag faces, and export the kept photos — see below.
 
 ---
 
@@ -182,7 +160,7 @@ Face recognition runs automatically at the end of Step 1 (unless `--skip-facerec
 
 **What it does:**
 
-1. Loads per-body data from `results.json`.
+1. Loads per-body data from `album.json`.
 2. Extracts face embeddings from qualifying bodies (via the selected provider), skipping crops smaller than `--min-face-crop-px`.
 3. Optionally matches faces against a face DB and names matched clusters (see **How face-DB matching works** below).
 4. Clusters the remaining (unmatched) faces by cosine similarity (agglomerative, average linkage).

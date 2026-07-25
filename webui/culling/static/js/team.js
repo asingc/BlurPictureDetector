@@ -1,12 +1,17 @@
 "use strict";
 
-// Page 1 — Team Setup
+// Page 1 — Team Setup: a row of team blocks at the top lets you switch
+// between existing teams or start a brand-new one; the panels below edit
+// whichever team is currently selected.
 
-const Team = {
-  jerseyColors: [],
-  players: [],
-  openaiApiKey: "",
-};
+let teams = [];
+let selectedTeamId = null; // null => creating a brand-new (unsaved) team
+
+function blankTeam() {
+  return { id: "", name: "", jerseyColors: [], players: [], openaiApiKey: "" };
+}
+
+let Team = blankTeam();
 
 function renderJerseyList() {
   const list = $("#jerseyList").empty();
@@ -36,22 +41,64 @@ function renderPlayerTable() {
   });
 }
 
-async function loadTeam() {
-  const data = await apiGet("/api/team");
-  Object.assign(Team, data);
+function renderForm() {
+  $("#teamNameInput").val(Team.name || "");
   renderJerseyList();
   renderPlayerTable();
   $("#openaiKeyInput").val(Team.openaiApiKey || "");
+  const hasGoalkeeper = Team.jerseyColors.some((jc) => jc.forced);
+  $("#hasGoalkeeperInput").prop("checked", hasGoalkeeper);
+  $("#goalkeeperJerseyRow").toggle(hasGoalkeeper);
+}
+
+function renderPicker() {
+  renderTeamPicker($("#teamPicker"), teams, {
+    selectedId: selectedTeamId,
+    onSelect: (team) => {
+      selectedTeamId = team.id;
+      Team = $.extend(true, {}, team);
+      renderForm();
+      renderPicker();
+    },
+    onAddNew: () => {
+      selectedTeamId = null;
+      Team = blankTeam();
+      $("#teamSaveStatus").text("");
+      renderForm();
+      renderPicker();
+    },
+    addLabel: "Add new team",
+  });
+}
+
+async function loadTeams() {
+  const data = await apiGet("/api/teams/query");
+  teams = data.teams || [];
+  if (teams.length) {
+    selectedTeamId = teams[0].id;
+    Team = $.extend(true, {}, teams[0]);
+  } else {
+    selectedTeamId = null;
+    Team = blankTeam();
+  }
+  renderForm();
+  renderPicker();
 }
 
 async function saveTeam() {
+  Team.name = $("#teamNameInput").val().trim();
   Team.openaiApiKey = $("#openaiKeyInput").val();
   $("#saveTeamBtn").prop("disabled", true);
   $("#teamSaveStatus").text("Saving…");
   try {
-    await apiPost("/api/team", Team);
+    const res = await apiPost("/api/team", Team);
+    Team = res.team;
+    selectedTeamId = Team.id;
+    const idx = teams.findIndex((t) => t.id === Team.id);
+    if (idx >= 0) teams[idx] = Team; else teams.push(Team);
+    renderForm();
+    renderPicker();
     $("#teamSaveStatus").text("Saved.");
-    window.location.href = "/import";
   } catch (err) {
     $("#teamSaveStatus").text("Save failed: " + err.message);
   } finally {
@@ -63,12 +110,24 @@ $(function () {
   $("#addJerseyBtn").on("click", () => {
     const color = $("#jerseyColorInput").val().trim();
     if (!color) return;
-    Team.jerseyColors.push({ color, forced: $("#jerseyForcedInput").is(":checked") });
+    Team.jerseyColors.push({ color, forced: false });
     $("#jerseyColorInput").val("");
-    $("#jerseyForcedInput").prop("checked", false);
     renderJerseyList();
   });
   $("#jerseyColorInput").on("keydown", (e) => { if (e.key === "Enter") $("#addJerseyBtn").click(); });
+
+  $("#hasGoalkeeperInput").on("change", function () {
+    $("#goalkeeperJerseyRow").toggle($(this).is(":checked"));
+  });
+
+  $("#addGoalkeeperJerseyBtn").on("click", () => {
+    const color = $("#goalkeeperJerseyInput").val().trim();
+    if (!color) return;
+    Team.jerseyColors.push({ color, forced: true });
+    $("#goalkeeperJerseyInput").val("");
+    renderJerseyList();
+  });
+  $("#goalkeeperJerseyInput").on("keydown", (e) => { if (e.key === "Enter") $("#addGoalkeeperJerseyBtn").click(); });
 
   $("#addPlayerBtn").on("click", () => {
     const raw = $("#playerBulkInput").val();
@@ -92,5 +151,5 @@ $(function () {
 
   $("#saveTeamBtn").on("click", saveTeam);
 
-  loadTeam().catch((err) => alert("Failed to load team.json: " + err.message));
+  loadTeams().catch((err) => alert("Failed to load teams: " + err.message));
 });

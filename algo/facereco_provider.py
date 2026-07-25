@@ -38,7 +38,7 @@ class Box:
 
 @dataclass
 class BodyRecord:
-    """Serializable body record loaded from results.json annotation_data."""
+    """Serializable body record loaded from album.json annotation_data."""
 
     orig_filename: str
     body_index: int

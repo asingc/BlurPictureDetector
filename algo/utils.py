@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -7,9 +8,48 @@ import numpy as np
 
 from algo.models import AutoAdjustment, Box, ColorLab, Face
 
+try:
+    from PIL import Image as _PILImage
+    from PIL import ExifTags as _PILExifTags
+except ImportError:  # Pillow not installed — EXIF timestamps just won't be available.
+    _PILImage = None
+    _PILExifTags = None
+
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
 _HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+# EXIF tag ids (main IFD "DateTime", and Exif sub-IFD "DateTimeOriginal" /
+# "DateTimeDigitized") — checked in that order. Mirrors culling_app.py's
+# review-page burst grouping so both places agree on "when was this taken".
+_EXIF_TAG_DATETIME = 306
+_EXIF_TAG_DATETIME_ORIGINAL = 36867
+_EXIF_TAG_DATETIME_DIGITIZED = 36868
+
+
+def image_capture_timestamp(path: Path) -> float:
+    """Best-effort capture time (as a Unix timestamp) for burst grouping:
+    EXIF capture time first, falling back to min(file create time, file
+    modified time) when EXIF is missing/unreadable (non-JPEG source, no
+    camera metadata, Pillow not installed, etc.)."""
+    if _PILImage is not None:
+        try:
+            with _PILImage.open(path) as img:
+                exif = img.getexif()
+                raw = exif.get(_EXIF_TAG_DATETIME)
+                if not raw:
+                    sub = exif.get_ifd(_PILExifTags.IFD.Exif)
+                    raw = sub.get(_EXIF_TAG_DATETIME_ORIGINAL) or sub.get(_EXIF_TAG_DATETIME_DIGITIZED)
+                if raw:
+                    from datetime import datetime
+                    return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S").timestamp()
+        except Exception:
+            pass
+    try:
+        stat = path.stat()
+        return min(stat.st_ctime, stat.st_mtime)
+    except OSError:
+        return 0.0
 
 
 def apply_auto_adjustment(image: np.ndarray, adjustment: AutoAdjustment | None) -> np.ndarray:

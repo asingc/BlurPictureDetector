@@ -29,10 +29,13 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +46,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 try:
     from PIL import Image as _PILImage
@@ -59,7 +62,7 @@ WEBUI_DIR = REPO_ROOT / "webui" / "culling"
 
 TEAM_JSON_PATH = REPO_ROOT / "team.json"
 STATE_JSON_PATH = REPO_ROOT / ".culling_state.json"
-OUTPUT_DIR = REPO_ROOT / "output"
+OUTPUT_DIR = REPO_ROOT / "albums"
 
 SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.35, "medium": 0.50, "high": 0.70}
 
@@ -81,9 +84,25 @@ class Player(BaseModel):
 
 
 class TeamData(BaseModel):
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    name: str = ""
     jerseyColors: list[JerseyColor] = Field(default_factory=list)
     players: list[Player] = Field(default_factory=list)
     openaiApiKey: str = ""
+
+
+class GlobalSettings(BaseModel):
+    """App-wide settings that aren't tied to any one team. Empty for now —
+    reserved for future cross-team settings; `extra="allow"` so hand-added
+    fields round-trip instead of being dropped on save."""
+    model_config = ConfigDict(extra="allow")
+
+
+class TeamsFile(BaseModel):
+    """On-disk shape of team.json: a list of teams plus shared Global
+    settings."""
+    Teams: list[TeamData] = Field(default_factory=list)
+    Global: GlobalSettings = Field(default_factory=GlobalSettings)
 
 
 class ImportPathRequest(BaseModel):
@@ -92,9 +111,20 @@ class ImportPathRequest(BaseModel):
 
 class StartProcessingRequest(BaseModel):
     path: str
+    albumName: str = ""                   # optional custom name for the output album folder
     sensitivityMode: str = "medium"       # "low" | "medium" | "high" | "custom"
     sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
     recognizeFaces: bool = True
+    teamId: str = ""                      # which team's jersey colors/roster/API key to use
+
+
+class BrowseFolderRequest(BaseModel):
+    title: str = "Select photo folder to import"
+
+
+class ExportRequest(BaseModel):
+    destination: str
+    exportFaceTagging: bool = True
 
 
 class AlbumSelectRequest(BaseModel):
@@ -128,6 +158,66 @@ class ProcessingState:
 processing_state = ProcessingState()
 
 
+# --------------------------------------------------------------------------- #
+# Export (page 5 — Apply) — copy "keep" images and merge tagged-player faces
+# into a .FaceReco database at a destination folder, run in a background
+# thread with the same buffered-lines-for-polling pattern as ProcessingState.
+# --------------------------------------------------------------------------- #
+class ExportState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.running = False
+        self.done = False
+        self.error: Optional[str] = None
+        self.lines: list[str] = []
+        self.total_images = 0
+        self.copied_images = 0
+        self.total_players = 0
+        self.processed_players = 0
+
+
+export_state = ExportState()
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeat watchdog — the browser pings /api/heartbeat periodically from
+# every page (common.js); if none arrives within the timeout, the server
+# exits automatically so we don't leave orphaned local servers running after
+# the browser tab/window is closed. Mirrors face_tag_ui.py's watchdog.
+# --------------------------------------------------------------------------- #
+class HeartbeatState:
+    def __init__(self, timeout: float = 180.0) -> None:
+        self.lock = threading.Lock()
+        self.timeout = timeout
+        self.last_heartbeat = time.time()
+
+
+heartbeat_state = HeartbeatState()
+
+
+def _heartbeat_watchdog() -> None:
+    """Exit the process if no browser heartbeat arrives within the timeout.
+
+    Runs as a daemon thread. The timer starts from server launch, so the
+    browser has one full timeout window to load the page and send its first
+    heartbeat before the watchdog can fire.
+    """
+    poll_interval = max(1.0, min(5.0, heartbeat_state.timeout / 3))
+    while True:
+        time.sleep(poll_interval)
+        with heartbeat_state.lock:
+            elapsed = time.time() - heartbeat_state.last_heartbeat
+        if elapsed > heartbeat_state.timeout:
+            log.info(
+                "No heartbeat received for %.0fs (timeout %.0fs) — shutting down.",
+                elapsed, heartbeat_state.timeout,
+            )
+            os._exit(0)
+
+
 def _sensitivity_arg(mode: str, custom_value: float) -> str:
     if mode == "custom":
         return str(custom_value)
@@ -142,10 +232,11 @@ def _jerseycolor_arg(team: TeamData) -> str:
     return ";".join(parts)
 
 
-def _run_processing(path: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool) -> None:
-    team = _load_team()
+def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool, team_id: str) -> None:
+    team = _resolve_team(team_id)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = OUTPUT_DIR / f"{ts}-{Path(path).stem}"
+    folder_stem = _sanitize_player_dirname(album_name.strip()) if album_name.strip() else Path(path).stem
+    output_dir = OUTPUT_DIR / f"{ts}-{folder_stem}"
     cmd = [
         sys.executable,
         str(REPO_ROOT / "1_prep_review.py"),
@@ -159,8 +250,12 @@ def _run_processing(path: str, sensitivity_mode: str, sensitivity_custom_value: 
     jerseycolor = _jerseycolor_arg(team)
     if jerseycolor:
         cmd += ["--jerseycolor", jerseycolor]
+    if team.id:
+        cmd += ["--team-id", team.id]
+    if team.openaiApiKey:
+        cmd += ["--openaikey", team.openaiApiKey]
 
-    log.info("Starting processing: %s", " ".join(cmd))
+    log.info("Starting processing: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
     proc = subprocess.Popen(
         cmd,
         cwd=str(REPO_ROOT),
@@ -194,36 +289,101 @@ def _run_processing(path: str, sensitivity_mode: str, sensitivity_custom_value: 
 
 
 # --------------------------------------------------------------------------- #
-# team.json persistence
+# team.json persistence — {"Teams": [...], "Global": {...}}. Multiple teams
+# are supported; each is identified by a stable `id` assigned the first time
+# it's loaded/saved without one. QueryTeams (below) exposes every team's
+# settings; the Team Setup page can create/update any team by id.
 # --------------------------------------------------------------------------- #
-def _default_team() -> TeamData:
-    return TeamData()
+def _default_teams_file() -> TeamsFile:
+    return TeamsFile(Teams=[TeamData(name="Team 1")])
 
 
-def _load_team() -> TeamData:
+def _load_teams_file() -> TeamsFile:
+    """Load team.json, transparently migrating the legacy flat single-team
+    format (no "Teams" key — the whole file *was* one team's data) into
+    {"Teams": [...], "Global": {...}}, and backfilling a stable `id`/`name`
+    for any team that predates those fields (re-saved immediately so the
+    generated id doesn't change on the next load)."""
     if not TEAM_JSON_PATH.is_file():
-        return _default_team()
+        teams_file = _default_teams_file()
+        _save_teams_file(teams_file)
+        return teams_file
     try:
         with open(TEAM_JSON_PATH, encoding="utf-8") as fh:
             payload = json.load(fh)
+        if "Teams" not in payload:
+            payload = {"Teams": [payload], "Global": {}}
+        needs_resave = False
         # Defensive: coerce null player fields to "" so one malformed entry
         # (e.g. hand-edited JSON, or a future bulk-parse edge case) doesn't
-        # discard the whole file back to defaults.
-        for player in payload.get("players", []):
-            if isinstance(player, dict):
-                player["name"] = player.get("name") or ""
-                player["number"] = player.get("number") or ""
-        return TeamData.model_validate(payload)
+        # discard the whole file back to defaults. Also backfill id/name.
+        for i, team in enumerate(payload.get("Teams", [])):
+            if not isinstance(team, dict):
+                continue
+            if not team.get("id"):
+                team["id"] = uuid.uuid4().hex[:12]
+                needs_resave = True
+            if not team.get("name"):
+                team["name"] = f"Team {i + 1}"
+                needs_resave = True
+            for player in team.get("players", []):
+                if isinstance(player, dict):
+                    player["name"] = player.get("name") or ""
+                    player["number"] = player.get("number") or ""
+        teams_file = TeamsFile.model_validate(payload)
+        if not teams_file.Teams:
+            teams_file.Teams = [TeamData(name="Team 1")]
+            needs_resave = True
+        if needs_resave:
+            _save_teams_file(teams_file)
+        return teams_file
     except (json.JSONDecodeError, OSError, ValueError) as exc:
         log.warning("Failed to load team.json (%s) — using defaults", exc)
-        return _default_team()
+        return _default_teams_file()
 
 
-def _save_team(team: TeamData) -> None:
+def _save_teams_file(teams_file: TeamsFile) -> None:
     with open(TEAM_JSON_PATH, "w", encoding="utf-8") as fh:
-        json.dump(team.model_dump(), fh, indent=2)
-    log.info("team.json saved (%d player(s), %d jersey colour(s))",
-              len(team.players), len(team.jerseyColors))
+        json.dump(teams_file.model_dump(), fh, indent=2)
+
+
+def _find_team(teams_file: TeamsFile, team_id: str) -> Optional[TeamData]:
+    for team in teams_file.Teams:
+        if team.id == team_id:
+            return team
+    return None
+
+
+def _resolve_team(team_id: str) -> TeamData:
+    """Resolve a team by id for use by the processing pipeline, falling back
+    to the first team on disk if no id was given or it no longer exists."""
+    teams_file = _load_teams_file()
+    if team_id:
+        team = _find_team(teams_file, team_id)
+        if team is not None:
+            return team
+        log.warning("Team id %r not found — falling back to the first team.", team_id)
+    return teams_file.Teams[0]
+
+
+def _save_team(team: TeamData) -> TeamData:
+    """Create (if `team.id` is blank or unrecognized) or update (if it
+    matches an existing team) a single team, preserving every other team /
+    Global settings already on disk. Returns the saved team (with its id
+    filled in if it was newly created)."""
+    teams_file = _load_teams_file()
+    if not team.id:
+        team.id = uuid.uuid4().hex[:12]
+    for i, existing in enumerate(teams_file.Teams):
+        if existing.id == team.id:
+            teams_file.Teams[i] = team
+            break
+    else:
+        teams_file.Teams.append(team)
+    _save_teams_file(teams_file)
+    log.info("team.json saved (team %r: %d player(s), %d jersey colour(s))",
+              team.name, len(team.players), len(team.jerseyColors))
+    return team
 
 
 # --------------------------------------------------------------------------- #
@@ -232,12 +392,12 @@ def _save_team(team: TeamData) -> None:
 # --------------------------------------------------------------------------- #
 def _load_state() -> dict:
     if not STATE_JSON_PATH.is_file():
-        return {"lastImportPath": "", "currentAlbum": ""}
+        return {"lastImportPath": "", "currentAlbum": "", "selectedTeamId": ""}
     try:
         with open(STATE_JSON_PATH, encoding="utf-8") as fh:
             return json.load(fh)
     except (json.JSONDecodeError, OSError):
-        return {"lastImportPath": "", "currentAlbum": ""}
+        return {"lastImportPath": "", "currentAlbum": "", "selectedTeamId": ""}
 
 
 def _save_state(state: dict) -> None:
@@ -246,7 +406,7 @@ def _save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Album discovery — list/select previously processed output/ folders so the
+# Album discovery — list/select previously processed albums/ folders so the
 # user can resume review/tagging without re-running 1_prep_review.py.
 # --------------------------------------------------------------------------- #
 def _album_has_facereco(path: Path) -> bool:
@@ -255,10 +415,10 @@ def _album_has_facereco(path: Path) -> bool:
 
 def _is_album_complete(path: Path) -> bool:
     """An album is "fully processed" once 1_prep_review.py has written both
-    results.json and info.json - both are always written together (barring a
+    album.json and info.json - both are always written together (barring a
     completely empty input folder), regardless of --skip-facereco or whether
     any blurry images were found."""
-    return (path / "results.json").is_file() and (path / "info.json").is_file()
+    return (path / "album.json").is_file() and (path / "info.json").is_file()
 
 
 # How many random sharp-image filenames to hand to the client per album for
@@ -330,7 +490,7 @@ def _list_albums() -> list[dict]:
 FACE_SUBDIR = "Face"
 FACE_ANNOTATED_SUBDIR = "Face.annotated"
 
-# Matching tolerance for body_bbox floats when writing back to results.json.
+# Matching tolerance for body_bbox floats when writing back to album.json.
 BBOX_EPS = 1e-6
 
 
@@ -358,13 +518,13 @@ def _current_album_path() -> Path:
 # --------------------------------------------------------------------------- #
 # Review (page 3) — sort blur / sharp / skipped images into keep / drop,
 # grouped into time-based "bursts". Decisions are staged client-side and only
-# committed to results.json (as an explicit "keep" boolean per entry) when the
+# committed to album.json (as an explicit "keep" boolean per entry) when the
 # user hits Apply — see api_review_apply().
 # --------------------------------------------------------------------------- #
 REVIEW_CATEGORIES = ("blur", "sharp", "skipped")
 _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
 _REVIEW_ANNO_SUBDIR = {"blur": "anno_blur", "sharp": "anno_sharp", "skipped": "anno_skipped"}
-# Effective "keep" when results.json has no explicit value yet (older albums,
+# Effective "keep" when album.json has no explicit value yet (older albums,
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
 # manually deleting anno_* previews to "reject" an image.
@@ -419,7 +579,7 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def _load_results_payload(album_path: Path) -> dict:
-    with open(album_path / "results.json", encoding="utf-8") as fh:
+    with open(album_path / "album.json", encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -444,15 +604,30 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
             continue
         result = results_by_name.get(src_name)
         keep = bool(result.get("keep", default_keep)) if result else default_keep
+        burst_ranking = result.get("burst_ranking") if result else None
         src_path = src_dir / src_name
         ts_path = src_path if src_path.is_file() else anno_subdir / anno_name
         images.append({
             "file": src_name,
             "anno": anno_name,
             "keep": keep,
+            "burstRanking": burst_ranking,
             "timestamp": _image_timestamp(ts_path),
         })
     return images
+
+
+def _kept_image_basenames(album_path: Path) -> set[str]:
+    """Basenames of every image the user decided to keep, across all 3
+    review categories — the same effective (explicit-or-default) keep state
+    the Review page shows. Used by the Apply/export step to decide which
+    original photos (and which face crops) to copy to the destination."""
+    kept: set[str] = set()
+    for category in REVIEW_CATEGORIES:
+        for image in _review_images(album_path, category):
+            if image["keep"]:
+                kept.add(image["file"])
+    return kept
 
 
 def _group_bursts(images: list[dict]) -> list[list[dict]]:
@@ -500,6 +675,17 @@ def _safe_component(name: str) -> str:
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid path component")
     return name
+
+
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_player_dirname(name: str) -> str:
+    """Make a free-text player name safe to use as a destination folder
+    name (Windows/POSIX invalid characters replaced, trailing dots/spaces
+    trimmed — Windows rejects both)."""
+    cleaned = _INVALID_FS_CHARS.sub("_", name).strip(" .")
+    return cleaned or "Unnamed"
 
 
 def _is_pending_cluster(folder_name: str) -> bool:
@@ -664,13 +850,13 @@ def _boxes_match(a: Optional[dict], b: Optional[dict]) -> bool:
 
 
 def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
-    """Write player_name / player_number onto matching results.json bodies.
+    """Write player_name / player_number onto matching album.json bodies.
 
     ``assignments`` is a list of {origFilename, body_bbox, name, playernum}.
     """
     if not assignments:
         return
-    results_fp = album_path / "results.json"
+    results_fp = album_path / "album.json"
     if not results_fp.is_file():
         return
     with open(results_fp, encoding="utf-8") as fh:
@@ -783,17 +969,223 @@ def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> d
 
 
 # --------------------------------------------------------------------------- #
+# Export (page 5 — Apply). Three steps, run in a background thread while the
+# browser polls /api/apply/export-status the same way it polls processing
+# output:
+#
+#   1. Sync every recognized/tagged player's face crops (from kept images
+#      only) into the permanent, cross-album system face database at
+#      REPO_ROOT/.FaceReco — uncapped; RebuildFaceDB.py's retire step (below)
+#      is what curates it, not this step.
+#   2. Run RebuildFaceDB.py against that system database to regenerate
+#      embeddings and retire redundant crops.
+#   3. Run apply_export.py to copy every kept photo (with edits + metadata
+#      preserved) plus players.csv into the user-chosen destination — a flat
+#      folder, no subdirectories. albums/<album>/ (and its own .FaceReco) is
+#      the persistent "working album"; the destination is just the final
+#      deliverable.
+# --------------------------------------------------------------------------- #
+def _export_log(msg: str) -> None:
+    with export_state.lock:
+        export_state.lines.append(msg)
+    log.info("[Export] %s", msg)
+
+
+def _stream_subprocess(cmd: list[str], on_line=None) -> int:
+    """Run *cmd*, forwarding each combined stdout/stderr line to _export_log
+    (and optionally *on_line* for progress-counter bookkeeping). Returns the
+    process's exit code."""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        _export_log(line)
+        if on_line:
+            on_line(line)
+    proc.wait()
+    return proc.returncode
+
+
+def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
+    """Copy every recognized/tagged player's face crops from *kept* images in
+    this album's own .FaceReco into REPO_ROOT/.FaceReco (creating a person
+    folder there the first time we see them). Copies everything uncapped —
+    RebuildFaceDB.py's retire step decides afterward what's actually worth
+    keeping. Returns the number of tagged players processed."""
+    fr = _facereco_dir(album_path)
+    if fr is None:
+        _export_log("No .FaceReco folder in this album — nothing to sync.")
+        return 0
+
+    named_clusters = [
+        child for child in sorted(fr.iterdir())
+        if child.is_dir() and not child.name.startswith(".") and not _is_pending_cluster(child.name)
+    ]
+    if not named_clusters:
+        _export_log("No tagged players found in this album — nothing to sync.")
+        return 0
+
+    system_fr = REPO_ROOT / ".FaceReco"
+    system_fr.mkdir(parents=True, exist_ok=True)
+
+    processed = 0
+    for cluster_dir in named_clusters:
+        payload = _load_face_json(cluster_dir)
+        name = (payload.get("name") or cluster_dir.name).strip() or cluster_dir.name
+
+        candidates = [
+            f for f in payload.get("faces", [])
+            if f.get("cropFileName") and Path(f.get("origFilename", "")).name in kept
+        ]
+        with export_state.lock:
+            export_state.processed_players = processed + 1
+            export_state.total_players = len(named_clusters)
+        if not candidates:
+            _export_log(f"  {name}: no kept faces to sync.")
+            processed += 1
+            continue
+
+        dest_dir = system_fr / _sanitize_player_dirname(name)
+        dest_face_dir = dest_dir / FACE_SUBDIR
+        dest_face_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / "Negative").mkdir(parents=True, exist_ok=True)
+
+        if not (dest_dir / "face.json").is_file():
+            _write_face_json(dest_dir, {
+                "name": name,
+                "playernum": payload.get("playernum"),
+                "provider": payload.get("provider"),
+                "cluster": cluster_dir.name,
+                "faces": [],
+                "negative_faces": [],
+            })
+
+        copied = 0
+        skipped = 0
+        for f in candidates:
+            src_crop = cluster_dir / FACE_SUBDIR / f["cropFileName"]
+            if not src_crop.is_file():
+                continue
+            dest_crop = dest_face_dir / f["cropFileName"]
+            if dest_crop.is_file():
+                # Already synced in a previous export run — skip instead of
+                # copying a renamed duplicate (crop file names are
+                # deterministic per source photo/body, so an existing file
+                # of the same name means this exact face is already there).
+                skipped += 1
+                continue
+            shutil.copy2(str(src_crop), str(dest_crop))
+            src_anno = cluster_dir / FACE_ANNOTATED_SUBDIR / f["cropFileName"]
+            if src_anno.is_file():
+                dest_anno_dir = dest_dir / FACE_ANNOTATED_SUBDIR
+                dest_anno_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src_anno), str(dest_anno_dir / f["cropFileName"]))
+            copied += 1
+        _export_log(
+            f"  {name}: {copied} new face crop(s) synced, {skipped} already present "
+            f"(of {len(candidates)} kept face crop(s))."
+        )
+        processed += 1
+
+    _export_log(f"Face-DB sync complete: {processed}/{len(named_clusters)} player(s) processed.")
+    return processed
+
+
+def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool) -> None:
+    try:
+        kept = _kept_image_basenames(album_path)
+        with export_state.lock:
+            export_state.total_images = len(kept)
+
+        _export_log("Step 1/3: syncing tagged face crops into system face database (./FaceReco)...")
+        _sync_named_clusters_to_system_db(album_path, kept)
+
+        system_fr = REPO_ROOT / ".FaceReco"
+        if system_fr.is_dir() and any(system_fr.iterdir()):
+            _export_log("Step 2/3: rebuilding face database embeddings (RebuildFaceDB.py)...")
+            rc = _stream_subprocess([
+                sys.executable, str(REPO_ROOT / "RebuildFaceDB.py"), str(system_fr), "--skip-calibration",
+            ])
+            if rc != 0:
+                raise RuntimeError(f"RebuildFaceDB.py failed with exit code {rc}")
+        else:
+            _export_log("Step 2/3: system face database is empty — skipping rebuild.")
+
+        _export_log(f"Step 3/3: exporting {len(kept)} kept photo(s) + players.csv to {dest_dir}...")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        def _bump_copied(line: str) -> None:
+            # apply_export.py logs "  Copied: <name>" but the subprocess's
+            # own logging.Formatter prepends "<time> [LEVEL   ] " to every
+            # line, so match the message as a substring rather than a
+            # prefix (startswith would never match and copied_images would
+            # stay stuck at 0 despite the export succeeding).
+            if "  Copied: " in line:
+                with export_state.lock:
+                    export_state.copied_images += 1
+
+        cmd = [sys.executable, str(REPO_ROOT / "apply_export.py"), str(album_path), str(dest_dir)]
+        if export_face_tagging:
+            cmd.append("--export-face-tagging")
+        rc = _stream_subprocess(cmd, on_line=_bump_copied)
+        if rc != 0:
+            raise RuntimeError(f"apply_export.py failed with exit code {rc}")
+
+        _export_log("Export complete.")
+        with export_state.lock:
+            export_state.done = True
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        log.exception("[Export] failed")
+        with export_state.lock:
+            export_state.error = str(exc)
+    finally:
+        with export_state.lock:
+            export_state.running = False
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="Photo Culling UI")
 templates = Jinja2Templates(directory=str(WEBUI_DIR / "templates"))
+
+
+def _static_url(path: str) -> str:
+    """Build a `/static/...` URL with a cache-busting `?v=<mtime>` query
+    param, so browsers pick up edited JS/CSS immediately instead of serving
+    a stale cached copy after the file changes on disk."""
+    fp = WEBUI_DIR / "static" / path
+    try:
+        version = int(fp.stat().st_mtime)
+    except OSError:
+        version = 0
+    return f"/static/{path}?v={version}"
+
+
+templates.env.globals["static_url"] = _static_url
 
 PAGE_STEPS: tuple[str, ...] = ("team", "import", "review", "cluster", "apply")
 
 
 @app.get("/")
 def root() -> RedirectResponse:
-    return RedirectResponse(url="/team")
+    return RedirectResponse(url="/import")
+
+
+@app.post("/api/heartbeat")
+def api_heartbeat() -> dict:
+    with heartbeat_state.lock:
+        heartbeat_state.last_heartbeat = time.time()
+    return {"ok": True}
 
 
 def _render_page(step: str, request: Request) -> HTMLResponse:
@@ -808,15 +1200,28 @@ for _step in PAGE_STEPS:
     app.add_api_route(f"/{_step}", _make_route(_step), methods=["GET"], response_class=HTMLResponse)
 
 
-@app.get("/api/team")
-def api_get_team() -> dict:
-    return _load_team().model_dump()
+@app.get("/add-album")
+def add_album_page(request: Request) -> HTMLResponse:
+    # Sub-page of "Select Album" (reached via the "+" polaroid card there),
+    # not a numbered step of its own — highlight the "Select Album" step.
+    return templates.TemplateResponse(request, "add_album.html", {"active_step": "import"})
 
 
 @app.post("/api/team")
 def api_save_team(team: TeamData) -> dict:
-    _save_team(team)
-    return {"ok": True}
+    saved = _save_team(team)
+    return {"ok": True, "team": saved.model_dump()}
+
+
+@app.get("/api/teams/query")
+def api_query_teams() -> dict:
+    """QueryTeams — returns settings (jersey colours, roster, API key) for
+    every team stored in team.json, plus the shared Global settings block."""
+    teams_file = _load_teams_file()
+    return {
+        "teams": [team.model_dump() for team in teams_file.Teams],
+        "global": teams_file.Global.model_dump(),
+    }
 
 
 @app.get("/api/sensitivity-presets")
@@ -892,7 +1297,10 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
     return {
         "category": category,
         "groups": [
-            {"images": [{"file": im["file"], "anno": im["anno"], "keep": im["keep"]} for im in group]}
+            {"images": [
+                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "burstRanking": im["burstRanking"]}
+                for im in group
+            ]}
             for group in groups
         ],
     }
@@ -912,12 +1320,12 @@ def api_review_thumb(category: str = Query(...), file: str = Query(...)) -> File
 @app.post("/api/review/apply")
 def api_review_apply(req: ReviewApplyRequest) -> dict:
     """Commit pending keep/drop decisions (staged client-side, across all 3
-    review tabs at once) into results.json. Every reviewable entry gets an
+    review tabs at once) into album.json. Every reviewable entry gets an
     explicit "keep" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
-    so results.json becomes fully self-describing going forward. Written
+    so album.json becomes fully self-describing going forward. Written
     atomically (temp file + os.replace) so a crash mid-write can never
-    corrupt results.json."""
+    corrupt album.json."""
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
@@ -934,7 +1342,7 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
             current = bool(result.get("keep", default_keep))
             result["keep"] = bool(req.overrides.get(src_name, current))
 
-    _write_json_atomic(album_path / "results.json", payload)
+    _write_json_atomic(album_path / "album.json", payload)
     log.info("Review changes applied: %s (%d overrides)", album_path.resolve(), len(req.overrides))
     return {"ok": True}
 
@@ -949,6 +1357,7 @@ def api_get_import_state() -> dict:
         "sensitivityMode": state.get("sensitivityMode", "medium"),
         "sensitivityCustomValue": state.get("sensitivityCustomValue", 0.50),
         "recognizeFaces": state.get("recognizeFaces", True),
+        "selectedTeamId": state.get("selectedTeamId", ""),
     }
 
 
@@ -965,7 +1374,7 @@ def api_set_import_path(req: ImportPathRequest) -> dict:
 
 
 @app.post("/api/browse-folder")
-def api_browse_folder() -> dict:
+def api_browse_folder(req: BrowseFolderRequest = BrowseFolderRequest()) -> dict:
     """Open a native OS folder-picker dialog on the server machine.
 
     Only meaningful when the server and browser run on the same machine
@@ -986,7 +1395,7 @@ def api_browse_folder() -> dict:
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        chosen = filedialog.askdirectory(initialdir=initial_dir, title="Select photo folder to import")
+        chosen = filedialog.askdirectory(initialdir=initial_dir, title=req.title)
         root.destroy()
         result["path"] = chosen or None
 
@@ -1020,11 +1429,12 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
     state["sensitivityMode"] = req.sensitivityMode
     state["sensitivityCustomValue"] = req.sensitivityCustomValue
     state["recognizeFaces"] = req.recognizeFaces
+    state["selectedTeamId"] = req.teamId
     _save_state(state)
 
     thread = threading.Thread(
         target=_run_processing,
-        args=(str(path.resolve()), req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces),
+        args=(str(path.resolve()), req.albumName, req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces, req.teamId),
         daemon=True,
     )
     thread.start()
@@ -1083,6 +1493,67 @@ def api_cluster_commit(req: ClusterCommitRequest) -> dict:
     return _commit_cluster_operations(album_path, req)
 
 
+@app.get("/api/apply/summary")
+def api_apply_summary() -> dict:
+    album_path = _current_album_path()
+    with open(album_path / "info.json", encoding="utf-8") as fh:
+        info = json.load(fh)
+    total_images = (
+        len(info.get("Anno_Sharp", [])) + len(info.get("Anno_Blur", [])) + len(info.get("Anno_Skipped", []))
+    )
+    kept = len(_kept_image_basenames(album_path))
+    clusters = _build_clusters(album_path)
+    return {
+        "name": album_path.name,
+        "imagesKept": kept,
+        "imagesDropped": max(0, total_images - kept),
+        "facesDetected": sum(len(c["faces"]) for c in clusters),
+        "playersDetected": sum(1 for c in clusters if not c["pending"]),
+    }
+
+
+@app.post("/api/apply/export")
+def api_start_export(req: ExportRequest) -> dict:
+    album_path = _current_album_path()
+    destination = req.destination.strip()
+    if not destination:
+        raise HTTPException(status_code=400, detail="Destination folder is required.")
+    dest_path = Path(destination)
+    if dest_path.is_file():
+        raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
+
+    with export_state.lock:
+        if export_state.running:
+            raise HTTPException(status_code=409, detail="Export is already running.")
+        export_state.reset()
+        export_state.running = True
+
+    thread = threading.Thread(
+        target=_run_export,
+        args=(album_path, dest_path, req.exportFaceTagging),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
+@app.get("/api/apply/export-status")
+def api_export_status(since: int = 0) -> dict:
+    with export_state.lock:
+        new_lines = export_state.lines[since:]
+        return {
+            "lines": new_lines,
+            "next": since + len(new_lines),
+            "running": export_state.running,
+            "done": export_state.done,
+            "error": export_state.error,
+            "totalImages": export_state.total_images,
+            "copiedImages": export_state.copied_images,
+            "totalPlayers": export_state.total_players,
+            "processedPlayers": export_state.processed_players,
+        }
+
+
 if (WEBUI_DIR / "static").is_dir():
     app.mount("/static", StaticFiles(directory=WEBUI_DIR / "static"), name="static")
 
@@ -1095,9 +1566,15 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser tab")
+    parser.add_argument("--heartbeat-timeout", type=float, default=180.0,
+                        help="Seconds without a browser heartbeat before the "
+                             "server exits automatically. Use 0 to disable.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    heartbeat_state.timeout = args.heartbeat_timeout
+    heartbeat_state.last_heartbeat = time.time()
 
     url = f"http://{args.host}:{args.port}/"
     log.info("team.json:  %s", TEAM_JSON_PATH)
@@ -1106,6 +1583,12 @@ def main() -> None:
 
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    if heartbeat_state.timeout > 0:
+        log.info("Heartbeat watchdog: exit after %.0fs without a browser ping", heartbeat_state.timeout)
+        threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
+    else:
+        log.info("Heartbeat watchdog disabled")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

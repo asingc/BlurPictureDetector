@@ -55,6 +55,7 @@ from algo.stages.face_reco import FaceRecoStage
 from algo.stages.grading import GradingStage
 from algo.stages.image_analysis import ImageAnalysisStage, MediaPipeImageAnalysisStage
 from algo.stages.jersey_counting import JerseyCountingStage
+from algo.stages.llm_culling import LLMCullingStage
 from algo.scorers import (
     BodyArrayScorer,
     BodyArrayScorerBase,
@@ -984,7 +985,7 @@ def process(
     <output_dir>/anno_sharp/, and <output_dir>/anno_skipped/ sub-folders.
 
     output_root : if provided, use it directly as the output directory;
-                  otherwise a timestamped sub-folder is created under ./output/.
+                  otherwise a timestamped sub-folder is created under ./albums/.
 
     Returns (all_results, blurry_results, output_directory).
     """
@@ -994,7 +995,7 @@ def process(
         threshold = SENSITIVITY_THRESHOLDS[sensitivity]
     files      = collect_images(input_path)
     ts         = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = output_root if output_root is not None else Path("output") / f"{ts}-{input_path.stem}"
+    output_dir = output_root if output_root is not None else Path("albums") / f"{ts}-{input_path.stem}"
 
     if not files:
         log.warning("No supported image files found in: %s", input_path)
@@ -1194,7 +1195,13 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def write_results_json(frames: list[Frame], json_path: Path, *, our_jersey_color: str | None = None) -> None:
+def write_results_json(
+    frames: list[Frame],
+    json_path: Path,
+    *,
+    our_jersey_color: str | None = None,
+    team_id: str | None = None,
+) -> None:
     """Write full per-image analytic results (scores, bboxes, keypoints) to JSON."""
     serializable = []
     for frame in frames:
@@ -1240,6 +1247,7 @@ def write_results_json(frames: list[Frame], json_path: Path, *, our_jersey_color
             }
         serializable.append(entry)
     payload = {
+        "team_id": team_id,
         "our_jersey_color": our_jersey_color,
         "results": serializable,
     }
@@ -1524,7 +1532,7 @@ def main() -> None:
         help=(
             "Root directory for all output files (anno_blur/, anno_sharp/, "
             "anno_skipped/, blurry.csv, blur.lst, run.log).  "
-            "Defaults to output/<timestamp>-<input_name>/."
+            "Defaults to albums/<timestamp>-<input_name>/."
         ),
     )
     parser.add_argument(
@@ -1674,9 +1682,37 @@ def main() -> None:
         action="store_true",
         help=(
             "Compute a simple auto-exposure (brightness) correction per image, "
-            "shown in the annotated previews and written to results.json for "
-            "2_apply_changes.py to apply. Off by default."
+            "shown in the annotated previews and written to album.json. "
+            "Off by default."
         ),
+    )
+    parser.add_argument(
+        "--openaikey",
+        default=None,
+        metavar="KEY",
+        help=(
+            "OpenAI API key for LLM-assisted burst culling (falls back to the "
+            "OPENAI_API_KEY environment variable). When a key is available "
+            "(from either source), the LLM culling stage runs automatically "
+            "after face recognition — use --skip-llm-cull to opt out."
+        ),
+    )
+    parser.add_argument(
+        "--team-id",
+        default=None,
+        metavar="ID",
+        help="Id of the team (from team.json) this album was processed for. Stored in album.json.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="gpt-4o-mini",
+        metavar="MODEL",
+        help="OpenAI model used for LLM-assisted burst culling (default: gpt-4o-mini).",
+    )
+    parser.add_argument(
+        "--skip-llm-cull",
+        action="store_true",
+        help="Skip LLM-assisted burst culling even when an OpenAI API key is available.",
     )
     args = parser.parse_args()
 
@@ -1721,7 +1757,7 @@ def main() -> None:
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_root = Path(args.output).resolve() if args.output else None
-    output_dir  = output_root if output_root is not None else Path("output") / f"{ts}-{input_path.stem}"
+    output_dir  = output_root if output_root is not None else Path("albums") / f"{ts}-{input_path.stem}"
     output_dir.mkdir(parents=True, exist_ok=True)
     _add_file_logging(output_dir / "run.log")
     log.debug("Output directory: %s", output_dir.resolve())
@@ -1737,7 +1773,7 @@ def main() -> None:
     else:
         from algo.mediapipe_provider import load_face_landmarker, load_pose_landmarker
         from algo.torchvision_provider import load_person_detector
-        person_detector = load_person_detector()
+        person_detector = load_person_detector(force_cpu=args.cpu_only)
         pose_landmarker = load_pose_landmarker(num_poses=1)
         face_landmarker = load_face_landmarker(num_faces=1)
         analysis_stage = MediaPipeImageAnalysisStage(input_path, person_detector, pose_landmarker, face_landmarker)
@@ -1758,7 +1794,7 @@ def main() -> None:
         frames = stage.process(frames, app_config)
 
     our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
-    write_results_json(frames, output_dir / "results.json", our_jersey_color=our_jersey_color)
+    write_results_json(frames, output_dir / "album.json", our_jersey_color=our_jersey_color, team_id=args.team_id)
 
     if frames:
         write_csv(frames, output_dir / "blurry.csv")
@@ -1800,8 +1836,19 @@ def main() -> None:
             if not args.no_tag_ui:
                 _launch_face_tag_ui(output_dir)
 
+    openai_api_key = args.openaikey or os.environ.get("OPENAI_API_KEY")
+    if frames and not args.skip_llm_cull and openai_api_key:
+        try:
+            from algo.llm.culling_provider import OpenAIProvider
+            provider = OpenAIProvider(api_key=openai_api_key, model=args.llm_model)
+            LLMCullingStage(output_dir, provider=provider).process(frames, app_config)
+        except Exception as exc:
+            log.error("LLM-assisted burst culling failed: %s", exc, exc_info=True)
+    elif frames and not openai_api_key:
+        log.info("LLM-assisted burst culling skipped: no OpenAI API key (--openaikey or OPENAI_API_KEY).")
+
     if frames:
-        log.info("When done, run:  python 2_apply_changes.py \"%s\"", output_dir)
+        log.info("When done, run:  python culling_app.py")
 
 
 if __name__ == "__main__":

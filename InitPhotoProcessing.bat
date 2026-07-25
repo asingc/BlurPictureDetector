@@ -23,7 +23,7 @@ setlocal EnableDelayedExpansion
 ::      PyTorch if found, otherwise CPU-only PyTorch.
 ::   5. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
 ::      (no git required) and updates the local app folder in place (existing
-::      output\ and other local-only data are never deleted).
+::      albums\ and other local-only data are never deleted).
 ::   6. Installs dlib via conda-forge (prebuilt Windows binary - no C++
 ::      compiler / CMake needed) - GPU-accelerated build + cudnn when an
 ::      NVIDIA GPU was detected, otherwise the CPU build - then the rest of
@@ -213,7 +213,7 @@ if not exist "%EXTRACTED_SRC%" (
 )
 
 if not exist "%APP_DIR%" mkdir "%APP_DIR%"
-echo       Updating "%APP_DIR%" ^(existing output\ and local data are preserved^)...
+echo       Updating "%APP_DIR%" ^(existing albums\ and local data are preserved^)...
 robocopy "%EXTRACTED_SRC%" "%APP_DIR%" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
 if errorlevel 8 (
     echo ERROR: robocopy failed to update the application folder.

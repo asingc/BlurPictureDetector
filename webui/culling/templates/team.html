@@ -4,13 +4,29 @@
 <h2>Team Setup</h2>
 
 <div class="panel">
+  <h3>Teams</h3>
+  <div id="teamPicker" class="team-picker"></div>
+</div>
+
+<div class="panel">
+  <h3>Team Name</h3>
+  <input type="text" id="teamNameInput" placeholder="e.g. U10 Sharks" style="min-width:280px" />
+</div>
+
+<div class="panel">
   <h3>Jersey Colors</h3>
-  <p class="muted">Colors your team wears. Mark a color as "Special/Goalie" to always include it (e.g. a goalie's different kit).</p>
+  <p class="muted">Colors your team wears.</p>
   <div id="jerseyList" class="tag-list"></div>
   <div class="row">
-    <input type="text" id="jerseyColorInput" placeholder="e.g. Blue" />
-    <label class="inline-check"><input type="checkbox" id="jerseyForcedInput" /> Special/Goalie</label>
+    <input type="text" id="jerseyColorInput" placeholder="Team Jersey, e.g. Blue" />
     <button id="addJerseyBtn" class="btn">Add</button>
+  </div>
+  <div class="row">
+    <label class="inline-check"><input type="checkbox" id="hasGoalkeeperInput" /> My team has a goalkeeper/player in different jersey color</label>
+  </div>
+  <div class="row" id="goalkeeperJerseyRow" style="display:none">
+    <input type="text" id="goalkeeperJerseyInput" placeholder="Goal Keeper/Special Jersey, e.g. Neon Green" />
+    <button id="addGoalkeeperJerseyBtn" class="btn">Add</button>
   </div>
 </div>
 
@@ -40,9 +56,9 @@ Sam Rivera"></textarea>
 
 <div class="row actions">
   <span id="teamSaveStatus" class="muted"></span>
-  <button id="saveTeamBtn" class="btn btn-primary">Save &amp; Continue</button>
+  <button id="saveTeamBtn" class="btn btn-primary">Save</button>
 </div>
 {% endblock %}
 {% block extra_scripts %}
-<script src="/static/js/team.js"></script>
+<script src="{{ static_url('js/team.js') }}"></script>
 {% endblock %}

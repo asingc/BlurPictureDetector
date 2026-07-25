@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Photo Culling{% endblock %}</title>
   <link rel="stylesheet" href="https://code.jquery.com/ui/1.13.2/themes/base/jquery-ui.css" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="{{ static_url('style.css') }}" />
   {% block extra_head %}{% endblock %}
 </head>
 <body class="page-{{ active_step }}">
@@ -15,7 +15,7 @@
       <h1 id="title">Photo Culling</h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Review"), ("cluster", "Faces"), ("apply", "Apply")] %}
+      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Culling"), ("cluster", "Faces"), ("apply", "Apply")] %}
       {% for key, label in step_labels %}
       <a class="step {{ 'active' if active_step == key else '' }}" href="/{{ key }}">
         <span class="step-index">{{ loop.index }}</span>
@@ -31,7 +31,8 @@
 
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://code.jquery.com/ui/1.13.2/jquery-ui.min.js"></script>
-  <script src="/static/js/common.js"></script>
+  <script src="{{ static_url('js/common.js') }}"></script>
+  <script src="{{ static_url('js/viewport.js') }}"></script>
   {% block extra_scripts %}{% endblock %}
 </body>
 </html>

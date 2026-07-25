@@ -29,17 +29,26 @@ log = logging.getLogger("BlurPictureDetector")
 _COCO_PERSON_LABEL = 1
 
 _PERSON_DETECTOR = None
+_PERSON_DETECTOR_DEVICE: str | None = None
 _PERSON_DETECTOR_LOCK = threading.Lock()
 
 
-def load_person_detector():
+def load_person_detector(force_cpu: bool = False):
     """Return the process-wide torchvision person-detector singleton
-    (Faster R-CNN ResNet50-FPN-v2, COCO-pretrained, CPU, eval mode)."""
-    global _PERSON_DETECTOR
-    if _PERSON_DETECTOR is not None:
+    (Faster R-CNN ResNet50-FPN-v2, COCO-pretrained, eval mode).
+
+    Runs on CUDA automatically when available (much faster than CPU for this
+    model — see /memories/repo/python-notes.md), falling back to CPU
+    otherwise. Pass ``force_cpu=True`` (e.g. from ``--cpu-only``) to pin it to
+    CPU regardless of GPU availability. Re-loaded (and moved) if a different
+    device is requested than the cached singleton's.
+    """
+    global _PERSON_DETECTOR, _PERSON_DETECTOR_DEVICE
+    requested_device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    if _PERSON_DETECTOR is not None and _PERSON_DETECTOR_DEVICE == requested_device:
         return _PERSON_DETECTOR
     with _PERSON_DETECTOR_LOCK:
-        if _PERSON_DETECTOR is not None:
+        if _PERSON_DETECTOR is not None and _PERSON_DETECTOR_DEVICE == requested_device:
             return _PERSON_DETECTOR
         from torchvision.models.detection import (
             fasterrcnn_resnet50_fpn_v2,
@@ -50,8 +59,13 @@ def load_person_detector():
             box_score_thresh=0.5,
         )
         model.eval()
+        model.to(requested_device)
         _PERSON_DETECTOR = model
-        log.info("Torchvision Faster R-CNN (ResNet50-FPN-v2) person detector loaded")
+        _PERSON_DETECTOR_DEVICE = requested_device
+        log.info(
+            "Torchvision Faster R-CNN (ResNet50-FPN-v2) person detector loaded on %s",
+            requested_device,
+        )
     return _PERSON_DETECTOR
 
 
@@ -60,7 +74,8 @@ def extract_person_boxes_tv(image: np.ndarray, model, max_bodies: int = 8) -> li
     normalised to [0, 1] fractions of *image*'s width/height."""
     h, w = image.shape[:2]
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float() / 255.0
+    device = next(model.parameters()).device
+    tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float().to(device) / 255.0
 
     with torch.no_grad():
         result = model([tensor])[0]

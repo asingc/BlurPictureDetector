@@ -2,8 +2,50 @@
 {% block title %}Apply Changes — Photo Culling{% endblock %}
 {% block content %}
 <h2>Apply Changes</h2>
-<p class="muted">Coming soon — progress while files are moved and face-reco info is written.</p>
+
+<div class="panel" id="summaryPanel">
+  <h3 id="summaryAlbumName">Album</h3>
+  <div class="stat-grid" id="summaryStats">
+    <div class="stat"><span class="stat-value" id="statKept">–</span><span class="stat-label">Images kept</span></div>
+    <div class="stat"><span class="stat-value" id="statDropped">–</span><span class="stat-label">Images dropped</span></div>
+    <div class="stat"><span class="stat-value" id="statFaces">–</span><span class="stat-label">Faces detected</span></div>
+    <div class="stat"><span class="stat-value" id="statPlayers">–</span><span class="stat-label">Players detected</span></div>
+  </div>
+</div>
+
+<div class="panel" id="exportPanel">
+  <h3>Export</h3>
+  <p class="muted">
+    Syncs every tagged player's face crops (from kept photos) into the
+    system-wide <code>.FaceReco</code> database and rebuilds its embeddings,
+    then copies all kept photos to a destination folder of your choice
+    along with a <code>players.csv</code> tagging file.
+  </p>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="exportFaceTaggingInput" checked />
+      Export face tagging
+    </label>
+  </div>
+
+  <div id="exportOutputSection" style="display:none">
+    <h3 style="margin-top:24px">Export Progress</h3>
+    <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
+  </div>
+
+  <div class="row actions">
+    <span id="exportStatus" class="muted"></span>
+    <button id="exportBtn" class="btn btn-primary btn-icon-text" title="Choose destination &amp; export">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="17 8 12 3 7 8"></polyline>
+        <line x1="12" y1="3" x2="12" y2="15"></line>
+      </svg>
+      <span>Export</span>
+    </button>
+  </div>
+</div>
 {% endblock %}
 {% block extra_scripts %}
-<script src="/static/js/apply.js"></script>
+<script src="{{ static_url('js/apply.js') }}"></script>
 {% endblock %}
