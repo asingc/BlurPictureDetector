@@ -48,6 +48,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
+from algo.utils import atomic_save_and_backup
+
 try:
     from PIL import Image as _PILImage
     from PIL import ExifTags as _PILExifTags
@@ -64,7 +66,11 @@ TEAM_JSON_PATH = REPO_ROOT / "team.json"
 STATE_JSON_PATH = REPO_ROOT / ".culling_state.json"
 OUTPUT_DIR = REPO_ROOT / "albums"
 
-SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.35, "medium": 0.50, "high": 0.70}
+# "high" recalibrated 2026-07-27 (0.70 -> 0.68) alongside the production
+# sharpness-evaluator swap to WeightedGeometricMeanEvaluator (algo/sharpness.py)
+# so "high" sensitivity keeps the same recall (~0.63) the old evaluator
+# achieved at its old 0.70 threshold — see _setup_tmp/sharpness_eval/calibrate_high_threshold.py.
+SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.35, "medium": 0.50, "high": 0.68}
 
 # Folder-name candidates for a face-DB dir, mirroring 1_prep_review.py / face_tag_ui.py.
 FACE_DB_DIR_CANDIDATES: tuple[str, ...] = (".FaceReco", ".facereco", ".Facereco")
@@ -120,6 +126,11 @@ class StartProcessingRequest(BaseModel):
 
 class BrowseFolderRequest(BaseModel):
     title: str = "Select photo folder to import"
+    # "import" seeds the dialog from the *parent* of the last-used import
+    # source folder; "export" seeds it from the *parent* of the last export
+    # destination — either way, picking a sibling folder for the next
+    # album is one click.
+    context: str = "import"
 
 
 class ExportRequest(BaseModel):
@@ -177,6 +188,7 @@ class ExportState:
         self.copied_images = 0
         self.total_players = 0
         self.processed_players = 0
+        self.dest_dir: Optional[str] = None
 
 
 export_state = ExportState()
@@ -206,10 +218,31 @@ def _heartbeat_watchdog() -> None:
     heartbeat before the watchdog can fire.
     """
     poll_interval = max(1.0, min(5.0, heartbeat_state.timeout / 3))
+    last_poll = time.time()
     while True:
         time.sleep(poll_interval)
+        now = time.time()
+        poll_gap = now - last_poll
+        last_poll = now
+        if poll_gap > poll_interval * 3:
+            # This watchdog thread itself missed multiple polls — wall-clock
+            # time jumped far more than a sleeping thread should ever drift.
+            # That only happens if the whole machine (this server process
+            # included) was suspended, not just the browser tab/window being
+            # closed — a closed tab doesn't affect our own thread's timing at
+            # all. Since the browser suspends/resumes together with us on the
+            # same machine, forgive this cycle instead of shutting down: it
+            # will send a fresh heartbeat shortly after waking anyway.
+            log.info(
+                "Watchdog poll delayed %.0fs (expected ~%.0fs) — system likely "
+                "resumed from sleep; resetting heartbeat timer instead of exiting.",
+                poll_gap, poll_interval,
+            )
+            with heartbeat_state.lock:
+                heartbeat_state.last_heartbeat = now
+            continue
         with heartbeat_state.lock:
-            elapsed = time.time() - heartbeat_state.last_heartbeat
+            elapsed = now - heartbeat_state.last_heartbeat
         if elapsed > heartbeat_state.timeout:
             log.info(
                 "No heartbeat received for %.0fs (timeout %.0fs) — shutting down.",
@@ -427,6 +460,19 @@ def _is_album_complete(path: Path) -> bool:
 PREVIEW_IMAGE_SAMPLE = 8
 
 
+# Matches the "<yyyymmdd-hhmmss>-" prefix _run_processing() stamps onto every
+# output folder name (see `output_dir = OUTPUT_DIR / f"{ts}-{folder_stem}"`).
+_ALBUM_DIR_TIMESTAMP_PREFIX_RE = re.compile(r"^\d{8}-\d{6}-")
+
+
+def _album_display_name(dir_name: str) -> str:
+    """Human-friendly album name for UI display: the directory name with its
+    leading run-timestamp prefix stripped (that timestamp is already shown
+    separately as `createdDisplay`). Falls back to the full directory name
+    if it doesn't match the expected `1_prep_review.py` naming scheme."""
+    return _ALBUM_DIR_TIMESTAMP_PREFIX_RE.sub("", dir_name) or dir_name
+
+
 def _format_created(timestamp: str) -> str:
     """"20260719-030759" -> "Jul 19, 2026 03:07 AM"; falls back to the raw
     string (or "") if it doesn't match the expected 1_prep_review.py format."""
@@ -441,6 +487,7 @@ def _format_created(timestamp: str) -> str:
 def _read_album_summary(path: Path) -> dict:
     summary: dict = {
         "name": path.name,  # also serves as the album's id — never the absolute path
+        "displayName": _album_display_name(path.name),  # human-friendly, for UI display only
         "srcDir": "",
         "timestamp": "",
         "createdDisplay": "",
@@ -462,8 +509,14 @@ def _read_album_summary(path: Path) -> dict:
         summary["sharpCount"] = len(sharp)
         summary["blurCount"] = len(info.get("Anno_Blur", []))
         summary["skippedCount"] = len(info.get("Anno_Skipped", []))
-        sharp_files = [item.get("anno") for item in sharp if item.get("anno")]
-        summary["previewImages"] = random.sample(sharp_files, min(len(sharp_files), PREVIEW_IMAGE_SAMPLE))
+        results_by_name = _results_by_filename(_load_results_payload(path))
+        sharp_previews = []
+        for item in sharp:
+            result = results_by_name.get(item.get("src"))
+            preview_path = result.get("preview_path") if result else None
+            if preview_path:
+                sharp_previews.append(Path(preview_path).name)
+        summary["previewImages"] = random.sample(sharp_previews, min(len(sharp_previews), PREVIEW_IMAGE_SAMPLE))
     except (json.JSONDecodeError, OSError):
         pass
     return summary
@@ -523,7 +576,9 @@ def _current_album_path() -> Path:
 # --------------------------------------------------------------------------- #
 REVIEW_CATEGORIES = ("blur", "sharp", "skipped")
 _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
-_REVIEW_ANNO_SUBDIR = {"blur": "anno_blur", "sharp": "anno_sharp", "skipped": "anno_skipped"}
+# All annotated previews (blur/sharp/skipped alike) live in one shared folder
+# — see algo/stages/annotation.py::AnnotationStage.
+_PREVIEWS_SUBDIR = "previews"
 # Effective "keep" when album.json has no explicit value yet (older albums,
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
@@ -565,19 +620,6 @@ def _image_timestamp(path: Path) -> float:
         return 0.0
 
 
-def _write_json_atomic(path: Path, payload: dict) -> None:
-    """Write JSON to a temp file beside `path`, then atomically swap it into
-    place via os.replace() (an atomic rename on both Windows and POSIX) — a
-    crash or interruption mid-write can never leave `path` half-written or
-    corrupted; readers only ever see the fully-old or fully-new file."""
-    tmp_path = path.with_name(path.name + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_path, path)
-
-
 def _load_results_payload(album_path: Path) -> dict:
     with open(album_path / "album.json", encoding="utf-8") as fh:
         return json.load(fh)
@@ -595,23 +637,29 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
     src_dir = Path(info.get("SrcDir", ""))
     results_by_name = _results_by_filename(_load_results_payload(album_path))
     default_keep = _REVIEW_DEFAULT_KEEP[category]
-    anno_subdir = album_path / _REVIEW_ANNO_SUBDIR[category]
+    previews_dir = album_path / _PREVIEWS_SUBDIR
 
     images = []
     for item in info.get(_REVIEW_INFO_KEY[category], []):
-        src_name, anno_name = item.get("src"), item.get("anno")
-        if not src_name or not anno_name:
+        src_name = item.get("src")
+        if not src_name:
             continue
         result = results_by_name.get(src_name)
+        preview_path = result.get("preview_path") if result else None
+        if not preview_path:
+            continue
+        anno_name = Path(preview_path).name
         keep = bool(result.get("keep", default_keep)) if result else default_keep
         burst_ranking = result.get("burst_ranking") if result else None
+        llm_grade = result.get("llm_grade") if result else None
         src_path = src_dir / src_name
-        ts_path = src_path if src_path.is_file() else anno_subdir / anno_name
+        ts_path = src_path if src_path.is_file() else previews_dir / anno_name
         images.append({
             "file": src_name,
             "anno": anno_name,
             "keep": keep,
             "burstRanking": burst_ranking,
+            "llmGrade": llm_grade,
             "timestamp": _image_timestamp(ts_path),
         })
     return images
@@ -881,8 +929,7 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
                     changed = True
 
     if changed:
-        with open(results_fp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
+        atomic_save_and_backup(json.dumps(data, indent=2), results_fp)
 
 
 def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> dict:
@@ -1100,11 +1147,24 @@ def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
     return processed
 
 
+def _open_in_file_explorer(path: Path) -> None:
+    """Open *path* in the OS's native file explorer. Only meaningful when the
+    server and browser run on the same machine (see api_browse_folder's
+    docstring for the same assumption)."""
+    if sys.platform == "win32":
+        os.startfile(str(path))  # noqa: S606 — local-machine convenience only
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
 def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool) -> None:
     try:
         kept = _kept_image_basenames(album_path)
         with export_state.lock:
             export_state.total_images = len(kept)
+            export_state.dest_dir = str(dest_dir)
 
         _export_log("Step 1/3: syncing tagged face crops into system face database (./FaceReco)...")
         _sync_named_clusters_to_system_db(album_path, kept)
@@ -1143,6 +1203,9 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool) -> 
         _export_log("Export complete.")
         with export_state.lock:
             export_state.done = True
+        state = _load_state()
+        state["lastExportPath"] = str(dest_dir.resolve())
+        _save_state(state)
     except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
         log.exception("[Export] failed")
         with export_state.lock:
@@ -1249,7 +1312,7 @@ def api_select_album(req: AlbumSelectRequest) -> dict:
 @app.get("/api/albums/thumb")
 def api_album_thumb(id: str = Query(...), file: str = Query(...)) -> FileResponse:
     album_path = _album_dir_by_id(id)
-    fp = album_path / "anno_sharp" / _safe_component(file)
+    fp = album_path / _PREVIEWS_SUBDIR / _safe_component(file)
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
@@ -1298,7 +1361,7 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
         "category": category,
         "groups": [
             {"images": [
-                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "burstRanking": im["burstRanking"]}
+                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
                 for im in group
             ]}
             for group in groups
@@ -1311,7 +1374,7 @@ def api_review_thumb(category: str = Query(...), file: str = Query(...)) -> File
     if category not in REVIEW_CATEGORIES:
         raise HTTPException(status_code=400, detail="Invalid category")
     album_path = _current_album_path()
-    fp = album_path / _REVIEW_ANNO_SUBDIR[category] / _safe_component(file)
+    fp = album_path / _PREVIEWS_SUBDIR / _safe_component(file)
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
@@ -1324,8 +1387,8 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
     explicit "keep" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
     so album.json becomes fully self-describing going forward. Written
-    atomically (temp file + os.replace) so a crash mid-write can never
-    corrupt album.json."""
+    atomically (temp file + os.replace, with the previous contents backed
+    up) so a crash mid-write can never corrupt album.json."""
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
@@ -1342,7 +1405,7 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
             current = bool(result.get("keep", default_keep))
             result["keep"] = bool(req.overrides.get(src_name, current))
 
-    _write_json_atomic(album_path / "album.json", payload)
+    atomic_save_and_backup(json.dumps(payload, indent=2), album_path / "album.json")
     log.info("Review changes applied: %s (%d overrides)", album_path.resolve(), len(req.overrides))
     return {"ok": True}
 
@@ -1382,8 +1445,13 @@ def api_browse_folder(req: BrowseFolderRequest = BrowseFolderRequest()) -> dict:
     pattern). Returns {"path": null} if the user cancels.
     """
     state = _load_state()
-    initial_dir = state.get("lastImportPath") or str(Path.home())
-    if not Path(initial_dir).is_dir():
+    if req.context == "export":
+        last_export = state.get("lastExportPath", "")
+        initial_dir = str(Path(last_export).parent) if last_export else ""
+    else:
+        last_import = state.get("lastImportPath", "")
+        initial_dir = str(Path(last_import).parent) if last_import else ""
+    if not initial_dir or not Path(initial_dir).is_dir():
         initial_dir = str(Path.home())
 
     result: dict[str, Optional[str]] = {"path": None}
@@ -1551,7 +1619,20 @@ def api_export_status(since: int = 0) -> dict:
             "copiedImages": export_state.copied_images,
             "totalPlayers": export_state.total_players,
             "processedPlayers": export_state.processed_players,
+            "destDir": export_state.dest_dir,
         }
+
+
+@app.post("/api/apply/open-destination")
+def api_open_export_destination() -> dict:
+    """Open the just-exported destination folder in the OS's native file
+    explorer (Windows Explorer / macOS Finder / Linux file manager)."""
+    with export_state.lock:
+        dest_dir = export_state.dest_dir
+    if not dest_dir or not Path(dest_dir).is_dir():
+        raise HTTPException(status_code=400, detail="Destination folder not found.")
+    _open_in_file_explorer(Path(dest_dir))
+    return {"ok": True}
 
 
 if (WEBUI_DIR / "static").is_dir():

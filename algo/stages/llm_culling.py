@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 from pathlib import Path
 
 import cv2
@@ -12,7 +13,7 @@ from algo.frame import Frame
 from algo.llm.culling_provider import BurstFrameInput, BurstRankingResult, CullingProvider
 from algo.stage import ProcessStage
 from algo.stages.image_analysis import _read_image
-from algo.utils import cap_long_edge, image_capture_timestamp
+from algo.utils import atomic_save_and_backup, cap_long_edge, image_capture_timestamp
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -36,6 +37,11 @@ DEFAULT_SINGLETON_BATCH_SIZE = 6
 # first. Every standalone image keeps its llm_grade regardless of whether it
 # lands in the kept fraction, so the score stays visible for manual review.
 DEFAULT_SINGLETON_KEEP_FRACTION = 0.6
+
+# Star-rating thresholds (fraction of all LLM-graded sharp frames, by
+# llm_grade, highest first) — see _assign_star_ratings.
+STAR_4_TOP_FRACTION = 0.4
+STAR_5_TOP_FRACTION = 0.1
 
 
 def _sorted_sharp_entries(payload: dict) -> list[dict]:
@@ -161,6 +167,8 @@ class LLMCullingStage(ProcessStage):
         # out in parallel instead of waiting on each burst serially.
         prepared: list[tuple[str, list[dict]]] = []
         burst_inputs_batch: list[list[BurstFrameInput]] = []
+        if qualifying:
+            log.info("[LLMCullingStage] preparing %d qualifying burst(s) for ranking …", len(qualifying))
         for idx, burst in enumerate(qualifying):
             group_id = f"burst-{idx:04d}"
             burst_inputs = [
@@ -174,8 +182,10 @@ class LLMCullingStage(ProcessStage):
                 continue
             prepared.append((group_id, burst))
             burst_inputs_batch.append(burst_inputs)
+            log.debug("[LLMCullingStage] prepared %d/%d burst(s)", idx + 1, len(qualifying))
 
         if prepared:
+            log.info("[LLMCullingStage] sending %d burst(s) to LLM provider for ranking …", len(prepared))
             try:
                 all_rankings = self.provider.rank_bursts(burst_inputs_batch)
             except Exception as exc:  # noqa: BLE001 — a batch failure must not abort the whole run
@@ -183,10 +193,14 @@ class LLMCullingStage(ProcessStage):
                 all_rankings = [BurstRankingResult(rankings=[], grades={}, caption="") for _ in prepared]
             for (group_id, burst), result in zip(prepared, all_rankings):
                 self._apply_rankings(burst, group_id, result)
+            log.info("[LLMCullingStage] burst ranking complete: %d burst(s) processed", len(prepared))
 
         standalone_entries = [e for b in bursts if len(b) < self.min_group_size for e in b]
         if standalone_entries:
+            log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_entries))
             self._grade_standalone_entries(standalone_entries)
+
+        self._assign_star_ratings(sharp_entries)
 
         for entry in sharp_entries:
             entry.pop("_timestamp", None)
@@ -205,11 +219,54 @@ class LLMCullingStage(ProcessStage):
             cost_summary.total_output_tokens, cost_summary.total_cost_usd,
         )
 
-        with open(results_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
+        atomic_save_and_backup(json.dumps(payload, indent=2), results_path)
         log.info("[LLMCullingStage] album.json updated: %s", results_path)
 
         return frames
+
+    def _assign_star_ratings(self, sharp_entries: list[dict]) -> None:
+        """Assign a 3-5 star rating to every sharp entry.
+
+        Baseline: every sharp frame (it already qualified as "sharp") gets
+        3 stars. Frames land in higher tiers by ``llm_grade`` percentile,
+        measured across every sharp frame that received a grade (whether
+        ranked as part of a burst or graded standalone) — the top
+        ``STAR_4_TOP_FRACTION`` get 4 stars, the top ``STAR_5_TOP_FRACTION``
+        get 5 stars.
+
+        Burst ranking then applies a *floor* on top of that: a burst's #1
+        pick is always at least 5 stars and its #2/#3 picks are always at
+        least 4 stars, regardless of where their llm_grade falls in the
+        global percentile (it can never be lowered by this step — only
+        raised).
+        """
+        for entry in sharp_entries:
+            entry["stars"] = 3
+
+        graded = [e for e in sharp_entries if e.get("llm_grade") is not None]
+        graded.sort(key=lambda e: e["llm_grade"], reverse=True)
+        top_4_count = math.ceil(len(graded) * STAR_4_TOP_FRACTION)
+        top_5_count = math.ceil(len(graded) * STAR_5_TOP_FRACTION)
+        for entry in graded[:top_4_count]:
+            entry["stars"] = 4
+        for entry in graded[:top_5_count]:
+            entry["stars"] = 5
+
+        for entry in sharp_entries:
+            rank = (entry.get("burst_ranking") or {}).get("rank")
+            if rank == 1:
+                entry["stars"] = max(entry["stars"], 5)
+            elif rank in (2, 3):
+                entry["stars"] = max(entry["stars"], 4)
+
+        log.info(
+            "[LLMCullingStage] star ratings: %d sharp frame(s) — %d x5\u2605, %d x4\u2605, %d x3\u2605 (%d graded)",
+            len(sharp_entries),
+            sum(1 for e in sharp_entries if e["stars"] == 5),
+            sum(1 for e in sharp_entries if e["stars"] == 4),
+            sum(1 for e in sharp_entries if e["stars"] == 3),
+            len(graded),
+        )
 
     def _apply_rankings(self, burst: list[dict], group_id: str, result: BurstRankingResult) -> None:
         rank_by_file = {r.file: r for r in result.rankings}
@@ -261,10 +318,18 @@ class LLMCullingStage(ProcessStage):
                 continue
             batches.append(inputs)
             by_name_per_batch.append({Path(e["file"]).name: e for e in chunk})
+            log.debug(
+                "[LLMCullingStage] standalone: prepared batch %d (%d image(s))",
+                len(batches), len(inputs),
+            )
 
         if not batches:
             return
 
+        log.info(
+            "[LLMCullingStage] sending %d standalone batch(es) (%d image(s)) to LLM provider for grading …",
+            len(batches), len(entries),
+        )
         try:
             grade_results = self.provider.grade_image_batches(batches)
         except Exception as exc:  # noqa: BLE001 — a batch failure must not abort the whole run

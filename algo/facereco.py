@@ -21,7 +21,7 @@ log = logging.getLogger("BlurPictureDetector")
 class FaceRecoConfig:
     # Cosine similarity floor for two faces to be placed in the same cluster.
     # Higher = tighter clusters (fewer faces per cluster, more clusters overall).
-    cluster_similarity_threshold: float = 0.68
+    cluster_similarity_threshold: float = 0.65
     face_buffer_ratio: float = 0.15
     output_dir_name: str = ".FaceReco"
     # When True, each face crop is similarity-aligned to a canonical 5-point
@@ -80,6 +80,14 @@ class FaceRecoConfig:
     # refinement pass (see algo/face_crop_embed.py:load_face_model).
     # "mediapipe" (default, Apache-2.0) or "yolo" (legacy, AGPL-3.0/GPL-3.0).
     engine: str = "mediapipe"
+    # The album's overall blur-sensitivity threshold (see GradingStage /
+    # FaceSharpnessScorer) -- a body already had to score > this value to be
+    # marked "sharp" for review purposes. Face-crop qualification uses
+    # min(sensitivity_threshold, 0.5) instead of this value directly (see
+    # FaceRecoPipeline._collect_qualified_bodies) so a strict album setting
+    # (e.g. "high") doesn't also start discarding faces that are perfectly
+    # recognizable but merely a bit softer than that stricter overall bar.
+    sensitivity_threshold: float = 0.5
 @dataclass
 class FaceSample:
     body: BodyRecord
@@ -628,7 +636,11 @@ class FaceRecoPipeline:
         qualified: list[_QualifiedBody] = []
         total_results = len(payload.get("results", []))
         total_bodies = skipped_blurry = skipped_no_ann = 0
-        log.debug("FaceReco [collect]: scanning %d result entries", total_results)
+        # Capped at 0.5 regardless of how strict the album's own sensitivity
+        # setting is -- see FaceRecoConfig.sensitivity_threshold.
+        min_face_sharpness = min(self.config.sensitivity_threshold, 0.5)
+        log.debug("FaceReco [collect]: scanning %d result entries  (min_face_sharpness=%.3f)",
+                  total_results, min_face_sharpness)
         for result in payload.get("results", []):
             image_path = Path(result.get("file", ""))
             ann = result.get("annotation_data")
@@ -640,14 +652,13 @@ class FaceRecoPipeline:
             log.debug("FaceReco [collect]: %s — %d evaluated body/bodies", image_path.name, len(evaluated))
             for idx, body_data in enumerate(evaluated):
                 total_bodies += 1
-                is_blurry = body_data.get("is_blurry", True)
                 sharpness = body_data.get("sharpness_score", 0.0)
                 cloth = body_data.get("cloth_color", "N/A")
-                if is_blurry:
+                if sharpness <= min_face_sharpness:
                     skipped_blurry += 1
                     log.debug(
-                        "FaceReco [collect]: %s body#%d  score=%.3f  color=%s  → SKIP (blurry)",
-                        image_path.name, idx, sharpness, cloth,
+                        "FaceReco [collect]: %s body#%d  score=%.3f  color=%s  → SKIP (<= min_face_sharpness %.3f)",
+                        image_path.name, idx, sharpness, cloth, min_face_sharpness,
                     )
                     continue
                 log.debug(

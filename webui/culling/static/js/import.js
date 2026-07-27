@@ -34,7 +34,7 @@ function buildPolaroidCard(album) {
 
   if (urls.length) {
     const startUrl = urls[Math.floor(Math.random() * urls.length)];
-    const img = $("<img>", { src: startUrl, alt: album.name });
+    const img = $("<img>", { src: startUrl, alt: album.displayName || album.name });
     img.data("original", startUrl);
     img.data("urls", urls);
     photo.append(img);
@@ -51,7 +51,7 @@ function buildPolaroidCard(album) {
   photo.append(deleteBtn);
 
   const caption = $("<div>", { class: "polaroid-caption" });
-  caption.append($("<div>", { class: "polaroid-name" }).text(album.name));
+  caption.append($("<div>", { class: "polaroid-name" }).text(album.displayName || album.name));
   caption.append($("<div>", { class: "polaroid-date" }).text(album.createdDisplay || ""));
 
   card.append(photo, caption);
@@ -78,7 +78,7 @@ function buildPolaroidCard(album) {
 
   deleteBtn.on("click", async (e) => {
     e.stopPropagation();
-    if (!confirm(`Delete album "${album.name}"? This permanently removes its output folder and cannot be undone.`)) {
+    if (!confirm(`Delete album "${album.displayName || album.name}"? This permanently removes its output folder and cannot be undone.`)) {
       return;
     }
     deleteBtn.prop("disabled", true);

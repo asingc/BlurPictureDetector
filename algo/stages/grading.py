@@ -169,7 +169,14 @@ class GradingStage(ProcessStage):
             FaceSharpnessScorer(self.threshold),
         ])
 
-        for frame in frames:
+        total = len(frames)
+        log.info("[GradingStage] grading %d frame(s)", total)
+        progress_step = max(1, total // 20)
+        width = len(str(total))
+        passed_bodies = 0
+        total_bodies = 0
+
+        for idx, frame in enumerate(frames, 1):
             if frame.normalized_image is None:
                 continue
 
@@ -177,8 +184,10 @@ class GradingStage(ProcessStage):
                 frame.bodies = scorer.process(frame.normalized_image, frame.bodies)
 
                 for body in frame.bodies:
+                    total_bodies += 1
                     if not body.passed:
                         continue
+                    passed_bodies += 1
                     body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(
                         body, frame.normalized_image
                     )
@@ -195,4 +204,9 @@ class GradingStage(ProcessStage):
                     body.passed = False
                     body.rejection_reason = f"exception while grading: {exc}"
 
+            if idx % progress_step == 0 or idx == total:
+                log.info("[GradingStage] [%*d/%d] frame(s) graded", width, idx, total)
+
+        log.info("[GradingStage] done: %d/%d body(ies) passed across %d frame(s)",
+                 passed_bodies, total_bodies, total)
         return frames

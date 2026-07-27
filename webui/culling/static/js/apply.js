@@ -12,6 +12,14 @@ function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #exportBtn").prop("disabled", !enabled);
 }
 
+async function openExportDestination() {
+  try {
+    await apiPost("/api/apply/open-destination", {});
+  } catch (err) {
+    $("#exportStatus").text("Could not open folder: " + err.message);
+  }
+}
+
 function appendExportLines(lines) {
   if (!lines.length) return;
   const box = document.getElementById("exportOutput");
@@ -56,6 +64,10 @@ async function pollExportStatus() {
       $("#exportStatus").text("Export failed: " + data.error);
     } else {
       $("#exportStatus").text(`Done — ${data.copiedImages} photo(s) exported.`);
+      if (data.destDir) {
+        $("#openDestBtn").show();
+        openExportDestination();
+      }
     }
   }
 }
@@ -63,12 +75,15 @@ async function pollExportStatus() {
 $(function () {
   loadSummary();
 
+  $("#openDestBtn").on("click", openExportDestination);
+
   $("#exportBtn").on("click", async () => {
     setExportUIEnabled(false);
     $("#exportStatus").text("Choose a destination folder…");
+    $("#openDestBtn").hide();
     let res;
     try {
-      res = await apiPost("/api/browse-folder", { title: "Select export destination folder" });
+      res = await apiPost("/api/browse-folder", { title: "Select export destination folder", context: "export" });
     } catch (err) {
       $("#exportStatus").text("Browse failed: " + err.message);
       setExportUIEnabled(true);

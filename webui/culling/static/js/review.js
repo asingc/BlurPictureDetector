@@ -19,14 +19,6 @@ function previewImgs() {
   return $("#reviewPreview .review-preview-cell img");
 }
 
-// Locked "fit" viewport size for each currently displayed preview cell (in
-// px, matching the CSS border width below). Computed once per image from
-// its natural size vs. the cell's available space, then held fixed even as
-// the zoom level changes, so zooming clips/scales the image inside a
-// stationary frame instead of resizing the frame itself.
-const PREVIEW_VIEWPORT_BORDER = 4;
-let previewViewportLockers = [];
-
 // categoryData[category] = { groups: [{images:[{file,anno,keep}, ...]}, ...], activeGroup, activeImage }
 const categoryData = {};
 // Pending client-side overrides, shared across all 3 tabs: {filename: keep}
@@ -185,22 +177,28 @@ function zoomToActualSize() {
   previewZoomCtl.zoomToActual(previewImgs(), $img[0]);
 }
 
-// Size a preview cell's viewport to exactly wrap the image at "fit" scale
-// (i.e. the classic object-fit: contain box), based on its natural size vs.
-// the available space in the cell. Locked once here; unaffected by the
-// zoom level afterwards since zoom only transforms the <img> inside.
-function lockPreviewViewport($cell, $viewport, imgEl) {
-  const box = Viewport.computeContainFit(imgEl.naturalWidth, imgEl.naturalHeight, $cell.width(), $cell.height());
-  if (!box) return;
-  $viewport.css({
-    width: box.width + PREVIEW_VIEWPORT_BORDER * 2 + "px",
-    height: box.height + PREVIEW_VIEWPORT_BORDER * 2 + "px",
-  });
+// Give a preview viewport the image's intrinsic aspect ratio so pure CSS
+// (max-width/max-height: 100% of the cell, see .review-preview-viewport)
+// sizes it as an object-fit: contain box — no JS pixel measurement of the
+// cell involved, so there's no stale-measurement race with layout changes
+// elsewhere on the page (e.g. the rank-info bar showing/hiding) and no
+// need to re-measure on window resize; the browser keeps it correctly
+// fitted on every reflow automatically. Locked once here (rather than
+// left to the <img> itself) so overflow: hidden clips a zoomed/panned
+// image against a frame that doesn't itself resize as zoom changes.
+function applyPreviewAspectRatio($viewport, imgEl) {
+  if (!imgEl.naturalWidth || !imgEl.naturalHeight) return;
+  $viewport.css("aspect-ratio", imgEl.naturalWidth + " / " + imgEl.naturalHeight);
 }
 
-// Re-lock viewports if the window is resized (the "fit" box depends on
-// available space, unlike zoom which never resizes it).
-$(window).on("resize", () => previewViewportLockers.forEach((fn) => fn()));
+// Maps an LLM quality grade (0.0-1.0, higher = better composition/framing —
+// see algo/llm/prompts.py) to a CSS class controlling the badge color, so
+// low grades read as a warning and high grades read as a strong pick.
+function llmGradeClass(grade) {
+  if (grade >= 0.7) return "llm-grade-high";
+  if (grade >= 0.4) return "llm-grade-mid";
+  return "llm-grade-low";
+}
 
 function renderMain() {
   const data = categoryData[currentCategory];
@@ -212,6 +210,34 @@ function renderMain() {
   const group = data.groups[data.activeGroup];
   if (!group) return;
   const activeImage = group.images[data.activeImage];
+
+  // Populate/show the rank-info bar *before* building & measuring the
+  // preview cells below. #reviewRankInfo is a flex sibling of
+  // .review-preview inside .review-main (column flex) — showing it (or
+  // not) changes how much height .review-preview actually gets. If we
+  // measured/locked cell sizes first and toggled this bar afterwards,
+  // already-cached images (locked synchronously off the stale, taller
+  // pre-toggle layout) would end up locked to a viewport taller than the
+  // cell once the bar's real height kicks in.
+  let hasRankInfo = false;
+  if (activeImage.burstRanking) {
+    const rank = activeImage.burstRanking.rank;
+    $rankInfo.append($("<span>", { class: "rank-badge rank-" + rank }).text("#" + rank));
+    hasRankInfo = true;
+  }
+  if (typeof activeImage.llmGrade === "number") {
+    const pct = Math.round(activeImage.llmGrade * 100);
+    $rankInfo.append(
+      $("<span>", { class: "llm-grade-badge " + llmGradeClass(activeImage.llmGrade) })
+        .attr("title", "AI quality grade")
+        .text("AI " + pct + "%")
+    );
+    hasRankInfo = true;
+  }
+  if (activeImage.burstRanking) {
+    $rankInfo.append($("<span>", { class: "rank-reason" }).text(activeImage.burstRanking.reason || ""));
+  }
+  if (hasRankInfo) $rankInfo.show();
 
   const { start, end } = computeWindow(group.images.length, data.activeImage, previewCount);
   const cellEntries = [];
@@ -229,23 +255,14 @@ function renderMain() {
     }
     $cell.append($viewport);
     $preview.append($cell);
-    cellEntries.push({ $cell, $viewport, img: $img[0] });
+    cellEntries.push({ $viewport, img: $img[0] });
   }
-  previewViewportLockers = cellEntries.map(({ $cell, $viewport, img }) => () => lockPreviewViewport($cell, $viewport, img));
-  previewViewportLockers.forEach((lockFn, idx) => {
-    const img = cellEntries[idx].img;
-    if (img.complete) lockFn();
-    else $(img).on("load", lockFn);
+  cellEntries.forEach(({ $viewport, img }) => {
+    const apply = () => applyPreviewAspectRatio($viewport, img);
+    if (img.complete) apply();
+    else $(img).on("load", apply);
   });
   previewZoomCtl.apply(previewImgs());
-
-  if (activeImage.burstRanking) {
-    const rank = activeImage.burstRanking.rank;
-    $rankInfo
-      .append($("<span>", { class: "rank-badge rank-" + rank }).text("#" + rank))
-      .append($("<span>", { class: "rank-reason" }).text(activeImage.burstRanking.reason || ""))
-      .show();
-  }
 
   group.images.forEach((im, i) => {
     const $thumb = $("<div>", { class: "review-strip-thumb" }).toggleClass("active", i === data.activeImage);

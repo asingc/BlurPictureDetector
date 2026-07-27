@@ -702,9 +702,9 @@ body.page-review #content {
 .review-nav-row:hover { background: var(--surface-2); }
 .review-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
 .review-dot {
-  width: 4px;
-  height: 4px;
-  border-radius: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 4px;
   flex: 0 0 auto;
 }
 .review-dot.keep { background: #3a6fd8; }
@@ -732,19 +732,28 @@ body.page-review #content {
 .review-preview-cell {
   flex: 1 1 0;
   min-width: 0;
+  min-height: 0;
   height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
 }
-/* Locked "fit" viewport — sized once (in JS) to the image's zoom-to-fit
-   pixel box and kept fixed afterwards; only the <img> inside is scaled/
-   clipped when the user zooms in. */
+/* "Fit" viewport — sized purely via CSS: JS sets aspect-ratio to the
+   image's natural ratio (see applyPreviewAspectRatio in review.js), and
+   max-width/max-height: 100% (of this cell) does the rest, mimicking
+   object-fit: contain without ever needing to read the cell's pixel size.
+   This guarantees the viewport can never exceed the cell, no matter what
+   else on the page changes size (e.g. the rank-info bar toggling), and
+   needs no re-computation on window resize — the browser keeps it
+   correctly fitted on every reflow automatically. Only the <img> inside
+   is scaled/clipped when the user zooms in. */
 .review-preview-viewport {
   position: relative;
   overflow: hidden;
   border: 4px solid transparent;
   border-radius: 4px;
+  max-width: 100%;
+  max-height: 100%;
 }
 .review-preview-viewport.selected { border-color: navy; }
 .review-preview-viewport img {
@@ -821,6 +830,22 @@ body.page-review #content {
   font-size: 13px;
 }
 .review-rank-info .rank-reason { color: var(--muted); }
+
+/* LLM composition/framing quality grade (0.0-1.0, higher = better) — a
+   color-coded pill shown alongside the burst-ranking badge/reason. */
+.llm-grade-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 16px;
+  color: #fff;
+  white-space: nowrap;
+}
+.llm-grade-badge.llm-grade-high { background: #2e8b57; }
+.llm-grade-badge.llm-grade-mid { background: #b8860b; }
+.llm-grade-badge.llm-grade-low { background: #b33a3a; }
 
 .review-strip {
   flex: 0 0 auto;

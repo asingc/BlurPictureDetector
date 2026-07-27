@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gzip
+import os
+import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -18,6 +22,58 @@ except ImportError:  # Pillow not installed — EXIF timestamps just won't be av
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
 _HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+
+def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:
+    """Atomically overwrite `path` with `content`, gzip-backing-up whatever
+    was there before.
+
+    Sequence (each step below only starts once the previous one has fully
+    succeeded, so a crash/exception at any point never corrupts or loses the
+    existing file at `path`):
+
+    1. Write `content` to a temp file beside `path` (flushed + fsync'd).
+    2. If `path` already exists, atomically rename it aside (os.replace is an
+       atomic rename on both Windows and POSIX) — the original bytes are now
+       safely parked under a temp name, untouched.
+    3. Atomically rename the new temp file into place at `path` — the new
+       content is now live.
+    4. If there was a previous file, gzip-compress the parked-aside original
+       into ``<path.parent>/backup/<path.stem>_<yyyymmdd-hhmmss>.gz``, where
+       the timestamp is the *old* file's creation time — then delete the
+       parked-aside temp copy.
+    """
+    path = Path(path)
+    tmp_new_path = path.with_name(path.name + ".new.tmp")
+    tmp_old_path = path.with_name(path.name + ".old.tmp")
+
+    with open(tmp_new_path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    had_old = path.is_file()
+    old_ctime = path.stat().st_ctime if had_old else None
+
+    try:
+        if had_old:
+            os.replace(path, tmp_old_path)  # park original aside, untouched
+        os.replace(tmp_new_path, path)  # swap new content into place
+    except OSError:
+        # Best-effort rollback so a mid-sequence failure doesn't strand the
+        # original outside of `path`.
+        if had_old and tmp_old_path.is_file() and not path.is_file():
+            os.replace(tmp_old_path, path)
+        raise
+
+    if had_old:
+        backup_dir = path.parent / "backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.fromtimestamp(old_ctime).strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_dir / f"{path.stem}_{timestamp}.gz"
+        with open(tmp_old_path, "rb") as src, gzip.open(backup_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        tmp_old_path.unlink()
 
 # EXIF tag ids (main IFD "DateTime", and Exif sub-IFD "DateTimeOriginal" /
 # "DateTimeDigitized") — checked in that order. Mirrors culling_app.py's

@@ -64,18 +64,18 @@ def _annotate_frame(
     output_dir: Path,
     config: AppConfig,
 ) -> None:
-    """Write an annotated preview for one frame to the appropriate sub-folder.
+    """Write an annotated preview for one frame into the shared ``previews/``
+    sub-folder.
 
     - No image data  → do nothing (read error upstream).
-    - No bodies      → no person detected; save original to ``anno_skipped/``.
-    - Otherwise      → draw boxes, keypoints, scores; save to
-                        ``anno_blur/`` or ``anno_sharp/``.
+    - No bodies      → no person detected; save original as-is.
+    - Otherwise      → draw boxes, keypoints, scores.
     """
     if frame.image is None:
         return
 
     if not frame.bodies:
-        subdir = output_dir / "anno_skipped"
+        subdir = output_dir / "previews"
         subdir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(
             str(subdir / (frame.path.stem + ".jpg")),
@@ -84,7 +84,6 @@ def _annotate_frame(
         )
         return
 
-    overall_blurry = not frame.is_sharp()
     annotated = apply_auto_adjustment(frame.image, frame.auto_adjustment).copy()
     overlay   = annotated.copy()
     h_out, w_out = annotated.shape[:2]
@@ -208,7 +207,7 @@ def _annotate_frame(
         cv2.putText(annotated, label, (lx, ly), font, fscale, lcolor, font_thick, cv2.LINE_AA)
 
     out_name    = frame.path.stem + ".jpg"
-    anno_subdir = output_dir / ("anno_blur" if overall_blurry else "anno_sharp")
+    anno_subdir = output_dir / "previews"
     anno_subdir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
@@ -220,9 +219,7 @@ def _annotate_frame(
 class AnnotationStage(ProcessStage):
     """Annotate every frame and write previews to the output directory.
 
-    Sharp frames → ``<output_dir>/anno_sharp/``
-    Blurry frames → ``<output_dir>/anno_blur/``
-    No-person frames → ``<output_dir>/anno_skipped/``
+    Every frame (sharp, blurry, or no-person) → ``<output_dir>/previews/``.
 
     The frame list is returned unchanged.
     """

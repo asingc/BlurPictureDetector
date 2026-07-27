@@ -34,7 +34,7 @@ The pipeline is a sequence of stages (`algo/stages/`):
 | `ImageAnalysisStage` | Run both YOLO models, match faces to bodies |
 | `GradingStage` | Compute the sharpness score and pass/fail per body |
 | `JerseyCountingStage` | Detect the dominant team colour and disqualify off-team bodies |
-| `AnnotationStage` | Draw and save annotated previews into `anno_*/` |
+| `AnnotationStage` | Draw and save annotated previews into `previews/` |
 | `FaceRecoStage` | Cluster qualifying faces into `.FaceReco/` (optional) |
 
 ### Sharpness scoring
@@ -90,10 +90,8 @@ Scores every image and writes an output folder:
 
 ```
 <output_dir>/
-    anno_blur/        ← annotated previews of images scored as blurry
-    anno_sharp/       ← annotated previews of images scored as sharp
-    anno_skipped/     ← annotated previews where no person was detected
-    album.json      ← full per-body data (used by face recognition)
+    previews/         ← annotated previews for every image (blur/sharp/skipped alike)
+    album.json      ← full per-body data (used by face recognition); each result also carries a "preview_path" pointing into previews/
     info.json         ← classification results (used by step 2)
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
@@ -127,13 +125,13 @@ You can also pass any numeric value directly, e.g. `--sensitivity 0.45`.
 
 ### Step 2 — Review
 
-Open the `anno_*` folders in your photo viewer and **delete any preview images you want to override**:
+Open the `previews/` folder in your photo viewer and **delete any preview images you want to override**:
 
-| Folder | Delete a preview when… | Effect on the original |
+| Preview is for… | Delete a preview when… | Effect on the original |
 |---|---|---|
-| `anno_blur/` | The photo isn't actually blurry — you want to keep it | Left in place |
-| `anno_sharp/` | The photo is sharp but you don't want it | Moved to `Blur/` |
-| `anno_skipped/` | You want to leave the original untouched | Left in place |
+| a blurry image | The photo isn't actually blurry — you want to keep it | Left in place |
+| a sharp image | The photo is sharp but you don't want it | Moved to `Blur/` |
+| a skipped image | You want to leave the original untouched | Left in place |
 
 Leave previews you agree with untouched.
 

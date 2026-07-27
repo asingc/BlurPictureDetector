@@ -96,10 +96,31 @@ def _heartbeat_watchdog() -> None:
     heartbeat before the watchdog can fire.
     """
     poll_interval = max(1.0, min(5.0, STATE.heartbeat_timeout / 3))
+    last_poll = time.time()
     while True:
         time.sleep(poll_interval)
+        now = time.time()
+        poll_gap = now - last_poll
+        last_poll = now
+        if poll_gap > poll_interval * 3:
+            # This watchdog thread itself missed multiple polls — wall-clock
+            # time jumped far more than a sleeping thread should ever drift.
+            # That only happens if the whole machine (this server process
+            # included) was suspended, not just the browser tab/window being
+            # closed — a closed tab doesn't affect our own thread's timing at
+            # all. Since the browser suspends/resumes together with us on the
+            # same machine, forgive this cycle instead of shutting down: it
+            # will send a fresh heartbeat shortly after waking anyway.
+            log.info(
+                "Watchdog poll delayed %.0fs (expected ~%.0fs) — system likely "
+                "resumed from sleep; resetting heartbeat timer instead of exiting.",
+                poll_gap, poll_interval,
+            )
+            with STATE.heartbeat_lock:
+                STATE.last_heartbeat = now
+            continue
         with STATE.heartbeat_lock:
-            elapsed = time.time() - STATE.last_heartbeat
+            elapsed = now - STATE.last_heartbeat
         if elapsed > STATE.heartbeat_timeout:
             log.info(
                 "No heartbeat received for %.0fs (timeout %.0fs) — shutting down.",

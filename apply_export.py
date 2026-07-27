@@ -4,8 +4,10 @@
 Copies every "kept" photo from a 1_prep_review.py / culling_app.py output
 directory (an album under albums/) to a destination folder, applying edits
 (placeholder for now — real pixel editing lands later) while preserving all
-metadata, and writes a players.csv describing which tagged player appears in
-which exported photo.
+metadata, writes a players.csv describing which tagged player appears in
+which exported photo, and embeds each photo's culling "stars" rating (see
+algo/stages/llm_culling.py) into the exported copy's EXIF Rating/
+RatingPercent tags (recognised by Windows Explorer, Adobe Bridge/Lightroom).
 
 The destination folder ends up FLAT: the edited kept images plus
 players.csv, no subdirectories. The album's own albums/<album>/ folder (and
@@ -35,6 +37,13 @@ import shutil
 import sys
 from pathlib import Path
 
+try:
+    import piexif
+    _PIEXIF_AVAILABLE = True
+except ImportError:  # optional — star-rating metadata is skipped without it
+    piexif = None
+    _PIEXIF_AVAILABLE = False
+
 log = logging.getLogger("apply_export")
 
 _FMT = "%(asctime)s [%(levelname)-8s] %(message)s"
@@ -46,6 +55,14 @@ _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno
 _REVIEW_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
 
 _PLAYERS_CSV_HEADER = ["Player Name", "Player Number", "Image Path"]
+
+# File types piexif can rewrite the EXIF segment of in place (no re-encode,
+# no pixel/quality loss). Other kept formats (PNG, WEBP, RAW) are silently
+# left untagged — no safe non-destructive path for them here.
+_RATING_TAG_EXTS = {".jpg", ".jpeg", ".tif", ".tiff"}
+# Standard Windows Explorer / Adobe Bridge-Lightroom star -> (Rating,
+# RatingPercent) EXIF tag values (System.Rating / System.Rating.Percent).
+_STAR_RATING_PERCENT = {1: 1, 2: 25, 3: 50, 4: 75, 5: 99}
 
 # Mirrors culling_app.py's FACE_DB_DIR_CANDIDATES / _facereco_dir /
 # _is_pending_cluster / _load_face_json.
@@ -133,6 +150,45 @@ def _export_photos(info: dict, kept: set[str], dest_dir: Path) -> int:
     return copied
 
 
+def _write_star_ratings(dest_dir: Path, kept: set[str], results_by_name: dict[str, dict]) -> int:
+    """Embed each kept photo's culling "stars" rating (assigned by
+    algo/stages/llm_culling.py's ``_assign_star_ratings``) into the exported
+    copy's EXIF metadata, as the standard Windows/Adobe "Rating" (0-5) and
+    "RatingPercent" tags recognised by Explorer, Lightroom and Bridge.
+
+    Uses piexif to rewrite only the EXIF APP1 segment in place — the
+    compressed image data itself is never touched (no re-encode, no quality
+    loss). Only .jpg/.jpeg/.tif/.tiff are supported (piexif's format
+    coverage); other kept formats (PNG, WEBP, RAW) are silently left
+    untagged. Entries with no "stars" field (e.g. blur/skipped photos, or
+    albums processed before this feature existed) are left untouched too.
+    """
+    if not _PIEXIF_AVAILABLE:
+        log.warning("piexif not installed — skipping star-rating metadata (pip install piexif)")
+        return 0
+
+    tagged = 0
+    for name in sorted(kept):
+        result = results_by_name.get(name)
+        stars = result.get("stars") if result else None
+        if not stars:
+            continue
+        dest_file = dest_dir / name
+        if dest_file.suffix.lower() not in _RATING_TAG_EXTS or not dest_file.is_file():
+            continue
+        try:
+            exif_dict = piexif.load(str(dest_file))
+            exif_dict["0th"][piexif.ImageIFD.Rating] = int(stars)
+            exif_dict["0th"][piexif.ImageIFD.RatingPercent] = _STAR_RATING_PERCENT.get(int(stars), 0)
+            piexif.insert(piexif.dump(exif_dict), str(dest_file))
+            tagged += 1
+        except Exception as exc:  # noqa: BLE001 — one file's tagging failure must not abort the export
+            log.warning("  Failed to write star rating for %s: %s", name, exc)
+
+    log.info("Star ratings written: %d/%d kept photo(s)", tagged, len(kept))
+    return tagged
+
+
 def _collect_player_rows(album_dir: Path, kept: set[str]) -> list[list[str]]:
     """One row per tagged face per kept image, sourced from the album's own
     .FaceReco database.
@@ -213,6 +269,7 @@ def main() -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     _export_photos(info, kept, dest_dir)
+    _write_star_ratings(dest_dir, kept, results_by_name)
 
     rows = _collect_player_rows(album_dir, kept) if args.export_face_tagging else []
     csv_path = _write_players_csv(dest_dir, rows)

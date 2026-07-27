@@ -78,6 +78,7 @@ from algo.utils import (
     _color_from_label,
     _matches_allowed_jersey_color,
     _narrow_face_box,
+    atomic_save_and_backup,
     cap_long_edge,
 )
 
@@ -121,10 +122,14 @@ IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
 #   low    → only flag severely blurry images  (high tolerance)
 #   medium → balanced default
 #   high   → flag even slightly blurry images  (low tolerance)
+# "high" recalibrated 2026-07-27 (0.70 -> 0.68) alongside the production
+# sharpness-evaluator swap to WeightedGeometricMeanEvaluator (algo/sharpness.py),
+# to preserve the recall the old evaluator achieved at its old 0.70 threshold —
+# see culling_app.py's SENSITIVITY_PRESETS and _setup_tmp/sharpness_eval/calibrate_high_threshold.py.
 SENSITIVITY_THRESHOLDS: dict[str, float] = {
     "low":    0.35,
     "medium": 0.50,
-    "high":   0.70,
+    "high":   0.68,
 }
 
 # COCO 17-keypoint skeleton: pairs of indices to connect with a line.
@@ -1211,7 +1216,12 @@ def write_results_json(
             {"ev": auto_adj.ev} if auto_adj is not None else None
         )
         if not frame.bodies:
-            entry: dict = {"file": str(frame.path), "status": "skipped", "auto_adjustment": auto_adj_entry}
+            entry: dict = {
+                "file": str(frame.path),
+                "status": "skipped",
+                "auto_adjustment": auto_adj_entry,
+                "preview_path": f"previews/{frame.path.stem}.jpg",
+            }
         else:
             overall_blurry = not frame.is_sharp()
             passing = [b for b in frame.bodies if b.passed]
@@ -1224,6 +1234,7 @@ def write_results_json(
                 "laplacian_variance": round(best.lap_var, 2),
                 "tenengrad_score":    round(best.ten, 2),
                 "auto_adjustment":    auto_adj_entry,
+                "preview_path":       f"previews/{frame.path.stem}.jpg",
                 "annotation_data": {
                     "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
                     "overall_blurry":   overall_blurry,
@@ -1251,8 +1262,7 @@ def write_results_json(
         "our_jersey_color": our_jersey_color,
         "results": serializable,
     }
-    with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, cls=_NumpyEncoder)
+    atomic_save_and_backup(json.dumps(payload, indent=2, cls=_NumpyEncoder), json_path)
     log.info("Results JSON written to:  %s", json_path)
 
 
@@ -1368,7 +1378,7 @@ def write_info_json(
 ) -> None:
     """Write a run-summary JSON file."""
     def _entry(frame: Frame) -> dict:
-        return {"src": frame.path.name, "anno": frame.path.stem + ".jpg"}
+        return {"src": frame.path.name}
 
     blur_files    = [_entry(f) for f in frames if f.bodies and not f.is_sharp()]
     sharp_files   = [_entry(f) for f in frames if f.bodies and f.is_sharp()]
@@ -1530,8 +1540,8 @@ def main() -> None:
         "--output",
         default=None,
         help=(
-            "Root directory for all output files (anno_blur/, anno_sharp/, "
-            "anno_skipped/, blurry.csv, blur.lst, run.log).  "
+            "Root directory for all output files (previews/, blurry.csv, "
+            "blur.lst, run.log).  "
             "Defaults to albums/<timestamp>-<input_name>/."
         ),
     )
@@ -1808,13 +1818,11 @@ def main() -> None:
     if frames:
         log.info("")
         log.info("Annotated previews saved to:")
-        log.info("  %s", output_dir / "anno_blur")
-        log.info("  %s", output_dir / "anno_sharp")
-        log.info("  %s", output_dir / "anno_skipped")
+        log.info("  %s", output_dir / "previews")
         log.info("")
         log.info("Review the previews, then delete images you want to override:")
-        log.info("  anno_blur/   delete a preview → keep that original (not blurry after all)")
-        log.info("  anno_sharp/  delete a preview → exclude that original (move to Unselected/)")
+        log.info("  previews/  delete a blurry preview → keep that original (not blurry after all)")
+        log.info("             delete a sharp preview → exclude that original (move to Unselected/)")
         log.info("")
 
     if frames and not args.skip_facereco:
@@ -1832,6 +1840,7 @@ def main() -> None:
                 debug_align=args.debug_align,
                 cpu_only=args.cpu_only,
                 engine=args.engine,
+                sensitivity_threshold=sensitivity_threshold,
             ).process(frames, app_config)
             if not args.no_tag_ui:
                 _launch_face_tag_ui(output_dir)

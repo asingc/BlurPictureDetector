@@ -527,15 +527,22 @@ class OpenAIProvider(CullingProvider):
         if not bursts:
             return []
         max_workers = max(1, min(self.max_concurrency, len(bursts)))
+        total = len(bursts)
+        log.info("[OpenAIProvider] ranking %d burst(s) with up to %d concurrent request(s)", total, max_workers)
+        progress_step = max(1, total // 10)
         results: list[BurstRankingResult] = [BurstRankingResult(rankings=[], grades={}, caption="") for _ in bursts]
+        completed = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {executor.submit(self.rank_burst, burst): i for i, burst in enumerate(bursts)}
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
+                completed += 1
                 try:
                     results[idx] = future.result()
                 except Exception as exc:  # noqa: BLE001 — one burst's failure must not sink the whole batch
                     log.warning("[OpenAIProvider] burst #%d failed: %s", idx, exc)
+                if completed % progress_step == 0 or completed == total:
+                    log.info("[OpenAIProvider] burst ranking progress: %d/%d complete", completed, total)
         return results
 
     def rank_burst(self, frames: list[BurstFrameInput]) -> BurstRankingResult:
@@ -568,15 +575,23 @@ class OpenAIProvider(CullingProvider):
         if not batches:
             return []
         max_workers = max(1, min(self.max_concurrency, len(batches)))
+        total = len(batches)
+        log.info("[OpenAIProvider] grading %d standalone batch(es) with up to %d concurrent request(s)",
+                 total, max_workers)
+        progress_step = max(1, total // 10)
         results: list[dict[str, float]] = [{} for _ in batches]
+        completed = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {executor.submit(self.grade_images, batch): i for i, batch in enumerate(batches)}
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
+                completed += 1
                 try:
                     results[idx] = future.result()
                 except Exception as exc:  # noqa: BLE001 — one batch's failure must not sink the whole run
                     log.warning("[OpenAIProvider] standalone grade batch #%d failed: %s", idx, exc)
+                if completed % progress_step == 0 or completed == total:
+                    log.info("[OpenAIProvider] standalone grading progress: %d/%d complete", completed, total)
         return results
 
     def grade_images(self, frames: list[BurstFrameInput]) -> dict[str, float]:

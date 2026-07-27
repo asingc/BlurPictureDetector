@@ -61,6 +61,7 @@ class FaceRecoStage(ProcessStage):
         min_face_crop_px: int = 32,
         debug_align: bool = False,
         engine: str = "mediapipe",
+        sensitivity_threshold: float = 0.5,
     ) -> None:
         self.output_dir = output_dir
         self.face_db_dir = face_db_dir
@@ -72,6 +73,7 @@ class FaceRecoStage(ProcessStage):
         self.debug_align = debug_align
         self.cpu_only = cpu_only
         self.engine = engine
+        self.sensitivity_threshold = sensitivity_threshold
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         sharp_body_count = sum(
@@ -111,6 +113,7 @@ class FaceRecoStage(ProcessStage):
                 min_face_crop_px=self.min_face_crop_px,
                 debug_align=self.debug_align,
                 engine=self.engine,
+                sensitivity_threshold=self.sensitivity_threshold,
             )
             pipeline = FaceRecoPipeline(provider=provider, config=facereco_config, cpu_only=self.cpu_only)
             facereco_dir = pipeline.run(self.output_dir)

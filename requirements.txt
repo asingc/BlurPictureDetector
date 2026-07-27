@@ -49,3 +49,9 @@ jinja2>=3.1.0
 # algo/stages/llm_culling.py). MIT licensed. Optional at runtime: the stage
 # is skipped when no OpenAI API key is configured.
 openai>=1.30.0
+
+# Embeds each exported photo's culling "stars" rating into its EXIF
+# Rating/RatingPercent tags in place, without recompressing the image
+# (apply_export.py). BSD licensed. Optional at runtime: skipped (with a
+# warning) if not installed.
+piexif>=1.1.3
