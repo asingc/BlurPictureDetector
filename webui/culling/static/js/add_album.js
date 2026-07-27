@@ -11,9 +11,18 @@ let pollSince = 0;
 let isProcessing = false;
 
 // Teams loaded from the server, and which one is currently selected for
-// this album (used when Start Processing is clicked).
+// this album (used when Import Images is clicked). The server already
+// returns them ordered most-recently-used-to-import first.
 let teams = [];
 let selectedTeamId = "";
+
+// Cookie names for the Face Recognition checkbox's client-only memory.
+const RECOGNIZE_FACES_COOKIE = "recognizeFacesLastState";
+const RECOGNIZE_FACES_CONSENT_COOKIE = "recognizeFacesConsentAck";
+
+// Set once the user clicks "I Agree" in the consent dialog for the current
+// open; used to tell an "agreed" close apart from a "cancelled" one.
+let consentAgreed = false;
 
 // ------------------------------------------------------------------ //
 // Team picker
@@ -55,23 +64,77 @@ function readSensitivityFromUI() {
 }
 
 // ------------------------------------------------------------------ //
-// Import state (last-used folder / sensitivity / face-recognition / team)
+// Import state (sensitivity / selected team). The last-used import
+// directory is intentionally not surfaced on this page — each import
+// starts from a fresh folder-picker dialog (see the Import Images button).
 // ------------------------------------------------------------------ //
 async function loadImportState() {
   const state = await apiGet("/api/import-state");
-  if (state.lastImportPath) {
-    $("#importPathInput").val(state.lastImportPath);
-    $("#lastImportHint").text(
-      state.lastImportPathExists
-        ? "Last used: " + state.lastImportPath
-        : "Last used (not found): " + state.lastImportPath
-    );
-  } else {
-    $("#lastImportHint").text("");
-  }
   applySensitivityToUI(state.sensitivityMode, state.sensitivityCustomValue);
-  $("#recognizeFacesInput").prop("checked", state.recognizeFaces !== false);
   return state.selectedTeamId || "";
+}
+
+// ------------------------------------------------------------------ //
+// Face Recognition checkbox — default unchecked, remembered client-side
+// via a cookie (not the server), with a one-time parental-consent-style
+// disclaimer the first time it's ever checked.
+// ------------------------------------------------------------------ //
+function initRecognizeFacesCheckbox() {
+  const lastState = getCookie(RECOGNIZE_FACES_COOKIE);
+  $("#recognizeFacesInput").prop("checked", lastState === "1");
+
+  const $consentDialog = $("#faceRecoConsentDialog");
+  const $readCheckbox = $("#faceRecoConsentReadCheckbox");
+
+  $consentDialog.dialog({
+    autoOpen: false,
+    modal: true,
+    width: 460,
+    resizable: false,
+    buttons: [
+      {
+        text: "I Agree",
+        class: "btn btn-primary",
+        disabled: true,
+        click: function () {
+          consentAgreed = true;
+          setCookie(RECOGNIZE_FACES_CONSENT_COOKIE, "1");
+          setCookie(RECOGNIZE_FACES_COOKIE, "1");
+          $(this).dialog("close");
+        },
+      },
+      {
+        text: "Cancel",
+        click: function () { $(this).dialog("close"); },
+      },
+    ],
+    open: function () {
+      consentAgreed = false;
+      $readCheckbox.prop("checked", false);
+      $consentDialog.dialog("widget").find(".btn-primary").prop("disabled", true);
+    },
+    close: function () {
+      if (!consentAgreed) {
+        // Declined, dismissed, or closed without agreeing — leave the
+        // checkbox unchecked and don't remember that consent was granted.
+        $("#recognizeFacesInput").prop("checked", false);
+        setCookie(RECOGNIZE_FACES_COOKIE, "0");
+      }
+    },
+  });
+
+  $readCheckbox.on("change", function () {
+    $consentDialog.dialog("widget").find(".btn-primary").prop("disabled", !this.checked);
+  });
+
+  $("#recognizeFacesInput").on("change", function () {
+    const checked = this.checked;
+    if (checked && getCookie(RECOGNIZE_FACES_CONSENT_COOKIE) !== "1") {
+      $consentDialog.dialog("open");
+      return; // cookie is set by the dialog's buttons/close handler
+    }
+    setCookie(RECOGNIZE_FACES_COOKIE, checked ? "1" : "0");
+  });
 }
 
 // ------------------------------------------------------------------ //
@@ -81,7 +144,56 @@ function setImportUIEnabled(enabled) {
   isProcessing = !enabled;
   $("#createAlbumPanel").find("input, button").prop("disabled", !enabled);
   $("#teamPanel").find("button").prop("disabled", !enabled);
-  $("#startProcessingBtn").prop("disabled", !enabled);
+  $("#importImagesBtn").prop("disabled", !enabled);
+}
+
+// ------------------------------------------------------------------ //
+// Processing log dialog — a non-closable jQuery UI modal while a run is
+// active (its dark overlay blocks every other UI element from being hit
+// by accident), becoming closable once the run finishes.
+// ------------------------------------------------------------------ //
+let dismissTimer = null;
+
+function initProcessingDialog() {
+  $("#processingDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openProcessingDialog() {
+  const $dialog = $("#processingDialog");
+  $dialog.dialog("option", "title", "Processing…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  // Non-closable while running: hide the titlebar's [x] button too.
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function finishProcessingDialog(returnCode) {
+  const $dialog = $("#processingDialog");
+  const success = returnCode === 0;
+  $dialog.dialog("option", "title", success ? "Processing complete" : `Processing failed (exit code ${returnCode})`);
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+
+  // (Re)bind the close handler for this run: navigate to Culling only on
+  // success, whether the dialog is dismissed by the user or auto-closes.
+  $dialog.off("dialogclose.processing").on("dialogclose.processing", () => {
+    if (dismissTimer) { clearTimeout(dismissTimer); dismissTimer = null; }
+    if (success) window.location.href = "/review";
+  });
+
+  if (success) {
+    $("#importStatus").text("Processing complete. Continuing to Culling…");
+    dismissTimer = setTimeout(() => { $dialog.dialog("close"); }, 5000);
+  } else {
+    $("#importStatus").text(`Processing exited with code ${returnCode}.`);
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -108,102 +220,48 @@ async function pollProcessingOutput() {
     clearInterval(pollTimer);
     pollTimer = null;
     setImportUIEnabled(true);
-    if (data.returnCode === 0) {
-      $("#importStatus").text("Processing complete. Continuing to Culling…");
-      setTimeout(() => { window.location.href = "/review"; }, 800);
-    } else {
-      $("#importStatus").text(`Processing exited with code ${data.returnCode}.`);
-    }
+    finishProcessingDialog(data.returnCode);
   }
 }
 
-// ------------------------------------------------------------------ //
-// Drag & drop — the whole "Create New Album" box is a drop target.
-//
-// Browsers deliberately do not expose the absolute filesystem path of a
-// dropped file/folder (a security measure to stop web pages probing the
-// local filesystem), so we can only recover it when the non-standard
-// File.path property happens to be present (e.g. some embedded/Electron
-// browsers). Otherwise we tell the user what we detected and ask them to
-// use Browse… instead, rather than silently failing.
-// ------------------------------------------------------------------ //
-function initDropZone() {
-  const zone = document.getElementById("createAlbumPanel");
-  if (!zone) return;
-  let dragCounter = 0;
-
-  ["dragenter", "dragover", "dragleave", "drop"].forEach((evt) => {
-    zone.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); });
-  });
-
-  zone.addEventListener("dragenter", () => {
-    dragCounter += 1;
-    zone.classList.add("drag-active");
-  });
-  zone.addEventListener("dragleave", () => {
-    dragCounter = Math.max(0, dragCounter - 1);
-    if (dragCounter === 0) zone.classList.remove("drag-active");
-  });
-  zone.addEventListener("drop", (e) => {
-    dragCounter = 0;
-    zone.classList.remove("drag-active");
-    const dt = e.dataTransfer;
-    const item = dt && dt.items && dt.items[0];
-    const entry = item && item.webkitGetAsEntry && item.webkitGetAsEntry();
-    const file = item && item.getAsFile && item.getAsFile();
-    const path = file && file.path; // non-standard; usually undefined in a normal browser tab
-
-    if (path) {
-      $("#importPathInput").val(path);
-      $("#dropHint").text("");
-      return;
-    }
-    if (entry && !entry.isDirectory) {
-      $("#dropHint").text("Please drop a folder, not a file.");
-      return;
-    }
-    const name = (entry && entry.name) || (file && file.name) || "the dropped item";
-    $("#dropHint").text(
-      `Browsers don't expose the full path of dropped folders for security reasons. ` +
-      `Detected "${name}" — use Browse… above to select it, or type the path directly.`
-    );
-  });
-}
-
 $(function () {
-  $("#browseFolderBtn").on("click", async () => {
-    $("#browseFolderBtn").prop("disabled", true);
-    try {
-      const res = await apiPost("/api/browse-folder");
-      if (res.path) $("#importPathInput").val(res.path);
-    } catch (err) {
-      alert("Browse failed: " + err.message);
-    } finally {
-      $("#browseFolderBtn").prop("disabled", false);
-    }
-  });
-
   $("#sensitivityCustomSlider").on("input", function () {
     $("#sensitivityCustomValue").text(Number($(this).val()).toFixed(2));
     $('input[name="sensMode"][value="custom"]').prop("checked", true);
   });
 
-  $("#startProcessingBtn").on("click", async () => {
+  $("#importImagesBtn").on("click", async () => {
     const albumName = $("#albumNameInput").val().trim();
     if (!albumName) { $("#importStatus").text("Album name is required."); $("#albumNameInput").trigger("focus"); return; }
-    const path = $("#importPathInput").val().trim();
-    if (!path) { $("#importStatus").text("Choose a folder first."); return; }
     if (!selectedTeamId) { $("#importStatus").text("Select a team first."); return; }
+
+    $("#importImagesBtn").prop("disabled", true);
+    $("#importStatus").text("Choose a folder…");
+    let path;
+    try {
+      const res = await apiPost("/api/browse-folder", { context: "import" });
+      path = res.path;
+    } catch (err) {
+      $("#importStatus").text("Folder picker failed: " + err.message);
+      $("#importImagesBtn").prop("disabled", false);
+      return;
+    }
+    if (!path) {
+      // Cancelled — fall back and do nothing.
+      $("#importStatus").text("");
+      $("#importImagesBtn").prop("disabled", false);
+      return;
+    }
+
     const { mode, customValue } = readSensitivityFromUI();
     const recognizeFaces = $("#recognizeFacesInput").is(":checked");
     setImportUIEnabled(false);
-    $("#importStatus").text("Saving import path…");
-    $("#processingSection").show();
     $("#processingOutput").val("");
     pollSince = 0;
+    openProcessingDialog();
+    $("#importStatus").text("Processing…");
     try {
       await apiPost("/api/import-path", { path });
-      $("#importStatus").text("Processing…");
       await apiPost("/api/start-processing", {
         path,
         albumName,
@@ -216,6 +274,7 @@ $(function () {
     } catch (err) {
       $("#importStatus").text("Failed: " + err.message);
       setImportUIEnabled(true);
+      $("#processingDialog").dialog("close");
     }
   });
 
@@ -223,7 +282,8 @@ $(function () {
     if (isProcessing) { e.preventDefault(); e.returnValue = ""; }
   });
 
-  initDropZone();
+  initRecognizeFacesCheckbox();
+  initProcessingDialog();
   (async () => {
     const preferredTeamId = await loadImportState().catch(() => "");
     await loadTeams(preferredTeamId).catch(() => {});

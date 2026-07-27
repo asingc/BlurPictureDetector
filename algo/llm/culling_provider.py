@@ -549,6 +549,8 @@ class OpenAIProvider(CullingProvider):
         if not frames:
             return BurstRankingResult(rankings=[], grades={}, caption="")
         top_n = min(3, len(frames))
+        frame_names = [f.file for f in frames]
+        log.info("[OpenAIProvider] rank_burst: sending %d frame(s) to LLM: %s", len(frames), frame_names)
         messages = [
             {"role": "system", "content": prompts.CULLING_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_user_content(frames, top_n)},
@@ -567,9 +569,15 @@ class OpenAIProvider(CullingProvider):
             raw = response.choices[0].message.content
             self._record_usage(response)
         except Exception as exc:  # noqa: BLE001 — a single burst's LLM failure must not abort the run
-            log.warning("[OpenAIProvider] LLM call failed: %s", exc)
+            log.warning("[OpenAIProvider] rank_burst: LLM call failed for %s: %s", frame_names, exc)
             return BurstRankingResult(rankings=[], grades={}, caption="")
-        return _parse_llm_response(raw, frames, top_n)
+        result = _parse_llm_response(raw, frames, top_n)
+        top_picks = [(r.file, r.rank) for r in result.rankings]
+        log.info(
+            "[OpenAIProvider] rank_burst: received result for %d frame(s) — top picks=%s, caption=%r",
+            len(frames), top_picks, result.caption,
+        )
+        return result
 
     def grade_image_batches(self, batches: list[list[BurstFrameInput]]) -> list[dict[str, float]]:
         if not batches:

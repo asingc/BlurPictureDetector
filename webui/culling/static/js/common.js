@@ -19,6 +19,21 @@ async function apiPost(url, body) {
 }
 
 // ------------------------------------------------------------------ //
+// Tiny cookie helpers — used for small pieces of client-only UI memory
+// (e.g. the Face Recognition checkbox's last state) that intentionally
+// live in the browser rather than in server-side state.json.
+// ------------------------------------------------------------------ //
+function setCookie(name, value, days) {
+  const maxAge = Math.round((days || 3650) * 86400);
+  document.cookie = `${name}=${encodeURIComponent(value)};max-age=${maxAge};path=/;samesite=lax`;
+}
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+// ------------------------------------------------------------------ //
 // Team picker widget — a row of selectable "team" blocks plus a trailing
 // "add team" block with a plus icon. Shared by the Add Album page (pick
 // which team's settings to use for a new album) and the Team Setup page

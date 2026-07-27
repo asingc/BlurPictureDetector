@@ -14,13 +14,6 @@
   <div class="row">
     <input type="text" id="albumNameInput" placeholder="Album name" required style="min-width:420px" />
   </div>
-  <p class="muted">Choose the folder containing the photos to process, or drag &amp; drop a folder anywhere in this box.</p>
-  <div class="row">
-    <input type="text" id="importPathInput" placeholder="C:\path\to\photos" style="min-width:420px" />
-    <button id="browseFolderBtn" class="btn">Browse…</button>
-  </div>
-  <p id="lastImportHint" class="muted"></p>
-  <p id="dropHint" class="muted"></p>
 
   <h3 style="margin-top:24px">Blur Sensitivity</h3>
   <div id="sensitivityPresets" class="sensitivity-options">
@@ -59,18 +52,23 @@
   </div>
 
   <h3 style="margin-top:24px">Face Recognition</h3>
-  <label class="inline-check"><input type="checkbox" id="recognizeFacesInput" checked /> Recognize Faces</label>
+  <label class="inline-check"><input type="checkbox" id="recognizeFacesInput" /> Recognize Faces</label>
   <p class="muted">Groups detected faces into clusters so they can be tagged with player names on the Face Clustering page.</p>
-
-  <div id="processingSection" style="display:none">
-    <h3 style="margin-top:24px">Processing Output</h3>
-    <textarea id="processingOutput" class="output-box" rows="18" readonly></textarea>
-  </div>
 </div>
 
 <div class="row actions">
   <span id="importStatus" class="muted"></span>
-  <button id="startProcessingBtn" class="btn btn-primary">Start Processing</button>
+  <button id="importImagesBtn" class="btn btn-primary">Import Images</button>
+</div>
+
+<div id="processingDialog" title="Processing…" style="display:none">
+  <textarea id="processingOutput" class="output-box" rows="18" readonly></textarea>
+</div>
+
+<div id="faceRecoConsentDialog" title="Before you turn on Face Recognition" style="display:none">
+  <p>Face Recognition groups faces detected in photos so they can be tagged with player names. Depending on where you use this tool and who is in the photos, enabling this feature on images of minors may require parental/guardian consent under local privacy laws (e.g. COPPA, GDPR).</p>
+  <p>Please make sure you have the appropriate consent before enabling this feature for a team or event.</p>
+  <label class="inline-check"><input type="checkbox" id="faceRecoConsentReadCheckbox" /> I have read and understood this notice.</label>
 </div>
 {% endblock %}
 {% block extra_scripts %}

@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -95,6 +95,10 @@ class TeamData(BaseModel):
     jerseyColors: list[JerseyColor] = Field(default_factory=list)
     players: list[Player] = Field(default_factory=list)
     openaiApiKey: str = ""
+    # ISO-8601 timestamp of the last time this team was used to start an
+    # import, or None if it's never been used. Drives the "most recently
+    # used first" ordering of the team picker on the Add Album page.
+    lastUsedAt: Optional[str] = None
 
 
 class GlobalSettings(BaseModel):
@@ -397,6 +401,19 @@ def _resolve_team(team_id: str) -> TeamData:
             return team
         log.warning("Team id %r not found — falling back to the first team.", team_id)
     return teams_file.Teams[0]
+
+
+def _touch_team_last_used(team_id: str) -> None:
+    """Stamp `team_id`'s lastUsedAt with the current time, so it sorts to
+    the front of the team picker next time. No-op if the team is unknown."""
+    if not team_id:
+        return
+    teams_file = _load_teams_file()
+    team = _find_team(teams_file, team_id)
+    if team is None:
+        return
+    team.lastUsedAt = datetime.now(timezone.utc).isoformat()
+    _save_teams_file(teams_file)
 
 
 def _save_team(team: TeamData) -> TeamData:
@@ -1279,10 +1296,13 @@ def api_save_team(team: TeamData) -> dict:
 @app.get("/api/teams/query")
 def api_query_teams() -> dict:
     """QueryTeams — returns settings (jersey colours, roster, API key) for
-    every team stored in team.json, plus the shared Global settings block."""
+    every team stored in team.json, plus the shared Global settings block.
+    Teams are ordered most-recently-used-to-import first (never-used teams
+    keep their on-disk order, after all used ones)."""
     teams_file = _load_teams_file()
+    ordered = sorted(teams_file.Teams, key=lambda t: t.lastUsedAt or "", reverse=True)
     return {
-        "teams": [team.model_dump() for team in teams_file.Teams],
+        "teams": [team.model_dump() for team in ordered],
         "global": teams_file.Global.model_dump(),
     }
 
@@ -1499,6 +1519,7 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
     state["recognizeFaces"] = req.recognizeFaces
     state["selectedTeamId"] = req.teamId
     _save_state(state)
+    _touch_team_last_used(req.teamId)
 
     thread = threading.Thread(
         target=_run_processing,
