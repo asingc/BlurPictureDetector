@@ -15,9 +15,13 @@
       <h1 id="title">Photo Culling</h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Culling"), ("cluster", "Faces"), ("apply", "Apply")] %}
+      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Culling"), ("cluster", "Faces"), ("apply", "Summary")] %}
+      {% set gated_steps = ("review", "cluster", "apply") %}
       {% for key, label in step_labels %}
-      <a class="step {{ 'active' if active_step == key else '' }}" href="/{{ key }}">
+      {% set is_disabled = key in gated_steps and not has_active_album() %}
+      <a class="step {{ 'active' if active_step == key else '' }} {{ 'disabled' if is_disabled else '' }}"
+         href="{{ '#' if is_disabled else '/' + key }}"
+         {% if is_disabled %}aria-disabled="true" tabindex="-1" title="Select or import an album first"{% endif %}>
         <span class="step-index">{{ loop.index }}</span>
         <span class="step-label">{{ label }}</span>
       </a>

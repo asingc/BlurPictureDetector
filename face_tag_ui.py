@@ -45,6 +45,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from algo.facereco import record_manual_override
+from algo.utils import load_album_source_index
+
 log = logging.getLogger("FaceTagUI")
 
 # Folder-name candidates for a ``.FaceReco`` DB, mirroring 1_prep_review.py.
@@ -404,11 +407,14 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
     with open(results_fp, encoding="utf-8") as fh:
         data = json.load(fh)
 
-    # Index results entries by basename for quick lookup.
+    # Index results entries by their disambiguated bookkeeping key (falling
+    # back to basename for older albums written before "key" existed) --
+    # plain basename indexing breaks once two source directories share a
+    # filename (see algo/utils.py::make_unique_import_key).
     by_name: dict[str, list[dict]] = {}
     for entry in data.get("results", []):
-        base = Path(entry.get("file", "")).name
-        by_name.setdefault(base, []).append(entry)
+        key = entry.get("key") or Path(entry.get("file", "")).name
+        by_name.setdefault(key, []).append(entry)
 
     changed = False
     for a in assignments:
@@ -458,9 +464,14 @@ def _commit(album_path: Path, req: CommitRequest) -> dict:
         src_payload = payload_for(src_dir)
 
         if op.type == "delete":
-            _pop_face_entry(src_payload, crop)
+            entry = _pop_face_entry(src_payload, crop)
             _delete_crop_files(src_dir, crop)
             deleted_keys.add((src_name, crop))
+            if entry is not None:
+                record_manual_override(fr, deleted={
+                    "file": entry.get("origFilename", ""),
+                    "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
+                })
             continue
 
         if op.type == "assign":
@@ -486,6 +497,12 @@ def _commit(album_path: Path, req: CommitRequest) -> dict:
                 dst_payload.setdefault("faces", []).append(entry)
                 results_updates.append({
                     "origFilename": entry.get("origFilename", ""),
+                    "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
+                    "name": name,
+                    "playernum": dst_payload.get("playernum"),
+                })
+                record_manual_override(fr, assigned={
+                    "file": entry.get("origFilename", ""),
                     "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
                     "name": name,
                     "playernum": dst_payload.get("playernum"),
@@ -565,6 +582,16 @@ def thumb(album: str, cluster: str, crop: str) -> FileResponse:
 @app.get("/original/{album}")
 def original(album: str, file: str = Query(...)) -> FileResponse:
     album_path = _album_dir(album)
+    album_json = album_path / "album.json"
+    if album_json.is_file():
+        index = load_album_source_index(album_json)
+        src_path = index.get(file)
+        if src_path:
+            fp = Path(src_path)
+            if fp.is_file():
+                return FileResponse(fp)
+    # Fall back to the legacy single-SrcDir + basename join for albums
+    # written before multi-source-directory import support existed.
     src_dir = _read_src_dir(album_path)
     if not src_dir:
         raise HTTPException(status_code=404, detail="Source directory unknown")

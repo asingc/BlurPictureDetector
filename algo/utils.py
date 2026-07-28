@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import shutil
 from datetime import datetime
@@ -22,6 +23,76 @@ except ImportError:  # Pillow not installed — EXIF timestamps just won't be av
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
 _HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+
+# ---------------------------------------------------------------------------
+# Multi-source-directory import support (1_prep_review.py "import more images"
+# into an existing album). Album entries are globally identified by their
+# absolute source path, but a lot of on-disk bookkeeping (preview filenames,
+# info.json's Anno_* lists, FaceReco crop provenance, export destination
+# filenames) is keyed by plain filename for readability -- which is only
+# safe as long as filenames are unique across every source directory ever
+# imported into the album. These two helpers keep that bookkeeping key
+# ("key" in album.json result entries) collision-free without ever renaming
+# the original file on disk.
+# ---------------------------------------------------------------------------
+
+def make_unique_import_key(filename: str, used_keys: dict[str, Path], src_path: Path) -> str:
+    """Return a bookkeeping key for *filename* that's unique within
+    *used_keys* (a dict of already-claimed key -> absolute source path),
+    mutating *used_keys* to claim the returned key.
+
+    Disambiguates with a ``__2``, ``__3``, ... suffix inserted before the
+    extension only when a DIFFERENT source file already claimed that exact
+    filename (e.g. two different source directories both containing an
+    ``IMG_0001.JPG``). The original file on disk is never touched -- this
+    key only affects internal bookkeeping (preview filenames, album.json /
+    info.json entries, face-DB origFilename, and export destination
+    filenames).
+    """
+    src_path = Path(src_path)
+    existing = used_keys.get(filename)
+    if existing is None or existing == src_path:
+        used_keys[filename] = src_path
+        return filename
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    i = 2
+    while True:
+        candidate = f"{stem}__{i}{suffix}"
+        existing = used_keys.get(candidate)
+        if existing is None or existing == src_path:
+            used_keys[candidate] = src_path
+            return candidate
+        i += 1
+
+
+def load_album_source_index(album_json_path: Union[str, Path]) -> dict[str, str]:
+    """Map every result entry's bookkeeping ``key`` to its absolute source
+    path, as recorded in album.json's ``results[].file``/``results[].key``.
+
+    Falls back to the entry's plain basename for older albums written before
+    the "key" field existed (single-source-directory albums, where filename
+    collisions can't happen). Used by every consumer that needs to open the
+    true original file behind a filename that may not be globally unique
+    across multiple imported source directories.
+    """
+    album_json_path = Path(album_json_path)
+    if not album_json_path.is_file():
+        return {}
+    try:
+        with open(album_json_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    index: dict[str, str] = {}
+    for entry in payload.get("results", []):
+        file_path = entry.get("file")
+        if not file_path:
+            continue
+        key = entry.get("key") or Path(file_path).name
+        index[key] = file_path
+    return index
 
 
 def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:

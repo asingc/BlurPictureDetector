@@ -440,6 +440,114 @@ class FaceDb:
         return cls(entries)
 
 
+# ---------------------------------------------------------------------------
+# Manual-override persistence (face_tag_ui.py delete/assign actions surviving
+# a full re-cluster on incremental "import more images" runs -- see
+# 1_prep_review.py's merge-into-existing-album support). FaceRecoPipeline.run
+# reclusters the WHOLE album's qualified bodies on every run (simplest,
+# explicitly chosen over incremental clustering), so without this, a full
+# re-run would forget any face a human deleted, and could revert any face a
+# human manually re-assigned to a different person than automatic
+# similarity-matching would pick.
+# ---------------------------------------------------------------------------
+
+MANUAL_OVERRIDES_FILENAME = "manual_overrides.json"
+
+
+def _bbox_key(box: dict | None) -> tuple[float, float, float, float] | None:
+    """Hashable identity for a body_bbox dict, rounded to tolerate the tiny
+    float round-tripping noise JSON (de)serialization can introduce."""
+    if not box:
+        return None
+    return tuple(round(float(box.get(k, 0.0)), 6) for k in ("x1", "y1", "x2", "y2"))
+
+
+def load_manual_overrides(out_root: Path) -> dict:
+    """Load ``<out_root>/manual_overrides.json`` (deleted/assigned face
+    identities recorded by face_tag_ui.py), defaulting to an empty payload
+    when absent or unreadable."""
+    path = out_root / MANUAL_OVERRIDES_FILENAME
+    if not path.is_file():
+        return {"deleted": [], "assigned": []}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            data.setdefault("deleted", [])
+            data.setdefault("assigned", [])
+            return data
+    except Exception as exc:  # noqa: BLE001
+        log.warning("FaceReco: failed to read %s: %s", path, exc)
+    return {"deleted": [], "assigned": []}
+
+
+def record_manual_override(out_root: Path, *, deleted: dict | None = None, assigned: dict | None = None) -> None:
+    """Append one deletion and/or one assignment record to
+    ``<out_root>/manual_overrides.json``. Called by face_tag_ui.py whenever a
+    commit deletes or (re-)assigns a face, so a future FaceRecoPipeline.run
+    (triggered by importing more images) preserves that human decision
+    instead of reverting it via fresh automatic clustering/matching.
+
+    ``deleted``/``assigned`` are ``{"file":, "body_bbox": {...}}`` (assigned
+    additionally carries ``"name"``/``"playernum"``).
+    """
+    payload = load_manual_overrides(out_root)
+    if deleted is not None:
+        payload["deleted"].append(deleted)
+    if assigned is not None:
+        # An assignment supersedes any earlier assignment of the same face.
+        key = (assigned.get("file"), _bbox_key(assigned.get("body_bbox")))
+        payload["assigned"] = [
+            a for a in payload["assigned"]
+            if (a.get("file"), _bbox_key(a.get("body_bbox"))) != key
+        ]
+        payload["assigned"].append(assigned)
+    out_root.mkdir(parents=True, exist_ok=True)
+    with open(out_root / MANUAL_OVERRIDES_FILENAME, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _load_named_cluster_entries(clusters_dir: Path, prototype_similarity_threshold: float) -> list[FaceDbEntry]:
+    """Load only the already-NAMED (human-tagged) person sub-directories of
+    an album's own ``.FaceReco`` output as :class:`FaceDbEntry` objects,
+    skipping pending numeric clusters and internal dot-prefixed folders
+    (``.AllFaces``, ``.debug``).
+
+    Feeding these back into face-DB matching on a re-run lets an album's own
+    previously-tagged people be re-matched by similarity to the SAME name
+    (and therefore the same output folder) even without an external
+    ``--face-db``, so tagging survives "recluster whole album" re-runs.
+    """
+    entries: list[FaceDbEntry] = []
+    if not clusters_dir.is_dir():
+        return entries
+    for person_dir in sorted(clusters_dir.iterdir()):
+        if not person_dir.is_dir() or person_dir.name.startswith(".") or person_dir.name.isdigit():
+            continue
+        face_json = person_dir / "face.json"
+        if not face_json.exists():
+            continue
+        try:
+            with open(face_json, encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FaceReco [local-db]: %s — failed to parse face.json: %s", person_dir.name, exc)
+            continue
+        name = data.get("name") or person_dir.name
+        embeddings = [e for e in (_decode_embedding(f) for f in data.get("faces", [])) if e is not None]
+        if not embeddings:
+            continue
+        entries.append(FaceDbEntry(
+            name=name,
+            playernum=data.get("playernum"),
+            provider=str(data.get("provider", "")),
+            embeddings=embeddings,
+            negative_embeddings=[],
+            prototypes=build_prototypes(embeddings, prototype_similarity_threshold),
+        ))
+    return entries
+
+
 @dataclass
 class _QualifiedBody:
     image_path: Path
@@ -494,11 +602,30 @@ class FaceRecoPipeline:
         src_dir = Path(info.get("SrcDir", "")).resolve() if info.get("SrcDir") else prep_output_dir
         log.debug("FaceReco: src_dir=%s", src_dir)
 
-        qualified = self._collect_qualified_bodies(payload)
-
         out_root = prep_output_dir / self.config.output_dir_name
         out_root.mkdir(parents=True, exist_ok=True)
         log.debug("FaceReco: output root=%s", out_root)
+
+        # Every run reclusters the WHOLE album's qualified bodies from
+        # scratch (simplest strategy, chosen so "import more images" doesn't
+        # need incremental-clustering logic) -- these previously-recorded
+        # human decisions (face_tag_ui.py delete/assign) are replayed on top
+        # of that fresh clustering so they're never silently undone.
+        overrides = load_manual_overrides(out_root)
+        deleted_keys = {
+            (o.get("file"), _bbox_key(o.get("body_bbox")))
+            for o in overrides.get("deleted", []) if o.get("file")
+        }
+        assigned_overrides = {
+            (o.get("file"), _bbox_key(o.get("body_bbox"))): {"name": o.get("name"), "playernum": o.get("playernum")}
+            for o in overrides.get("assigned", []) if o.get("file") and o.get("name")
+        }
+        if deleted_keys:
+            log.info("FaceReco: %d previously-deleted face(s) excluded from this run", len(deleted_keys))
+        if assigned_overrides:
+            log.info("FaceReco: %d manually-assigned face(s) will be pinned to their tagged person", len(assigned_overrides))
+
+        qualified = self._collect_qualified_bodies(payload, excluded=deleted_keys)
 
         debug_dir: Path | None = None
         if self.config.debug_align:
@@ -584,6 +711,20 @@ class FaceRecoPipeline:
         self._effective_face_db_match_threshold = effective_match_threshold
         self._effective_face_db_match_margin = effective_match_margin
 
+        # Feed the album's OWN already-tagged (named) clusters back into
+        # matching -- this is what lets manual face_tag_ui.py tagging survive
+        # a full recluster even when no external --face-db is configured, by
+        # re-matching those faces to the same name (and therefore the same
+        # output folder) via ordinary similarity matching.
+        local_entries = _load_named_cluster_entries(out_root, effective_proto_threshold)
+        if local_entries:
+            log.info(
+                "FaceReco: %d already-tagged person(s) found in this album's own %s — "
+                "matching against them too so existing tags are preserved",
+                len(local_entries), self.config.output_dir_name,
+            )
+            face_db = FaceDb((face_db.entries if face_db is not None else []) + local_entries)
+
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
         samples = self._predict_samples(qualified, debug_dir)
         log.info("FaceReco: %d/%d embeddings extracted successfully", len(samples), len(qualified))
@@ -620,6 +761,8 @@ class FaceRecoPipeline:
             [len(c.samples) for c in clusters],
         )
 
+        clusters, cluster_name_map = self._apply_manual_overrides(clusters, cluster_name_map, assigned_overrides)
+
         self._write_all_faces(out_root, clusters)
         self._write_cluster_outputs(out_root, clusters, src_dir, cluster_name_map)
         log.info("FaceReco completed: %d qualified bodies → %d clusters  output=%s",
@@ -632,8 +775,14 @@ class FaceRecoPipeline:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
 
-    def _collect_qualified_bodies(self, payload: dict) -> list[_QualifiedBody]:
+    def _collect_qualified_bodies(
+        self,
+        payload: dict,
+        excluded: set[tuple] | None = None,
+    ) -> list[_QualifiedBody]:
         qualified: list[_QualifiedBody] = []
+        excluded = excluded or set()
+        excluded_count = 0
         total_results = len(payload.get("results", []))
         total_bodies = skipped_blurry = skipped_no_ann = 0
         # Capped at 0.5 regardless of how strict the album's own sensitivity
@@ -643,30 +792,40 @@ class FaceRecoPipeline:
                   total_results, min_face_sharpness)
         for result in payload.get("results", []):
             image_path = Path(result.get("file", ""))
+            # Disambiguated bookkeeping key (see algo/utils.py::make_unique_import_key)
+            # -- falls back to the plain filename for older albums written
+            # before multi-source-directory import support existed.
+            image_key = result.get("key") or image_path.name
             ann = result.get("annotation_data")
             if ann is None:
                 skipped_no_ann += 1
-                log.debug("FaceReco [collect]: %s — no annotation_data, skipped", image_path.name)
+                log.debug("FaceReco [collect]: %s — no annotation_data, skipped", image_key)
                 continue
             evaluated = ann.get("evaluated", [])
-            log.debug("FaceReco [collect]: %s — %d evaluated body/bodies", image_path.name, len(evaluated))
+            log.debug("FaceReco [collect]: %s — %d evaluated body/bodies", image_key, len(evaluated))
             for idx, body_data in enumerate(evaluated):
                 total_bodies += 1
+                if (image_key, _bbox_key(body_data.get("body_bbox"))) in excluded:
+                    excluded_count += 1
+                    log.debug("FaceReco [collect]: %s body#%d — excluded (previously deleted), skipped", image_key, idx)
+                    continue
                 sharpness = body_data.get("sharpness_score", 0.0)
                 cloth = body_data.get("cloth_color", "N/A")
                 if sharpness <= min_face_sharpness:
                     skipped_blurry += 1
                     log.debug(
                         "FaceReco [collect]: %s body#%d  score=%.3f  color=%s  → SKIP (<= min_face_sharpness %.3f)",
-                        image_path.name, idx, sharpness, cloth, min_face_sharpness,
+                        image_key, idx, sharpness, cloth, min_face_sharpness,
                     )
                     continue
                 log.debug(
                     "FaceReco [collect]: %s body#%d  score=%.3f  color=%s  → QUALIFIED",
-                    image_path.name, idx, sharpness, cloth,
+                    image_key, idx, sharpness, cloth,
                 )
-                body = self._parse_body_record(image_path.name, idx, body_data)
+                body = self._parse_body_record(image_key, idx, body_data)
                 qualified.append(_QualifiedBody(image_path=image_path, body=body))
+        if excluded_count:
+            log.info("FaceReco [collect]: %d previously-deleted face(s) excluded", excluded_count)
         log.info(
             "FaceReco [collect]: total_results=%d  total_bodies=%d  "
             "qualified=%d  skipped_blurry=%d  skipped_no_annotation=%d",
@@ -1057,6 +1216,61 @@ class FaceRecoPipeline:
             )
         return matched_clusters, cluster_name_map, unmatched
 
+    def _apply_manual_overrides(
+        self,
+        clusters: list[Cluster],
+        cluster_name_map: dict[int, FaceDbEntry],
+        assigned: dict[tuple, dict],
+    ) -> tuple[list[Cluster], dict[int, FaceDbEntry]]:
+        """Force any face_tag_ui.py-assigned face into its pinned person's
+        cluster, regardless of what this run's automatic matching/clustering
+        decided -- see the ``manual_overrides.json`` design notes above
+        :data:`MANUAL_OVERRIDES_FILENAME`.
+        """
+        if not assigned:
+            return clusters, cluster_name_map
+
+        remaining: dict[int, Cluster] = {c.cluster_id: c for c in clusters}
+        by_target_name: dict[str, list[FaceSample]] = {}
+        name_playernum: dict[str, int | None] = {}
+        for cluster in remaining.values():
+            kept: list[FaceSample] = []
+            for sample in cluster.samples:
+                key = (sample.body.orig_filename, _bbox_key(sample.body.raw_body.get("body_bbox")))
+                override = assigned.get(key)
+                if override is not None:
+                    by_target_name.setdefault(override["name"], []).append(sample)
+                    name_playernum[override["name"]] = override.get("playernum")
+                else:
+                    kept.append(sample)
+            cluster.samples = kept
+
+        if not by_target_name:
+            return list(remaining.values()), cluster_name_map
+
+        next_id = max((c.cluster_id for c in remaining.values()), default=-1) + 1
+        for name, samples in by_target_name.items():
+            target_cid = next(
+                (cid for cid, entry in cluster_name_map.items() if entry.name == name and cid in remaining),
+                None,
+            )
+            if target_cid is not None:
+                remaining[target_cid].samples.extend(samples)
+                log.info("FaceReco [override]: pinned %d face(s) into existing cluster for %s", len(samples), name)
+            else:
+                cid = next_id
+                next_id += 1
+                entry = FaceDbEntry(
+                    name=name, playernum=name_playernum.get(name), provider=self.provider.provider_name(),
+                    embeddings=[], negative_embeddings=[], prototypes=[],
+                )
+                remaining[cid] = Cluster(cluster_id=cid, samples=samples)
+                cluster_name_map[cid] = entry
+                log.info("FaceReco [override]: pinned %d face(s) into a new cluster for %s", len(samples), name)
+
+        clusters_out = [c for c in remaining.values() if c.samples]
+        return clusters_out, cluster_name_map
+
     def _write_all_faces(self, out_root: Path, clusters: list[Cluster]) -> None:
         """Write every processed face crop and a combined face.json to
         ``<out_root>/.AllFaces/``.
@@ -1085,11 +1299,11 @@ class FaceRecoPipeline:
 
                 # Lossless PNG: the saved crop must reproduce this run's
                 # embedding exactly when the DB is later rebuilt from it.
-                crop_name = (
-                    f"{cluster_num}-"
-                    f"{Path(sample.body.orig_filename).stem}-"
-                    f"b{sample.body.body_index}.png"
-                )
+                # Deliberately independent of cluster_num (unstable across
+                # reruns -- see FaceRecoPipeline.run's manual-overrides notes)
+                # so a full recluster overwrites the same file in place instead
+                # of leaving the previous run's crop behind as an orphan.
+                crop_name = f"{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
                 cv2.imwrite(
                     str(all_faces_dir / crop_name), crop,
                     [cv2.IMWRITE_PNG_COMPRESSION, 3],
@@ -1157,7 +1371,10 @@ class FaceRecoPipeline:
 
                 # Lossless PNG: this crop becomes the face-DB image, so it must
                 # reproduce the prediction embedding exactly on rebuild.
-                crop_name = f"{cluster_num}-{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
+                # Deliberately independent of cluster_num (unstable across
+                # reruns) so a full recluster overwrites the same file in
+                # place instead of leaving the previous run's crop behind.
+                crop_name = f"{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
                 cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
                 if annotated is not None:
                     face_annotated_dir.mkdir(parents=True, exist_ok=True)

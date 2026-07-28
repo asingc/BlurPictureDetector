@@ -78,7 +78,7 @@ def _annotate_frame(
         subdir = output_dir / "previews"
         subdir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(
-            str(subdir / (frame.path.stem + ".jpg")),
+            str(subdir / (frame.key_stem + ".jpg")),
             frame.image,
             [cv2.IMWRITE_JPEG_QUALITY, 60],
         )
@@ -206,7 +206,7 @@ def _annotate_frame(
     for label, lx, ly, lcolor, fscale in score_labels:
         cv2.putText(annotated, label, (lx, ly), font, fscale, lcolor, font_thick, cv2.LINE_AA)
 
-    out_name    = frame.path.stem + ".jpg"
+    out_name    = frame.key_stem + ".jpg"
     anno_subdir = output_dir / "previews"
     anno_subdir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])

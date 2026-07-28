@@ -9,9 +9,24 @@ let exportPollTimer = null;
 let exportPollSince = 0;
 let lastStarBreakdown = null;
 
+let importMorePollTimer = null;
+let importMorePollSince = 0;
+let importMoreRunning = false;
+
 function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #minStarsInput, #exportBtn").prop("disabled", !enabled);
+  // Importing more images and exporting both mutate/read the album at the
+  // same time — keep them mutually exclusive from the UI side (each is
+  // already independently guarded server-side too).
+  $("#importMoreBtn").prop("disabled", !enabled || importMoreRunning);
 }
+
+function setImportMoreUIEnabled(enabled) {
+  importMoreRunning = !enabled;
+  $("#importMoreBtn").prop("disabled", !enabled);
+  $("#exportBtn").prop("disabled", !enabled);
+}
+
 
 async function openExportDestination() {
   try {
@@ -58,6 +73,68 @@ function finishExportDialog(success) {
   $dialog.dialog("option", "title", success ? "Export complete" : "Export failed");
   $dialog.dialog("option", "closeOnEscape", true);
   $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+}
+
+// ------------------------------------------------------------------ //
+// Import-more progress dialog — same non-closable-while-running pattern
+// as the export dialog above / add_album.js's processing dialog.
+// ------------------------------------------------------------------ //
+function initImportMoreDialog() {
+  $("#importMoreDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openImportMoreDialog() {
+  const $dialog = $("#importMoreDialog");
+  $dialog.dialog("option", "title", "Importing…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function appendImportMoreLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("importMoreOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function finishImportMoreDialog(returnCode) {
+  const $dialog = $("#importMoreDialog");
+  const success = returnCode === 0;
+  $dialog.dialog("option", "title", success ? "Import complete" : `Import failed (exit code ${returnCode})`);
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+  if (success) {
+    $("#importMoreStatus").text("Import complete.");
+    loadSummary();
+  } else {
+    $("#importMoreStatus").text(`Import exited with code ${returnCode}.`);
+  }
+}
+
+async function pollImportMoreOutput() {
+  let data;
+  try {
+    data = await apiGet(`/api/processing-output?since=${importMorePollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendImportMoreLines(data.lines);
+  importMorePollSince = data.next;
+  if (!data.running) {
+    clearInterval(importMorePollTimer);
+    importMorePollTimer = null;
+    setImportMoreUIEnabled(true);
+    finishImportMoreDialog(data.returnCode);
+  }
 }
 
 const STAR_TIERS = [5, 4, 3, 2, 1];
@@ -144,8 +221,42 @@ async function pollExportStatus() {
 $(function () {
   loadSummary();
   initExportDialog();
+  initImportMoreDialog();
 
   $("#minStarsInput").on("change", updateExportCount);
+
+  $("#importMoreBtn").on("click", async () => {
+    setImportMoreUIEnabled(false);
+    $("#importMoreStatus").text("Choose a folder…");
+    let path;
+    try {
+      const res = await apiPost("/api/browse-folder", { title: "Select folder to import more images from", context: "import" });
+      path = res.path;
+    } catch (err) {
+      $("#importMoreStatus").text("Folder picker failed: " + err.message);
+      setImportMoreUIEnabled(true);
+      return;
+    }
+    if (!path) {
+      // Cancelled — quietly return to the idle state.
+      $("#importMoreStatus").text("");
+      setImportMoreUIEnabled(true);
+      return;
+    }
+
+    $("#importMoreOutput").val("");
+    importMorePollSince = 0;
+    openImportMoreDialog();
+    $("#importMoreStatus").text("Importing…");
+    try {
+      await apiPost("/api/import-more", { path });
+      importMorePollTimer = setInterval(pollImportMoreOutput, 500);
+    } catch (err) {
+      $("#importMoreStatus").text("Failed: " + err.message);
+      setImportMoreUIEnabled(true);
+      $("#importMoreDialog").dialog("close");
+    }
+  });
 
   $("#openDestBtn").on("click", openExportDestination);
 

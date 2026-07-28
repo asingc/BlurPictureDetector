@@ -135,6 +135,7 @@ class LLMCullingStage(ProcessStage):
         image_max_long_edge: int = DEFAULT_IMAGE_MAX_LONG_EDGE,
         singleton_batch_size: int = DEFAULT_SINGLETON_BATCH_SIZE,
         singleton_keep_fraction: float = DEFAULT_SINGLETON_KEEP_FRACTION,
+        new_keys: frozenset[str] | None = None,
     ) -> None:
         self.output_dir = output_dir
         self.provider = provider
@@ -148,6 +149,18 @@ class LLMCullingStage(ProcessStage):
         self.image_max_long_edge = image_max_long_edge
         self.singleton_batch_size = singleton_batch_size
         self.singleton_keep_fraction = singleton_keep_fraction
+        # Bookkeeping keys (see algo/utils.py::make_unique_import_key) of the
+        # frames processed THIS run. When provided, only bursts/standalone
+        # entries containing at least one of these are sent to the LLM --
+        # "import more images" would otherwise re-rank (and re-bill) every
+        # burst in the whole album on every single import. None (the
+        # default) disables this filter so a fresh, non-merge run still
+        # ranks every qualifying burst as before.
+        self.new_keys = new_keys
+
+    @staticmethod
+    def _entry_key(entry: dict) -> str:
+        return entry.get("key") or Path(entry.get("file", "")).name
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         results_path = self.output_dir / "album.json"
@@ -166,6 +179,15 @@ class LLMCullingStage(ProcessStage):
             "[LLMCullingStage] %d sharp frame(s) -> %d burst(s), %d qualify (>= %d frames)",
             len(sharp_entries), len(bursts), len(qualifying), self.min_group_size,
         )
+
+        if self.new_keys is not None:
+            before = len(qualifying)
+            qualifying = [b for b in qualifying if any(self._entry_key(e) in self.new_keys for e in b)]
+            log.info(
+                "[LLMCullingStage] import-more: %d/%d qualifying burst(s) touch a newly-imported "
+                "photo -- only those will be (re-)ranked",
+                len(qualifying), before,
+            )
 
         # Build every qualifying burst's provider input up front so they can
         # all be handed to the provider in one batch call — this is what lets
@@ -202,6 +224,15 @@ class LLMCullingStage(ProcessStage):
             log.info("[LLMCullingStage] burst ranking complete: %d burst(s) processed", len(prepared))
 
         standalone_entries = [e for b in bursts if len(b) < self.min_group_size for e in b]
+        if self.new_keys is not None:
+            before = len(standalone_entries)
+            standalone_entries = [e for e in standalone_entries if self._entry_key(e) in self.new_keys]
+            if before:
+                log.info(
+                    "[LLMCullingStage] import-more: %d/%d standalone image(s) are newly-imported -- "
+                    "only those will be graded",
+                    len(standalone_entries), before,
+                )
         if standalone_entries:
             log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_entries))
             self._grade_standalone_entries(standalone_entries)
@@ -304,7 +335,7 @@ class LLMCullingStage(ProcessStage):
             log.warning("[LLMCullingStage] %s: provider returned no usable ranking — leaving as-is", group_id)
             return
 
-        by_name = {Path(e["file"]).name: e for e in burst}
+        by_name = {self._entry_key(e): e for e in burst}
         for filename, entry in by_name.items():
             ranked = rank_by_file.get(filename)
             if ranked is not None:
@@ -347,7 +378,7 @@ class LLMCullingStage(ProcessStage):
             if not inputs:
                 continue
             batches.append(inputs)
-            by_name_per_batch.append({Path(e["file"]).name: e for e in chunk})
+            by_name_per_batch.append({self._entry_key(e): e for e in chunk})
             log.debug(
                 "[LLMCullingStage] standalone: prepared batch %d (%d image(s))",
                 len(batches), len(inputs),
@@ -420,7 +451,7 @@ class LLMCullingStage(ProcessStage):
                 face_bbox = (box["x1"], box["y1"], box["x2"], box["y2"])
 
         return BurstFrameInput(
-            file=file_path.name,
+            file=self._entry_key(entry),
             image_b64=image_b64,
             face_bbox=face_bbox,
             sharpness_score=float(entry.get("sharpness_score", 0.0)),

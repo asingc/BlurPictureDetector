@@ -300,13 +300,21 @@ class ImageAnalysisStage(ProcessStage):
     always constructs a fresh list from the images on disk.
     """
 
-    def __init__(self, input_path: Path, pose_model: YOLO, face_model: YOLO) -> None:
+    def __init__(
+        self, input_path: Path, pose_model: YOLO, face_model: YOLO,
+        skip_paths: frozenset[Path] | None = None,
+    ) -> None:
         self.input_path = input_path
         self.pose_model = pose_model
         self.face_model = face_model
+        self.skip_paths = skip_paths or frozenset()
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         files = collect_images(self.input_path)
+        if self.skip_paths:
+            before = len(files)
+            files = [f for f in files if f.resolve() not in self.skip_paths]
+            log.info("[ImageAnalysisStage] skipping %d already-imported file(s)", before - len(files))
         result: list[Frame] = []
         width = len(str(len(files)))
 
@@ -423,14 +431,22 @@ class MediaPipeImageAnalysisStage(ProcessStage):
     always constructs a fresh list from the images on disk.
     """
 
-    def __init__(self, input_path: Path, person_detector, pose_landmarker, face_landmarker) -> None:
+    def __init__(
+        self, input_path: Path, person_detector, pose_landmarker, face_landmarker,
+        skip_paths: frozenset[Path] | None = None,
+    ) -> None:
         self.input_path = input_path
         self.person_detector = person_detector
         self.pose_landmarker = pose_landmarker
         self.face_landmarker = face_landmarker
+        self.skip_paths = skip_paths or frozenset()
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         files = collect_images(self.input_path)
+        if self.skip_paths:
+            before = len(files)
+            files = [f for f in files if f.resolve() not in self.skip_paths]
+            log.info("[MediaPipeImageAnalysisStage] skipping %d already-imported file(s)", before - len(files))
         result: list[Frame] = []
         width = len(str(len(files)))
 

@@ -48,7 +48,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
-from algo.utils import atomic_save_and_backup
+from algo.facereco import record_manual_override
+from algo.utils import atomic_save_and_backup, load_album_source_index
 
 try:
     from PIL import Image as _PILImage
@@ -162,6 +163,15 @@ class ReviewApplyRequest(BaseModel):
     # server-side from the final star rating (3+ = keep) — there is no
     # separate keep/drop flag to track.
     starOverrides: dict[str, int] = Field(default_factory=dict)
+
+
+class ImportMoreRequest(BaseModel):
+    # Source folder of additional photos to merge into the current album.
+    # Sensitivity/jersey-colour/engine/team are intentionally NOT accepted
+    # here — 1_prep_review.py's merge-mode auto-locks those from the
+    # album's own stored run_settings so a second import can never drift
+    # from the settings the first import used.
+    path: str
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +342,71 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
         log.info("Current album set from processing run: %s", output_dir.resolve())
 
 
+def _album_team_id(album_dir: Path) -> str:
+    """Best-effort read of album.json's team_id, so "import more" can look up
+    the same team's OpenAI key without asking the user to re-select a team
+    (sensitivity/jerseycolor/engine/noteam/team_id itself are already locked
+    server-side by 1_prep_review.py's merge-mode — this is only needed
+    because the API key itself is intentionally never persisted into
+    album.json/run_settings)."""
+    try:
+        with open(album_dir / "album.json", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload.get("team_id") or ""
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+
+def _run_import_more(path: str, album_dir: Path) -> None:
+    """Import additional photos into an EXISTING, already-processed album.
+
+    Runs 1_prep_review.py with --output pointed at the existing album
+    directory (not a fresh timestamped one) — its merge-mode (see main())
+    detects the existing album.json, skips already-imported source files,
+    and auto-locks sensitivity/jerseycolor/engine/noteam/team-id/autoadjust
+    to whatever the album's first import used, so none of those need to be
+    passed here.
+    """
+    team = _resolve_team(_album_team_id(album_dir))
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "1_prep_review.py"),
+        path,
+        "--output", str(album_dir),
+        "--no-tag-ui",
+    ]
+    if not _album_has_facereco(album_dir):
+        cmd += ["--skip-facereco"]
+    if team.openaiApiKey:
+        cmd += ["--openaikey", team.openaiApiKey]
+
+    log.info("Starting import-more: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    with processing_state.lock:
+        processing_state.process = proc
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        with processing_state.lock:
+            processing_state.lines.append(line.rstrip("\n"))
+
+    proc.wait()
+    with processing_state.lock:
+        processing_state.running = False
+        processing_state.return_code = proc.returncode
+        processing_state.process = None
+    log.info("Import-more finished (exit code %s)", proc.returncode)
+
+
 # --------------------------------------------------------------------------- #
 # team.json persistence — {"Teams": [...], "Global": {...}}. Multiple teams
 # are supported; each is identified by a stable `id` assigned the first time
@@ -474,8 +549,18 @@ def _is_album_complete(path: Path) -> bool:
     """An album is "fully processed" once 1_prep_review.py has written both
     album.json and info.json - both are always written together (barring a
     completely empty input folder), regardless of --skip-facereco or whether
-    any blurry images were found."""
-    return (path / "album.json").is_file() and (path / "info.json").is_file()
+    any blurry images were found. Also requires album.json's own
+    ``import_status`` (see 1_prep_review.py's merge-mode writer) to not be
+    "in_progress" -- an interrupted "import more images" run leaves that flag
+    set so a crashed/partial import isn't mistaken for a finished album."""
+    if not ((path / "album.json").is_file() and (path / "info.json").is_file()):
+        return False
+    try:
+        with open(path / "album.json", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return False
+    return payload.get("import_status", "complete") != "in_progress"
 
 
 # How many random sharp-image filenames to hand to the client per album for
@@ -592,6 +677,18 @@ def _current_album_path() -> Path:
     return path
 
 
+def _has_active_album() -> bool:
+    """True when the current session has a fully-processed album selected --
+    used by base.html (via the ``has_active_album()`` Jinja global below) to
+    decide whether the Culling/Faces/Summary nav steps should be enabled."""
+    state = _load_state()
+    album_path_str = state.get("currentAlbum", "")
+    if not album_path_str:
+        return False
+    path = Path(album_path_str)
+    return path.is_dir() and _is_album_complete(path)
+
+
 # --------------------------------------------------------------------------- #
 # Review (page 3) — sort blur / sharp / skipped images into keep / drop,
 # grouped into time-based "bursts". Decisions are staged client-side and only
@@ -656,7 +753,10 @@ def _load_results_payload(album_path: Path) -> dict:
 
 
 def _results_by_filename(payload: dict) -> dict[str, dict]:
-    return {Path(entry["file"]).name: entry for entry in payload.get("results", [])}
+    return {
+        (entry.get("key") or Path(entry["file"]).name): entry
+        for entry in payload.get("results", [])
+    }
 
 
 def _review_images(album_path: Path, category: str) -> list[dict]:
@@ -686,7 +786,9 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
         keep = stars >= 3
         burst_ranking = result.get("burst_ranking") if result else None
         llm_grade = result.get("llm_grade") if result else None
-        src_path = src_dir / src_name
+        # Prefer the per-entry absolute source path (multi-source-directory
+        # imports) over joining the album's single legacy SrcDir.
+        src_path = Path(item["srcPath"]) if item.get("srcPath") else src_dir / src_name
         ts_path = src_path if src_path.is_file() else previews_dir / anno_name
         images.append({
             "file": src_name,
@@ -945,11 +1047,14 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
     with open(results_fp, encoding="utf-8") as fh:
         data = json.load(fh)
 
-    # Index results entries by basename for quick lookup.
+    # Index results entries by their disambiguated bookkeeping key (falling
+    # back to basename for older albums written before "key" existed) --
+    # plain basename indexing breaks once two source directories share a
+    # filename (see algo/utils.py::make_unique_import_key).
     by_name: dict[str, list[dict]] = {}
     for entry in data.get("results", []):
-        base = Path(entry.get("file", "")).name
-        by_name.setdefault(base, []).append(entry)
+        key = entry.get("key") or Path(entry.get("file", "")).name
+        by_name.setdefault(key, []).append(entry)
 
     changed = False
     for a in assignments:
@@ -998,9 +1103,14 @@ def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> d
         src_payload = payload_for(src_dir)
 
         if op.type == "delete":
-            _pop_face_entry(src_payload, crop)
+            entry = _pop_face_entry(src_payload, crop)
             _delete_crop_files(src_dir, crop)
             deleted_keys.add((src_name, crop))
+            if entry is not None:
+                record_manual_override(fr, deleted={
+                    "file": entry.get("origFilename", ""),
+                    "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
+                })
             continue
 
         if op.type == "assign":
@@ -1026,6 +1136,12 @@ def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> d
                 dst_payload.setdefault("faces", []).append(entry)
                 results_updates.append({
                     "origFilename": entry.get("origFilename", ""),
+                    "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
+                    "name": name,
+                    "playernum": dst_payload.get("playernum"),
+                })
+                record_manual_override(fr, assigned={
+                    "file": entry.get("origFilename", ""),
                     "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
                     "name": name,
                     "playernum": dst_payload.get("playernum"),
@@ -1270,6 +1386,7 @@ def _static_url(path: str) -> str:
 
 
 templates.env.globals["static_url"] = _static_url
+templates.env.globals["has_active_album"] = _has_active_album
 
 PAGE_STEPS: tuple[str, ...] = ("team", "import", "review", "cluster", "apply")
 
@@ -1553,6 +1670,38 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/import-more")
+def api_import_more(req: ImportMoreRequest) -> dict:
+    """Import additional photos into the currently-selected album (page 5's
+    "Import more images" button). Reuses the same processing_state/polling
+    machinery as /api/start-processing — only one processing job (initial
+    import OR import-more) can run at a time."""
+    path = Path(req.path)
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Directory not found: {req.path}")
+
+    album_dir = _current_album_path()
+
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="Processing is already running.")
+        processing_state.running = True
+        processing_state.return_code = None
+        processing_state.lines = []
+
+    state = _load_state()
+    state["lastImportPath"] = str(path.resolve())
+    _save_state(state)
+
+    thread = threading.Thread(
+        target=_run_import_more,
+        args=(str(path.resolve()), album_dir),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
 @app.get("/api/processing-output")
 def api_processing_output(since: int = 0) -> dict:
     with processing_state.lock:
@@ -1590,6 +1739,16 @@ def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
 @app.get("/api/cluster/original")
 def api_cluster_original(file: str = Query(...)) -> FileResponse:
     album_path = _current_album_path()
+    album_json = album_path / "album.json"
+    if album_json.is_file():
+        index = load_album_source_index(album_json)
+        src_path = index.get(file)
+        if src_path:
+            fp = Path(src_path)
+            if fp.is_file():
+                return FileResponse(fp)
+    # Fall back to the legacy single-SrcDir + basename join for albums
+    # written before multi-source-directory import support existed.
     src_dir = _read_album_summary(album_path).get("srcDir")
     if not src_dir:
         raise HTTPException(status_code=404, detail="Source directory unknown")
@@ -1706,9 +1865,10 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser tab")
-    parser.add_argument("--heartbeat-timeout", type=float, default=180.0,
+    parser.add_argument("--heartbeat-timeout", type=float, default=0.0,
                         help="Seconds without a browser heartbeat before the "
-                             "server exits automatically. Use 0 to disable.")
+                             "server exits automatically. Use 0 to disable "
+                             "(default: disabled for now).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% block title %}Apply Changes — Photo Culling{% endblock %}
+{% block title %}Summary — Photo Culling{% endblock %}
 {% block content %}
-<h2>Apply Changes</h2>
+<h2>Summary</h2>
 
 <div class="panel" id="summaryPanel">
   <h3 id="summaryAlbumName">Album</h3>
@@ -10,6 +10,32 @@
     <div class="stat"><span class="stat-value" id="statFaces">–</span><span class="stat-label">Faces detected</span></div>
     <div class="stat"><span class="stat-value" id="statPlayers">–</span><span class="stat-label">Players detected</span></div>
   </div>
+</div>
+
+<div class="panel" id="importMorePanel">
+  <h3>Import More Images</h3>
+  <p class="muted">
+    Add photos from another folder into this album. Files already imported
+    (matched by source path) are automatically skipped — importing the same
+    folder twice is harmless. Newly imported photos go through the full
+    pipeline (blur detection, face recognition, LLM culling) using this
+    album's original settings.
+  </p>
+  <div class="row actions">
+    <span id="importMoreStatus" class="muted"></span>
+    <button id="importMoreBtn" class="btn btn-icon-text" title="Choose a folder to import">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="7 10 12 15 17 10"></polyline>
+        <line x1="12" y1="15" x2="12" y2="3"></line>
+      </svg>
+      <span>Import more images</span>
+    </button>
+  </div>
+</div>
+
+<div id="importMoreDialog" title="Importing…" style="display:none">
+  <textarea id="importMoreOutput" class="output-box" rows="16" readonly></textarea>
 </div>
 
 <div class="panel" id="exportPanel">

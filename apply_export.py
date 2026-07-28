@@ -44,6 +44,8 @@ except ImportError:  # optional — star-rating metadata is skipped without it
     piexif = None
     _PIEXIF_AVAILABLE = False
 
+from algo.utils import load_album_source_index
+
 log = logging.getLogger("apply_export")
 
 _FMT = "%(asctime)s [%(levelname)-8s] %(message)s"
@@ -131,13 +133,19 @@ def _apply_edits(src_file: Path, dest_file: Path) -> None:
     shutil.copy2(str(src_file), str(dest_file))
 
 
-def _export_photos(info: dict, kept: set[str], dest_dir: Path) -> int:
+def _export_photos(info: dict, kept: set[str], dest_dir: Path, source_index: dict[str, str]) -> int:
+    # Prefer the per-key absolute source path recorded in album.json (see
+    # algo/utils.py::load_album_source_index) -- required once an album has
+    # been imported from more than one source directory, since two
+    # directories can share a plain filename. Falls back to the single
+    # legacy SrcDir join for older albums / keys missing from the index.
     src_dir = Path(info.get("SrcDir", ""))
     log.info("Copying %d kept photo(s) to %s", len(kept), dest_dir)
 
     copied = 0
     for name in sorted(kept):
-        src_file = src_dir / name
+        resolved = source_index.get(name)
+        src_file = Path(resolved) if resolved else src_dir / name
         if not src_file.is_file():
             log.warning("  Missing, skipped: %s", name)
             continue
@@ -272,12 +280,16 @@ def main() -> None:
     with open(results_path, encoding="utf-8") as fh:
         results = json.load(fh)
 
-    results_by_name = {Path(r.get("file", "")).name: r for r in results.get("results", [])}
+    results_by_name = {
+        (r.get("key") or Path(r.get("file", "")).name): r
+        for r in results.get("results", [])
+    }
     kept = _kept_image_basenames(info, results_by_name, args.min_stars)
+    source_index = load_album_source_index(results_path)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    _export_photos(info, kept, dest_dir)
+    _export_photos(info, kept, dest_dir, source_index)
     _write_star_ratings(dest_dir, kept, results_by_name)
 
     rows = _collect_player_rows(album_dir, kept) if args.export_face_tagging else []

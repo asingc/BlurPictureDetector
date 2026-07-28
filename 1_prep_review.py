@@ -80,6 +80,7 @@ from algo.utils import (
     _narrow_face_box,
     atomic_save_and_backup,
     cap_long_edge,
+    make_unique_import_key,
 )
 
 import cv2
@@ -1107,10 +1108,12 @@ _CSV_FIELDS: list[str] = ["File", "Verdict", "Sharp Score", "# Boxes"] + [
 ]
 
 
-def write_csv(frames: list[Frame], csv_path: Path) -> None:
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+def write_csv(frames: list[Frame], csv_path: Path, *, append: bool = False) -> None:
+    write_header = not (append and csv_path.exists())
+    with open(csv_path, "a" if append else "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=_CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         for frame in frames:
             norm_img = frame.normalized_image
             img_w = norm_img.shape[1] if norm_img is not None else 1
@@ -1143,9 +1146,9 @@ def write_csv(frames: list[Frame], csv_path: Path) -> None:
     log.info("CSV report written to:    %s", csv_path)
 
 
-def write_blur_lst(frames: list[Frame], lst_path: Path) -> None:
+def write_blur_lst(frames: list[Frame], lst_path: Path, *, append: bool = False) -> None:
     """Write a plain-text list of blurry image filenames and their blur scores."""
-    with open(lst_path, "w", encoding="utf-8") as fh:
+    with open(lst_path, "a" if append else "w", encoding="utf-8") as fh:
         for frame in frames:
             if frame.bodies and not frame.is_sharp():
                 score = max(b.sharpness_score for b in frame.bodies)
@@ -1205,14 +1208,11 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def write_results_json(
-    frames: list[Frame],
-    json_path: Path,
-    *,
-    our_jersey_color: str | None = None,
-    team_id: str | None = None,
-) -> None:
-    """Write full per-image analytic results (scores, bboxes, keypoints) to JSON."""
+def _build_result_entries(frames: list[Frame]) -> list[dict]:
+    """Serialize *frames* into album.json ``results`` entries (scores,
+    bboxes, keypoints). Split out from :func:`write_results_json` so an
+    incremental import (see main()) can build entries for just the newly
+    imported frames and merge them with the existing album's entries."""
     serializable = []
     for frame in frames:
         norm_img = frame.normalized_image
@@ -1220,12 +1220,14 @@ def write_results_json(
         auto_adj_entry = (
             {"ev": auto_adj.ev} if auto_adj is not None else None
         )
+        key = frame.output_key or frame.path.name
         if not frame.bodies:
             entry: dict = {
                 "file": str(frame.path),
+                "key": key,
                 "status": "skipped",
                 "auto_adjustment": auto_adj_entry,
-                "preview_path": f"previews/{frame.path.stem}.jpg",
+                "preview_path": f"previews/{frame.key_stem}.jpg",
             }
         else:
             overall_blurry = not frame.is_sharp()
@@ -1233,13 +1235,14 @@ def write_results_json(
             best = max(passing or frame.bodies, key=lambda b: b.sharpness_score)
             entry = {
                 "file":               str(frame.path),
+                "key":                key,
                 "status":             "blurry" if overall_blurry else "sharp",
                 "sharpness_score":    round(best.sharpness_score, 4),
                 "sharpness_grade":    round(best.sharpness_score * 100, 1),
                 "laplacian_variance": round(best.lap_var, 2),
                 "tenengrad_score":    round(best.ten, 2),
                 "auto_adjustment":    auto_adj_entry,
-                "preview_path":       f"previews/{frame.path.stem}.jpg",
+                "preview_path":       f"previews/{frame.key_stem}.jpg",
                 "annotation_data": {
                     "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
                     "overall_blurry":   overall_blurry,
@@ -1262,13 +1265,52 @@ def write_results_json(
                 },
             }
         serializable.append(entry)
+    return serializable
+
+
+def write_results_json(
+    frames: list[Frame],
+    json_path: Path,
+    *,
+    our_jersey_color: str | None = None,
+    team_id: str | None = None,
+    existing_entries: list[dict] | None = None,
+    import_status: str = "complete",
+    imports_history: list[dict] | None = None,
+    run_settings: dict | None = None,
+) -> None:
+    """Write full per-image analytic results (scores, bboxes, keypoints) to JSON.
+
+    When importing more images into an existing album, pass the previous
+    album.json's ``results`` list as *existing_entries* -- new entries are
+    appended after them so already-processed images/clusters/reviews are
+    never disturbed.
+    """
+    serializable = list(existing_entries or []) + _build_result_entries(frames)
     payload = {
         "team_id": team_id,
         "our_jersey_color": our_jersey_color,
+        "import_status": import_status,
+        "imports": imports_history or [],
+        "run_settings": run_settings or {},
         "results": serializable,
     }
     atomic_save_and_backup(json.dumps(payload, indent=2, cls=_NumpyEncoder), json_path)
     log.info("Results JSON written to:  %s", json_path)
+
+
+def _mark_import_complete(json_path: Path) -> None:
+    """Flip ``import_status`` to ``"complete"`` in an already-written
+    album.json. Called once the full pipeline (analysis + FaceReco + LLM
+    culling) has finished, so a crash in between leaves the album correctly
+    marked ``"in_progress"`` instead of falsely looking finished."""
+    if not json_path.is_file():
+        return
+    with open(json_path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    payload["import_status"] = "complete"
+    atomic_save_and_backup(json.dumps(payload, indent=2, cls=_NumpyEncoder), json_path)
+    log.debug("Import marked complete: %s", json_path)
 
 
 def _compute_jersey_color(all_results: list[dict]) -> str:
@@ -1380,23 +1422,43 @@ def write_info_json(
     timestamp: str,
     json_path: Path,
     our_jersey_color: str | None = None,
+    *,
+    existing_info: dict | None = None,
 ) -> None:
-    """Write a run-summary JSON file."""
+    """Write a run-summary JSON file.
+
+    When importing more images into an existing album, pass the previous
+    info.json payload as *existing_info* -- its Anno_* entries and SrcDirs
+    are preserved and the new frames' entries are appended.
+    """
     def _entry(frame: Frame) -> dict:
-        return {"src": frame.path.name}
+        key = frame.output_key or frame.path.name
+        return {"src": key, "srcPath": str(frame.path)}
 
     blur_files    = [_entry(f) for f in frames if f.bodies and not f.is_sharp()]
     sharp_files   = [_entry(f) for f in frames if f.bodies and f.is_sharp()]
     skipped_files = [_entry(f) for f in frames if not f.bodies]
 
+    existing_info = existing_info or {}
+    src_dirs: list[str] = list(existing_info.get("SrcDirs") or [])
+    this_src = str(input_path.resolve())
+    if this_src not in src_dirs:
+        src_dirs.append(this_src)
+
     payload = {
-        "SrcDir":         str(input_path.resolve()),
+        # Kept for backward compatibility with older consumers that expect a
+        # single SrcDir: the FIRST source directory ever imported into this
+        # album. Every entry also carries its own "srcPath" (see _entry
+        # above) so multi-directory imports resolve correctly regardless.
+        "SrcDir":         existing_info.get("SrcDir") or this_src,
+        "SrcDirs":        src_dirs,
         "SrcType":        "File" if input_path.is_file() else "Directory",
-        "Timestamp":      timestamp,
+        "Timestamp":      existing_info.get("Timestamp") or timestamp,
+        "LastImportTimestamp": timestamp,
         "OurJerseyColor": our_jersey_color,
-        "Anno_Blur":      blur_files,
-        "Anno_Sharp":     sharp_files,
-        "Anno_Skipped":   skipped_files,
+        "Anno_Blur":      list(existing_info.get("Anno_Blur") or []) + blur_files,
+        "Anno_Sharp":     list(existing_info.get("Anno_Sharp") or []) + sharp_files,
+        "Anno_Skipped":   list(existing_info.get("Anno_Skipped") or []) + skipped_files,
     }
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
@@ -1742,6 +1804,69 @@ def main() -> None:
         log.error("Path does not exist: %s", input_path)
         sys.exit(1)
 
+    # --- Import-into-existing-album detection -----------------------------
+    # Merge mode: --output points at a directory that already has an
+    # album.json (i.e. "import more images" into an existing album). Load
+    # its prior state now so settings can be locked and new images
+    # deduplicated before any expensive model inference runs.
+    output_root = Path(args.output).resolve() if args.output else None
+    merge_mode = output_root is not None and (output_root / "album.json").is_file()
+
+    existing_payload: dict = {}
+    existing_info: dict = {}
+    existing_entries: list[dict] = []
+    imports_history: list[dict] = []
+    run_settings: dict = {}
+    already_imported: frozenset[Path] = frozenset()
+    used_keys: dict[str, Path] = {}
+
+    if merge_mode:
+        with open(output_root / "album.json", encoding="utf-8") as fh:
+            existing_payload = json.load(fh)
+        existing_entries = list(existing_payload.get("results", []))
+        imports_history = list(existing_payload.get("imports", []))
+        run_settings = dict(existing_payload.get("run_settings") or {})
+        info_path = output_root / "info.json"
+        if info_path.is_file():
+            with open(info_path, encoding="utf-8") as fh:
+                existing_info = json.load(fh)
+
+        already_imported = frozenset(
+            Path(e["file"]).resolve() for e in existing_entries if e.get("file")
+        )
+        for e in existing_entries:
+            if not e.get("file"):
+                continue
+            key = e.get("key") or Path(e["file"]).name
+            used_keys[key] = Path(e["file"]).resolve()
+
+        log.info(
+            "Importing into existing album %s — %d image(s) already present",
+            output_root, len(already_imported),
+        )
+
+        # Lock the settings that must stay consistent across every import
+        # into this album (grading/filtering behaviour), so a later "import
+        # more" run can't silently produce results inconsistent with the
+        # ones already reviewed. Settings are only locked once the album has
+        # actually recorded them (older albums without run_settings fall
+        # back to whatever was passed on the CLI, same as before).
+        if run_settings:
+            def _lock(name: str, current):
+                stored = run_settings.get(name)
+                if stored is not None and str(stored) != str(current):
+                    log.info(
+                        "Import-more: locking --%s to the original album setting %r (ignoring %r)",
+                        name, stored, current,
+                    )
+                return stored if stored is not None else current
+            args.sensitivity = _lock("sensitivity", args.sensitivity)
+            args.jerseycolor = _lock("jerseycolor", args.jerseycolor)
+            args.engine = _lock("engine", args.engine)
+            args.noteam = _lock("noteam", args.noteam)
+            args.team_id = _lock("team_id", args.team_id)
+            args.autoadjust = _lock("autoadjust", args.autoadjust)
+
     # Parse the semicolon-separated jersey colour list, normalise to title-case.
     # Colours prefixed with '+' are forced-include: they are always added to the
     # filter regardless of what other colours are listed (e.g. goalie colours).
@@ -1771,7 +1896,6 @@ def main() -> None:
         sensitivity_threshold = SENSITIVITY_THRESHOLDS[args.sensitivity]
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_root = Path(args.output).resolve() if args.output else None
     output_dir  = output_root if output_root is not None else Path("albums") / f"{ts}-{input_path.stem}"
     output_dir.mkdir(parents=True, exist_ok=True)
     _add_file_logging(output_dir / "run.log")
@@ -1784,40 +1908,76 @@ def main() -> None:
         if args.cpu_only:
             pose_model.to("cpu")
             face_model.to("cpu")
-        analysis_stage: ProcessStage = ImageAnalysisStage(input_path, pose_model, face_model)
+        analysis_stage: ProcessStage = ImageAnalysisStage(input_path, pose_model, face_model, skip_paths=already_imported)
     else:
         from algo.mediapipe_provider import load_face_landmarker, load_pose_landmarker
         from algo.torchvision_provider import load_person_detector
         person_detector = load_person_detector(force_cpu=args.cpu_only)
         pose_landmarker = load_pose_landmarker(num_poses=1)
         face_landmarker = load_face_landmarker(num_faces=1)
-        analysis_stage = MediaPipeImageAnalysisStage(input_path, person_detector, pose_landmarker, face_landmarker)
+        analysis_stage = MediaPipeImageAnalysisStage(
+            input_path, person_detector, pose_landmarker, face_landmarker, skip_paths=already_imported,
+        )
 
     face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, input_path)
 
+    # Run image analysis first (on its own) so each newly-discovered frame
+    # can be assigned its disambiguated bookkeeping key -- see
+    # algo/utils.py::make_unique_import_key -- before AnnotationStage (later
+    # in the pipeline) uses that key to name preview files.
+    frames: list[Frame] = analysis_stage.process([], app_config)
+    for frame in frames:
+        frame.output_key = make_unique_import_key(frame.path.name, used_keys, frame.path.resolve())
+
     jersey_stage = JerseyCountingStage(forced_colors, regular_colors, no_team=args.noteam)
     stages: list[ProcessStage] = [
-        analysis_stage,
         GradingStage(sensitivity_threshold),
         jersey_stage,
     ]
     if args.autoadjust:
         stages.append(AutoAdjustStage())
     stages.append(AnnotationStage(output_dir))
-    frames: list[Frame] = []
     for stage in stages:
         frames = stage.process(frames, app_config)
 
+    if merge_mode and not frames:
+        log.info("No new images found to import — album is already up to date.")
+
     our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
-    write_results_json(frames, output_dir / "album.json", our_jersey_color=our_jersey_color, team_id=args.team_id)
+    # Prefer the album's own recorded team_id on merge (covers albums written
+    # before run_settings existed, where args.team_id was never locked above).
+    team_id = existing_payload.get("team_id") if merge_mode and existing_payload.get("team_id") else args.team_id
+    new_import_record = {"src": str(input_path), "timestamp": ts, "image_count": len(frames)}
+    run_settings_out = run_settings or {
+        "sensitivity": args.sensitivity,
+        "jerseycolor": args.jerseycolor,
+        "engine": args.engine,
+        "noteam": args.noteam,
+        "team_id": args.team_id,
+        "autoadjust": args.autoadjust,
+    }
+    # A pending FaceReco/LLM-culling pass still needs to run against these
+    # new frames, so the album is provisionally "in_progress" until those
+    # complete (see the import_status flip near the end of this function).
+    # When there's nothing new to write, leave the existing status alone.
+    provisional_status = "in_progress" if frames else (existing_payload.get("import_status") or "complete")
+    write_results_json(
+        frames, output_dir / "album.json",
+        our_jersey_color=our_jersey_color, team_id=team_id,
+        existing_entries=existing_entries,
+        import_status=provisional_status,
+        imports_history=imports_history + ([new_import_record] if frames else []),
+        run_settings=run_settings_out,
+    )
 
     if frames:
-        write_csv(frames, output_dir / "blurry.csv")
+        write_csv(frames, output_dir / "blurry.csv", append=merge_mode)
         write_info_json(frames, input_path, datetime.now().strftime("%Y%m%d-%H%M%S"),
-                        output_dir / "info.json", our_jersey_color=our_jersey_color)
+                        output_dir / "info.json", our_jersey_color=our_jersey_color,
+                        existing_info=existing_info)
     if any(f.bodies and not f.is_sharp() for f in frames):
-        write_blur_lst(frames, output_dir / "blur.lst")
-    else:
+        write_blur_lst(frames, output_dir / "blur.lst", append=merge_mode)
+    elif not merge_mode:
         log.info("No blurry images detected — blur.lst not written.")
 
     if frames:
@@ -1855,11 +2015,25 @@ def main() -> None:
         try:
             from algo.llm.culling_provider import OpenAIProvider
             provider = OpenAIProvider(api_key=openai_api_key, model=args.llm_model)
-            LLMCullingStage(output_dir, provider=provider, threshold=sensitivity_threshold).process(frames, app_config)
+            # Only frames processed THIS run — when merging into an existing
+            # album, this restricts (re-)ranking to just the bursts/images
+            # that touch a newly-imported photo, instead of re-ranking (and
+            # re-billing) the whole album's LLM culling every import.
+            new_keys = frozenset(f.output_key or f.path.name for f in frames)
+            LLMCullingStage(
+                output_dir, provider=provider, threshold=sensitivity_threshold, new_keys=new_keys,
+            ).process(frames, app_config)
         except Exception as exc:
             log.error("LLM-assisted burst culling failed: %s", exc, exc_info=True)
     elif frames and not openai_api_key:
         log.info("LLM-assisted burst culling skipped: no OpenAI API key (--openaikey or OPENAI_API_KEY).")
+
+    if frames:
+        # Import completed successfully (analysis + FaceReco + LLM culling,
+        # whichever ran) -- flip the provisional "in_progress" flag written
+        # earlier so consumers (culling_app.py's album list, etc.) can tell
+        # a finished import apart from one interrupted mid-run.
+        _mark_import_complete(output_dir / "album.json")
 
     if frames:
         log.info("When done, run:  python culling_app.py")
