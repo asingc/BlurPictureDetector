@@ -140,6 +140,10 @@ class BrowseFolderRequest(BaseModel):
 class ExportRequest(BaseModel):
     destination: str
     exportFaceTagging: bool = True
+    # Minimum star rating (1-5) an image must have to be exported — replaces
+    # the old keep/drop flag as the export criterion. Defaults to 3 (the
+    # baseline "keep" tier).
+    minStars: int = 3
 
 
 class AlbumSelectRequest(BaseModel):
@@ -151,10 +155,13 @@ class AlbumDeleteRequest(BaseModel):
 
 
 class ReviewApplyRequest(BaseModel):
-    # {original filename: keep} for every image the user actually toggled
-    # this session, across all 3 review tabs at once. Anything not present
-    # here keeps its current effective (explicit-or-default) keep state.
-    overrides: dict[str, bool] = Field(default_factory=dict)
+    # {original filename: stars} for every image the user star-rated (hotkeys
+    # 1-5, or the space-bar quick keep/drop toggle) this session, across all
+    # 3 review tabs at once. Anything not present here keeps its current
+    # effective (explicit-or-default) star rating. "keep" is always derived
+    # server-side from the final star rating (3+ = keep) — there is no
+    # separate keep/drop flag to track.
+    starOverrides: dict[str, int] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -602,6 +609,12 @@ _PREVIEWS_SUBDIR = "previews"
 # manually deleting anno_* previews to "reject" an image.
 _REVIEW_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
 
+# Effective star rating when album.json has no explicit "stars" value yet
+# (older albums, or the LLM culling stage never ran) — same true/false split
+# as _REVIEW_DEFAULT_KEEP, expressed on the 1-5 scale (3 = baseline keep,
+# 1 = baseline discard).
+_REVIEW_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _REVIEW_DEFAULT_KEEP.items()}
+
 # Consecutive photos within this many seconds of each other are treated as
 # the same "burst" for the nav-pane grouping.
 BURST_GAP_SECONDS = 1.0
@@ -648,12 +661,14 @@ def _results_by_filename(payload: dict) -> dict[str, dict]:
 
 def _review_images(album_path: Path, category: str) -> list[dict]:
     """Per-image metadata for one review category: filename, annotated-preview
-    filename, effective keep state, and best-effort capture timestamp."""
+    filename, effective star rating, effective keep state (derived from the
+    star rating — 3+ = keep — so it can never drift out of sync with the
+    star-driven color scheme), and best-effort capture timestamp."""
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
     src_dir = Path(info.get("SrcDir", ""))
     results_by_name = _results_by_filename(_load_results_payload(album_path))
-    default_keep = _REVIEW_DEFAULT_KEEP[category]
+    default_stars = _REVIEW_DEFAULT_STARS[category]
     previews_dir = album_path / _PREVIEWS_SUBDIR
 
     images = []
@@ -666,7 +681,9 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
         if not preview_path:
             continue
         anno_name = Path(preview_path).name
-        keep = bool(result.get("keep", default_keep)) if result else default_keep
+        stars = result.get("stars") if result else None
+        stars = int(stars) if stars is not None else default_stars
+        keep = stars >= 3
         burst_ranking = result.get("burst_ranking") if result else None
         llm_grade = result.get("llm_grade") if result else None
         src_path = src_dir / src_name
@@ -675,6 +692,7 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
             "file": src_name,
             "anno": anno_name,
             "keep": keep,
+            "stars": stars,
             "burstRanking": burst_ranking,
             "llmGrade": llm_grade,
             "timestamp": _image_timestamp(ts_path),
@@ -682,15 +700,15 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
     return images
 
 
-def _kept_image_basenames(album_path: Path) -> set[str]:
-    """Basenames of every image the user decided to keep, across all 3
-    review categories — the same effective (explicit-or-default) keep state
-    the Review page shows. Used by the Apply/export step to decide which
-    original photos (and which face crops) to copy to the destination."""
+def _kept_image_basenames(album_path: Path, min_stars: int = 3) -> set[str]:
+    """Basenames of every image at or above *min_stars* — the same effective
+    (explicit-or-default) star rating the Review page shows. Used by the
+    Apply/export step to decide which original photos (and which face crops)
+    to copy to the destination."""
     kept: set[str] = set()
     for category in REVIEW_CATEGORIES:
         for image in _review_images(album_path, category):
-            if image["keep"]:
+            if image["stars"] >= min_stars:
                 kept.add(image["file"])
     return kept
 
@@ -1176,9 +1194,9 @@ def _open_in_file_explorer(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool) -> None:
+def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool, min_stars: int) -> None:
     try:
-        kept = _kept_image_basenames(album_path)
+        kept = _kept_image_basenames(album_path, min_stars)
         with export_state.lock:
             export_state.total_images = len(kept)
             export_state.dest_dir = str(dest_dir)
@@ -1210,7 +1228,7 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool) -> 
                 with export_state.lock:
                     export_state.copied_images += 1
 
-        cmd = [sys.executable, str(REPO_ROOT / "apply_export.py"), str(album_path), str(dest_dir)]
+        cmd = [sys.executable, str(REPO_ROOT / "apply_export.py"), str(album_path), str(dest_dir), "--min-stars", str(min_stars)]
         if export_face_tagging:
             cmd.append("--export-face-tagging")
         rc = _stream_subprocess(cmd, on_line=_bump_copied)
@@ -1381,7 +1399,7 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
         "category": category,
         "groups": [
             {"images": [
-                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
+                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
                 for im in group
             ]}
             for group in groups
@@ -1402,11 +1420,12 @@ def api_review_thumb(category: str = Query(...), file: str = Query(...)) -> File
 
 @app.post("/api/review/apply")
 def api_review_apply(req: ReviewApplyRequest) -> dict:
-    """Commit pending keep/drop decisions (staged client-side, across all 3
+    """Commit pending star-rating decisions (staged client-side, across all 3
     review tabs at once) into album.json. Every reviewable entry gets an
-    explicit "keep" field written — the user's override if they touched it
+    explicit "stars" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
-    so album.json becomes fully self-describing going forward. Written
+    with "keep" always derived from the final star rating (3+ = keep) so it
+    can never drift out of sync with the star-driven color scheme. Written
     atomically (temp file + os.replace, with the previous contents backed
     up) so a crash mid-write can never corrupt album.json."""
     album_path = _current_album_path()
@@ -1416,17 +1435,21 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
     results_by_name = _results_by_filename(payload)
 
     for category in REVIEW_CATEGORIES:
-        default_keep = _REVIEW_DEFAULT_KEEP[category]
+        default_stars = _REVIEW_DEFAULT_STARS[category]
         for item in info.get(_REVIEW_INFO_KEY[category], []):
             src_name = item.get("src")
             result = results_by_name.get(src_name)
             if result is None:
                 continue
-            current = bool(result.get("keep", default_keep))
-            result["keep"] = bool(req.overrides.get(src_name, current))
+            current_stars = result.get("stars")
+            current_stars = int(current_stars) if current_stars is not None else default_stars
+            stars = int(req.starOverrides.get(src_name, current_stars))
+            result["stars"] = stars
+            result["keep"] = stars >= 3
 
     atomic_save_and_backup(json.dumps(payload, indent=2), album_path / "album.json")
-    log.info("Review changes applied: %s (%d overrides)", album_path.resolve(), len(req.overrides))
+    log.info("Review changes applied: %s (%d star overrides)",
+             album_path.resolve(), len(req.starOverrides))
     return {"ok": True}
 
 
@@ -1592,12 +1615,26 @@ def api_apply_summary() -> dict:
     )
     kept = len(_kept_image_basenames(album_path))
     clusters = _build_clusters(album_path)
+
+    results = _load_results_payload(album_path).get("results", [])
+    star_breakdown = {str(n): 0 for n in range(5, 0, -1)}
+    unrated = 0
+    for entry in results:
+        stars = entry.get("stars")
+        key = str(stars)
+        if key in star_breakdown:
+            star_breakdown[key] += 1
+        else:
+            unrated += 1
+
     return {
         "name": album_path.name,
         "imagesKept": kept,
         "imagesDropped": max(0, total_images - kept),
         "facesDetected": sum(len(c["faces"]) for c in clusters),
         "playersDetected": sum(1 for c in clusters if not c["pending"]),
+        "starBreakdown": star_breakdown,
+        "unrated": unrated,
     }
 
 
@@ -1617,9 +1654,10 @@ def api_start_export(req: ExportRequest) -> dict:
         export_state.reset()
         export_state.running = True
 
+    min_stars = max(1, min(5, req.minStars))
     thread = threading.Thread(
         target=_run_export,
-        args=(album_path, dest_path, req.exportFaceTagging),
+        args=(album_path, dest_path, req.exportFaceTagging, min_stars),
         daemon=True,
     )
     thread.start()

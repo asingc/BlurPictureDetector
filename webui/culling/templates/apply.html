@@ -5,32 +5,38 @@
 
 <div class="panel" id="summaryPanel">
   <h3 id="summaryAlbumName">Album</h3>
+  <div class="star-breakdown" id="starBreakdown"></div>
   <div class="stat-grid" id="summaryStats">
-    <div class="stat"><span class="stat-value" id="statKept">–</span><span class="stat-label">Images kept</span></div>
-    <div class="stat"><span class="stat-value" id="statDropped">–</span><span class="stat-label">Images dropped</span></div>
     <div class="stat"><span class="stat-value" id="statFaces">–</span><span class="stat-label">Faces detected</span></div>
     <div class="stat"><span class="stat-value" id="statPlayers">–</span><span class="stat-label">Players detected</span></div>
   </div>
 </div>
 
 <div class="panel" id="exportPanel">
-  <h3>Export</h3>
+  <h3>Export to Folder</h3>
   <p class="muted">
-    Syncs every tagged player's face crops (from kept photos) into the
-    system-wide <code>.FaceReco</code> database and rebuilds its embeddings,
-    then copies all kept photos to a destination folder of your choice
-    along with a <code>players.csv</code> tagging file.
+    Copies every photo at or above the selected star rating to a destination
+    folder of your choice. If face tagging is enabled below, also generates
+    a <code>players.csv</code> file listing which players appear in each
+    photo.
   </p>
+  <div class="row">
+    <label class="inline-check">Minimum stars to export
+      <select id="minStarsInput">
+        <option value="1">1+ ★</option>
+        <option value="2">2+ ★</option>
+        <option value="3" selected>3+ ★</option>
+        <option value="4">4+ ★</option>
+        <option value="5">5 ★ only</option>
+      </select>
+    </label>
+    <span id="exportCountLabel" class="muted"></span>
+  </div>
   <div class="row">
     <label class="inline-check">
       <input type="checkbox" id="exportFaceTaggingInput" checked />
       Export face tagging
     </label>
-  </div>
-
-  <div id="exportOutputSection" style="display:none">
-    <h3 style="margin-top:24px">Export Progress</h3>
-    <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
   </div>
 
   <div class="row actions">
@@ -50,6 +56,11 @@
       <span>Export</span>
     </button>
   </div>
+</div>
+
+<div id="exportDialog" title="Exporting…" style="display:none">
+  <p id="exportDialogStatus" class="muted"></p>
+  <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
 </div>
 {% endblock %}
 {% block extra_scripts %}

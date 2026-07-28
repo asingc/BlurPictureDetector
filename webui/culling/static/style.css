@@ -17,6 +17,13 @@
   --shadow-sm: 0 1px 2px rgba(20, 20, 30, 0.04);
   --shadow-md: 0 4px 16px rgba(20, 20, 30, 0.06);
   --radius: 10px;
+  /* Star-rating scale (1 = white, ramping up to deep blue at 5) shared by
+     the Apply-page breakdown and the Review page's dots/preview border. */
+  --star-1: #ffffff;
+  --star-2: #c6dbef;
+  --star-3: #6baed6;
+  --star-4: #3182bd;
+  --star-5: #08519c;
 }
 
 * { box-sizing: border-box; }
@@ -493,6 +500,38 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 .stat-label { font-size: 12px; color: var(--muted); }
 
 /* ------------------------------------------------------------------ *
+ * Star-rating breakdown (Apply page) — 5 down to 1 star, square blocks
+ * (icon row + count row), colour-coded white (1 star) ramping up to
+ * deep blue (5 stars).
+ * ------------------------------------------------------------------ */
+.star-breakdown {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.star-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px 8px;
+  border-radius: var(--radius);
+  aspect-ratio: 1 / 1;
+}
+.star-icons { font-size: 14px; letter-spacing: 1px; }
+.star-count { font-size: 22px; font-weight: 700; }
+.star-block-5 { background: var(--star-5); color: #fff; }
+.star-block-4 { background: var(--star-4); color: #fff; }
+.star-block-3 { background: var(--star-3); color: #0a2740; }
+.star-block-2 { background: var(--star-2); color: var(--text); }
+.star-block-1 { background: var(--star-1); color: var(--text); border: 1px solid var(--border); }
+.star-block-unrated { color: var(--muted); border: 1px dashed var(--border); }
+.star-block-unrated .star-icons { opacity: 0.6; }
+
+
+/* ------------------------------------------------------------------ *
  * Face clustering — native cluster/thumbnail review UI
  * ------------------------------------------------------------------ */
 .page-cluster #content { max-width: 1100px; }
@@ -713,6 +752,13 @@ body.page-review #content {
   border-radius: 6px;
   cursor: pointer;
   min-height: 14px;
+  /* Rows are flex children of a column flex container (.review-nav); without
+     this, the default flex-shrink:1 lets big-cluster rows (many wrapped
+     dot-lines) get squeezed down toward min-height instead of keeping their
+     full wrapped height, clipping/overlapping dots. flex: 0 0 auto locks
+     each row's height to its actual content so .review-nav scrolls instead
+     of squishing rows. */
+  flex: 0 0 auto;
 }
 .review-nav-row:hover { background: var(--surface-2); }
 .review-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
@@ -722,8 +768,11 @@ body.page-review #content {
   border-radius: 4px;
   flex: 0 0 auto;
 }
-.review-dot.keep { background: #3a6fd8; }
-.review-dot.drop { background: var(--danger); }
+.review-dot.star-5 { background: var(--star-5); }
+.review-dot.star-4 { background: var(--star-4); }
+.review-dot.star-3 { background: var(--star-3); }
+.review-dot.star-2 { background: var(--star-2); }
+.review-dot.star-1 { background: var(--star-1); box-shadow: 0 0 0 1px var(--border) inset; }
 
 /* Main pane — multi-image preview + in-group thumbnail strip (~7/8 width). */
 .review-main {
@@ -770,7 +819,11 @@ body.page-review #content {
   max-width: 100%;
   max-height: 100%;
 }
-.review-preview-viewport.selected { border-color: navy; }
+.review-preview-viewport.star-5 { border-color: var(--star-5); }
+.review-preview-viewport.star-4 { border-color: var(--star-4); }
+.review-preview-viewport.star-3 { border-color: var(--star-3); }
+.review-preview-viewport.star-2 { border-color: var(--star-2); }
+.review-preview-viewport.star-1 { border-color: var(--star-1); box-shadow: 0 0 0 1px var(--border); }
 .review-preview-viewport img {
   width: 100%;
   height: 100%;
@@ -804,37 +857,6 @@ body.page-review #content {
 .review-strip-thumb { position: relative; }
 .review-strip-thumb .rank-badge { top: 2px; left: 2px; }
 
-/* Selection ("keep") indicator — blue checkmark badge overlaid on the
-   upper-left corner of the preview viewport / strip thumbnail. The navy
-   frame itself lives on .review-preview-viewport.selected / .review-strip-
-   thumb.keep. Unselected images get neither. */
-.keep-badge {
-  position: absolute;
-  top: 4px;
-  left: 4px;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  background: #2255cc;
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
-  line-height: 20px;
-  text-align: center;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-  pointer-events: none;
-  z-index: 4;
-}
-.keep-badge + .rank-badge { left: 28px; }
-.review-strip-thumb .keep-badge {
-  top: 2px;
-  left: 2px;
-  width: 14px;
-  height: 14px;
-  font-size: 9px;
-  line-height: 14px;
-}
-.review-strip-thumb .keep-badge + .rank-badge { left: 18px; }
 .review-rank-info {
   display: flex;
   align-items: center;
@@ -872,20 +894,38 @@ body.page-review #content {
 .review-strip-thumb {
   flex: 0 0 auto;
   width: 64px;
-  height: 64px;
   border-radius: 6px;
   border: 2px solid transparent;
   padding: 2px;
   cursor: pointer;
   background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
 }
 .review-strip-thumb.active { border-color: var(--accent); }
-.review-strip-thumb img {
+.review-strip-img-wrap {
+  position: relative;
+  width: 64px;
+  height: 64px;
+}
+.review-strip-img-wrap img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   border-radius: 4px;
   display: block;
+}
+/* Small star-rating icon row shown under each in-group strip thumbnail,
+   centered beneath the picture. */
+.review-strip-stars {
+  width: 100%;
+  text-align: center;
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 1px;
+  color: var(--muted);
 }
 
 /* ------------------------------------------------------------------ *

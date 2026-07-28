@@ -129,6 +129,7 @@ class LLMCullingStage(ProcessStage):
         self,
         output_dir: Path,
         provider: CullingProvider,
+        threshold: float,
         burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
         min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
         image_max_long_edge: int = DEFAULT_IMAGE_MAX_LONG_EDGE,
@@ -137,6 +138,11 @@ class LLMCullingStage(ProcessStage):
     ) -> None:
         self.output_dir = output_dir
         self.provider = provider
+        # The same blur-sensitivity threshold used earlier (GradingStage) to
+        # split sharp/blurry — reused here to split the *discard* side of the
+        # star scale (1 vs 2 stars) between "clearly bad" and "close to the
+        # keep line". See _assign_star_ratings.
+        self.threshold = threshold
         self.burst_gap_seconds = burst_gap_seconds
         self.min_group_size = min_group_size
         self.image_max_long_edge = image_max_long_edge
@@ -200,7 +206,10 @@ class LLMCullingStage(ProcessStage):
             log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_entries))
             self._grade_standalone_entries(standalone_entries)
 
-        self._assign_star_ratings(sharp_entries)
+        all_entries = payload.get("results", [])
+        blurry_entries = [e for e in all_entries if e.get("status") == "blurry"]
+        skipped_entries = [e for e in all_entries if e.get("status") in ("skipped", "error")]
+        self._assign_star_ratings(sharp_entries, blurry_entries, skipped_entries)
 
         for entry in sharp_entries:
             entry.pop("_timestamp", None)
@@ -224,22 +233,42 @@ class LLMCullingStage(ProcessStage):
 
         return frames
 
-    def _assign_star_ratings(self, sharp_entries: list[dict]) -> None:
-        """Assign a 3-5 star rating to every sharp entry.
+    def _assign_star_ratings(
+        self,
+        sharp_entries: list[dict],
+        blurry_entries: list[dict],
+        skipped_entries: list[dict],
+    ) -> None:
+        """Assign a 1-5 star rating to every analysed entry (sharp, blurry,
+        or skipped) so the whole album can be ranked on one scale:
 
-        Baseline: every sharp frame (it already qualified as "sharp") gets
-        3 stars. Frames land in higher tiers by ``llm_grade`` percentile,
-        measured across every sharp frame that received a grade (whether
-        ranked as part of a burst or graded standalone) — the top
-        ``STAR_4_TOP_FRACTION`` get 4 stars, the top ``STAR_5_TOP_FRACTION``
-        get 5 stars.
+        - 1 star:  no face detected (``skipped``/``error``), or a blurry
+          frame whose sharpness_score is below ``min(threshold, 0.4)`` —
+          clearly discard.
+        - 2 stars: a blurry frame whose sharpness_score is between
+          ``min(threshold, 0.4)`` and ``threshold`` — still below the keep
+          line, but close to it.
+        - 3 stars: baseline for every ``sharp`` frame (it already qualified
+          as a keeper).
+        - 4 stars: top ``STAR_4_TOP_FRACTION`` of sharp frames by
+          ``llm_grade`` percentile (measured across every sharp frame that
+          received a grade, whether ranked as part of a burst or graded
+          standalone).
+        - 5 stars: top ``STAR_5_TOP_FRACTION`` by that same percentile.
 
-        Burst ranking then applies a *floor* on top of that: a burst's #1
-        pick is always at least 5 stars and its #2/#3 picks are always at
-        least 4 stars, regardless of where their llm_grade falls in the
-        global percentile (it can never be lowered by this step — only
-        raised).
+        Burst ranking then applies a *floor* on top of the 3-5 tiers: a
+        burst's #1 pick is always at least 5 stars and its #2/#3 picks are
+        always at least 4 stars, regardless of where their llm_grade falls
+        in the global percentile (it can never be lowered by this step —
+        only raised).
         """
+        low_cutoff = min(self.threshold, 0.4)
+        for entry in skipped_entries:
+            entry["stars"] = 1
+        for entry in blurry_entries:
+            score = entry.get("sharpness_score")
+            entry["stars"] = 1 if score is None or score < low_cutoff else 2
+
         for entry in sharp_entries:
             entry["stars"] = 3
 
@@ -260,12 +289,13 @@ class LLMCullingStage(ProcessStage):
                 entry["stars"] = max(entry["stars"], 4)
 
         log.info(
-            "[LLMCullingStage] star ratings: %d sharp frame(s) — %d x5\u2605, %d x4\u2605, %d x3\u2605 (%d graded)",
-            len(sharp_entries),
-            sum(1 for e in sharp_entries if e["stars"] == 5),
-            sum(1 for e in sharp_entries if e["stars"] == 4),
+            "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605, %d5\u2605 (%d sharp/%d blurry/%d skipped)",
+            sum(1 for e in skipped_entries + blurry_entries if e["stars"] == 1),
+            sum(1 for e in blurry_entries if e["stars"] == 2),
             sum(1 for e in sharp_entries if e["stars"] == 3),
-            len(graded),
+            sum(1 for e in sharp_entries if e["stars"] == 4),
+            sum(1 for e in sharp_entries if e["stars"] == 5),
+            len(sharp_entries), len(blurry_entries), len(skipped_entries),
         )
 
     def _apply_rankings(self, burst: list[dict], group_id: str, result: BurstRankingResult) -> None:

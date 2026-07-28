@@ -49,10 +49,11 @@ log = logging.getLogger("apply_export")
 _FMT = "%(asctime)s [%(levelname)-8s] %(message)s"
 
 # Mirrors culling_app.py's REVIEW_CATEGORIES / _kept_image_basenames: which
-# info.json list backs each review category, and the effective "keep" value
-# when album.json has no explicit override yet.
+# info.json list backs each review category, and the effective star rating
+# when album.json has no explicit "stars" value yet.
 _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
 _REVIEW_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
+_REVIEW_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _REVIEW_DEFAULT_KEEP.items()}
 
 _PLAYERS_CSV_HEADER = ["Player Name", "Player Number", "Image Path"]
 
@@ -97,20 +98,21 @@ def _setup_logging() -> None:
     log.addHandler(handler)
 
 
-def _kept_image_basenames(info: dict, results_by_name: dict[str, dict]) -> set[str]:
-    """Basenames of every image the user decided to keep — the explicit
-    "keep" flag written by the Review page's Apply step if present, else the
+def _kept_image_basenames(info: dict, results_by_name: dict[str, dict], min_stars: int = 3) -> set[str]:
+    """Basenames of every image at or above *min_stars* — the explicit "stars"
+    value written by the Review page's Apply step if present, else the
     per-category default. Matches culling_app.py's _kept_image_basenames()."""
     kept: set[str] = set()
     for category, info_key in _REVIEW_INFO_KEY.items():
-        default_keep = _REVIEW_DEFAULT_KEEP[category]
+        default_stars = _REVIEW_DEFAULT_STARS[category]
         for item in info.get(info_key, []):
             src_name = item.get("src")
             if not src_name:
                 continue
             result = results_by_name.get(src_name)
-            keep = bool(result.get("keep", default_keep)) if result else default_keep
-            if keep:
+            stars = result.get("stars") if result else None
+            stars = int(stars) if stars is not None else default_stars
+            if stars >= min_stars:
                 kept.add(src_name)
     return kept
 
@@ -247,6 +249,13 @@ def main() -> None:
         action="store_true",
         help="Populate players.csv rows. Without this flag, players.csv is still created but header-only.",
     )
+    parser.add_argument(
+        "--min-stars",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Minimum star rating (1-5) an image must have to be exported (default: 3).",
+    )
     args = parser.parse_args()
 
     album_dir = Path(args.album_dir).resolve()
@@ -264,7 +273,7 @@ def main() -> None:
         results = json.load(fh)
 
     results_by_name = {Path(r.get("file", "")).name: r for r in results.get("results", [])}
-    kept = _kept_image_basenames(info, results_by_name)
+    kept = _kept_image_basenames(info, results_by_name, args.min_stars)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 

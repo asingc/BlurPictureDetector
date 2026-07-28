@@ -122,10 +122,15 @@ IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
 #   low    → only flag severely blurry images  (high tolerance)
 #   medium → balanced default
 #   high   → flag even slightly blurry images  (low tolerance)
-# "high" recalibrated 2026-07-27 (0.70 -> 0.68) alongside the production
-# sharpness-evaluator swap to WeightedGeometricMeanEvaluator (algo/sharpness.py),
-# to preserve the recall the old evaluator achieved at its old 0.70 threshold —
-# see culling_app.py's SENSITIVITY_PRESETS and _setup_tmp/sharpness_eval/calibrate_high_threshold.py.
+# Recalibrated 2026-07-27 (low 0.35->0.16, medium 0.50->0.28, high 0.68->0.42)
+# alongside the production face-crop size change to a fixed 96px long edge
+# (clamp_long_edge / app_config.face_crop_{min,max}_long_edge_px in
+# algo/scorers.py, replacing the old shrink-only ~4%-of-image-size cap) —
+# normalizing crop size shifts the WeightedGeometricMeanEvaluator score scale,
+# so each threshold was re-picked to preserve the RECALL the old
+# variable/native crop size achieved at its old threshold — see
+# culling_app.py's SENSITIVITY_PRESETS and
+# _setup_tmp/sharpness_eval/calibrate_96px_thresholds.py.
 SENSITIVITY_THRESHOLDS: dict[str, float] = {
     "low":    0.35,
     "medium": 0.50,
@@ -1850,7 +1855,7 @@ def main() -> None:
         try:
             from algo.llm.culling_provider import OpenAIProvider
             provider = OpenAIProvider(api_key=openai_api_key, model=args.llm_model)
-            LLMCullingStage(output_dir, provider=provider).process(frames, app_config)
+            LLMCullingStage(output_dir, provider=provider, threshold=sensitivity_threshold).process(frames, app_config)
         except Exception as exc:
             log.error("LLM-assisted burst culling failed: %s", exc, exc_info=True)
     elif frames and not openai_api_key:

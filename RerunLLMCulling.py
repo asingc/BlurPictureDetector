@@ -154,6 +154,18 @@ def main() -> None:
         help=f"Minimum burst size to be re-ranked; smaller bursts are left untouched (default: {DEFAULT_MIN_GROUP_SIZE}).",
     )
     parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.50,
+        metavar="F",
+        help=(
+            "Blur-sensitivity threshold (0-1) originally used for this album's "
+            "sharp/blurry split (see 1_prep_review.py's --sensitivity) -- reused "
+            "here to assign 1 vs 2 stars to blurry/skipped frames. Should match "
+            "the value the album was actually processed with (default: 0.50)."
+        ),
+    )
+    parser.add_argument(
         "--image-max-long-edge",
         type=int,
         default=DEFAULT_IMAGE_MAX_LONG_EDGE,
@@ -246,6 +258,7 @@ def main() -> None:
     stage = LLMCullingStage(
         output_dir,
         provider=provider,
+        threshold=args.threshold,
         burst_gap_seconds=args.burst_gap_seconds,
         min_group_size=args.min_group_size,
         image_max_long_edge=args.image_max_long_edge,

@@ -19,18 +19,24 @@ function previewImgs() {
   return $("#reviewPreview .review-preview-cell img");
 }
 
-// categoryData[category] = { groups: [{images:[{file,anno,keep}, ...]}, ...], activeGroup, activeImage }
+// categoryData[category] = { groups: [{images:[{file,anno,keep,stars}, ...]}, ...], activeGroup, activeImage }
 const categoryData = {};
-// Pending client-side overrides, shared across all 3 tabs: {filename: keep}
-const pendingOverrides = {};
+// Pending client-side star-rating overrides (hotkeys 1-5, or the space-bar
+// quick keep/drop toggle), shared across all 3 tabs: {filename: stars (1-5)}.
+// "keep" is always derived from stars (3+ = keep) — there is no separate
+// keep/drop map to track.
+const pendingStarOverrides = {};
 
 function reviewThumbUrl(category, anno) {
   return `/api/review/thumb?category=${encodeURIComponent(category)}&file=${encodeURIComponent(anno)}`;
 }
 
+// Initial active image within a group when it's first loaded/navigated to:
+// the first image at or above the baseline "keep" star tier (3+), same as
+// the star-driven color scheme used everywhere else on this page.
 function firstKeepIndex(group) {
   if (!group || !group.images.length) return 0;
-  const idx = group.images.findIndex((im) => im.keep);
+  const idx = group.images.findIndex((im) => (im.stars || 3) >= 3);
   return idx >= 0 ? idx : 0;
 }
 
@@ -76,13 +82,16 @@ async function initReview() {
 async function fetchCategory(category) {
   const url = `/api/review/data?category=${encodeURIComponent(category)}&sort=${encodeURIComponent(sortMode)}`;
   const data = await apiGet(url);
-  // Re-apply any pending (not-yet-applied) overrides on top of the
-  // persisted keep state the server just handed back.
+  // Re-apply any pending (not-yet-applied) star overrides on top of the
+  // persisted state the server just handed back, then derive "keep" from
+  // the effective star rating so it can never drift out of sync with the
+  // star-driven color scheme.
   data.groups.forEach((group) => {
     group.images.forEach((im) => {
-      if (Object.prototype.hasOwnProperty.call(pendingOverrides, im.file)) {
-        im.keep = pendingOverrides[im.file];
+      if (Object.prototype.hasOwnProperty.call(pendingStarOverrides, im.file)) {
+        im.stars = pendingStarOverrides[im.file];
       }
+      im.keep = (im.stars || 3) >= 3;
     });
   });
   categoryData[category] = {
@@ -99,7 +108,7 @@ async function ensureCategory(category) {
 }
 
 // ------------------------------------------------------------------ //
-// Nav pane (burst groups as rows of small keep/drop dots)
+// Nav pane (burst groups as rows of small star-colored dots)
 // ------------------------------------------------------------------ //
 function renderNav() {
   const data = categoryData[currentCategory];
@@ -109,7 +118,7 @@ function renderNav() {
   data.groups.forEach((group, gi) => {
     const $row = $("<div>", { class: "review-nav-row" }).toggleClass("active", gi === data.activeGroup);
     group.images.forEach((im) => {
-      $row.append($("<span>", { class: "review-dot" }).toggleClass("keep", !!im.keep).toggleClass("drop", !im.keep));
+      $row.append($("<span>", { class: `review-dot star-${im.stars || 3}` }));
     });
     $row.on("click", () => {
       data.activeGroup = gi;
@@ -169,13 +178,6 @@ $("#reviewPreview").on("wheel", function (e) {
 $("#reviewPreview").on("click", ".review-preview-cell img", function (e) {
   previewZoomCtl.toggleClick(previewImgs(), this, e.clientX, e.clientY);
 });
-
-// Zoom to 100% (actual pixel size) — used by the '1' hotkey.
-function zoomToActualSize() {
-  const $img = previewImgs().first();
-  if (!$img.length) return;
-  previewZoomCtl.zoomToActual(previewImgs(), $img[0]);
-}
 
 // Give a preview viewport the image's intrinsic aspect ratio so pure CSS
 // (max-width/max-height: 100% of the cell, see .review-preview-viewport)
@@ -244,12 +246,9 @@ function renderMain() {
   for (let i = start; i < end; i++) {
     const im = group.images[i];
     const $cell = $("<div>", { class: "review-preview-cell" });
-    const $viewport = $("<div>", { class: "review-preview-viewport" }).toggleClass("selected", !!im.keep);
+    const $viewport = $("<div>", { class: `review-preview-viewport star-${im.stars || 3}` });
     const $img = $("<img>", { src: reviewThumbUrl(currentCategory, im.anno), alt: im.file });
     $viewport.append($img);
-    if (im.keep) {
-      $viewport.append($("<span>", { class: "keep-badge" }).html("&#10003;"));
-    }
     if (im.burstRanking) {
       $viewport.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
     }
@@ -266,15 +265,15 @@ function renderMain() {
 
   group.images.forEach((im, i) => {
     const $thumb = $("<div>", { class: "review-strip-thumb" }).toggleClass("active", i === data.activeImage);
-    $thumb.toggleClass("keep", !!im.keep);
-    $thumb.append($("<img>", { src: reviewThumbUrl(currentCategory, im.anno), alt: im.file }));
-    if (im.keep) {
-      $thumb.append($("<span>", { class: "keep-badge" }).html("&#10003;"));
-    }
+    const $imgWrap = $("<div>", { class: "review-strip-img-wrap" });
+    $imgWrap.append($("<img>", { src: reviewThumbUrl(currentCategory, im.anno), alt: im.file }));
     if (im.burstRanking) {
-      $thumb.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
+      $imgWrap.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
       $thumb.attr("title", "#" + im.burstRanking.rank + ": " + (im.burstRanking.reason || ""));
     }
+    $thumb.append($imgWrap);
+    const stars = im.stars || 3;
+    $thumb.append($("<div>", { class: "review-strip-stars" }).text("★".repeat(stars) + "☆".repeat(5 - stars)));
     $thumb.on("click", () => {
       data.activeImage = i;
       renderMain();
@@ -288,14 +287,31 @@ function renderMain() {
   }
 }
 
+// Spacebar quick toggle: flips between the baseline "keep" star tier (3)
+// and the baseline "drop" tier (1) by routing through setActiveStars, so
+// the border/dot colors always stay in sync with whatever set the star
+// rating last (never a separate, driftable "keep" flag).
 function toggleActiveKeep() {
   const data = categoryData[currentCategory];
   if (!data) return;
   const group = data.groups[data.activeGroup];
   if (!group) return;
   const im = group.images[data.activeImage];
-  im.keep = !im.keep;
-  pendingOverrides[im.file] = im.keep;
+  setActiveStars((im.stars || 3) >= 3 ? 1 : 3);
+}
+
+// Star-rating hotkeys (1-5): sets the active image's star tier and derives
+// keep from it (3+ = keep, 1-2 = drop), consistent with the LLM-assigned
+// star scale (see algo/stages/llm_culling.py::_assign_star_ratings).
+function setActiveStars(stars) {
+  const data = categoryData[currentCategory];
+  if (!data) return;
+  const group = data.groups[data.activeGroup];
+  if (!group) return;
+  const im = group.images[data.activeImage];
+  im.stars = stars;
+  im.keep = stars >= 3;
+  pendingStarOverrides[im.file] = stars;
   renderNav();
   renderMain();
 }
@@ -361,7 +377,11 @@ $(document).on("keydown", (e) => {
       toggleActiveKeep();
       break;
     case "1":
-      zoomToActualSize();
+    case "2":
+    case "3":
+    case "4":
+    case "5":
+      setActiveStars(parseInt(key, 10));
       break;
     case "Escape":
       previewZoomCtl.resetToFit(previewImgs());
@@ -399,15 +419,15 @@ $("#reviewSort").on("change", async function () {
 });
 
 $("#reviewApplyBtn").on("click", async function () {
-  const overrides = Object.assign({}, pendingOverrides);
-  if (Object.keys(overrides).length === 0) {
+  const starOverrides = Object.assign({}, pendingStarOverrides);
+  if (Object.keys(starOverrides).length === 0) {
     $("#reviewStatus").text("No changes to apply.").show();
     return;
   }
   $(this).prop("disabled", true);
   try {
-    await apiPost("/api/review/apply", { overrides });
-    Object.keys(pendingOverrides).forEach((k) => delete pendingOverrides[k]);
+    await apiPost("/api/review/apply", { starOverrides });
+    Object.keys(pendingStarOverrides).forEach((k) => delete pendingStarOverrides[k]);
     $("#reviewStatus").text("Changes applied.").show();
   } catch (err) {
     $("#reviewStatus").text("Failed to apply changes: " + err.message).show();

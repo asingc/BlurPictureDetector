@@ -107,9 +107,9 @@ By default, after annotation previews are generated, face recognition automatica
 
 | Level | Threshold | Use when |
 |---|---|---|
-| `low` | 0.35 | Flag only severely blurry images |
-| `medium` *(default)* | 0.50 | Balanced |
-| `high` | 0.70 | Flag even slightly soft images |
+| `low` | 0.16 | Flag only severely blurry images |
+| `medium` *(default)* | 0.28 | Balanced |
+| `high` | 0.42 | Flag even slightly soft images |
 
 You can also pass any numeric value directly, e.g. `--sensitivity 0.45`.
 
@@ -291,6 +291,7 @@ landmarks) is effectively a pass-through under `--engine mediapipe`.
 |---|---|---|
 | `use_narrow_face_box` | `True` | Score and annotate on the minimal landmark bbox rather than the full face detection bbox |
 | `face_min_size_fraction` | `0.025` | Discard faces whose long edge is < 2.5 % of the image long edge |
+| `face_crop_min_long_edge_px` / `face_crop_max_long_edge_px` | `96` / `96` | Normalize every face crop's long edge to this pixel range (up *and* down) before sharpness scoring, removing scale-dependence from the Laplacian/Tenengrad metrics |
 | `face_coverage_min_visible` | `2` | Require this many of 5 face landmarks to be confident |
 | `normalized_img_max_long_edge` | `1800` | Downscale input to this long edge before processing (never upscales) |
 | `annotation_alpha` | `0.25` | Annotation translucency (0 = invisible, 1 = opaque) |

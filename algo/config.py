@@ -38,6 +38,15 @@ class AppConfig:
     # Falls back to the full bbox when fewer than 2 landmarks are detected.
     use_narrow_face_box: bool = True
 
+    # Face crop long-edge normalization for sharpness scoring (FaceSharpnessScorer).
+    # The face crop is resized so its long edge falls within
+    # [face_crop_min_long_edge_px, face_crop_max_long_edge_px] — upscaled if
+    # smaller than the min, downscaled if larger than the max. Setting both to
+    # the same value normalizes every face crop to that exact pixel size,
+    # removing the scale-dependence of Laplacian/Tenengrad sharpness metrics.
+    face_crop_min_long_edge_px: int = 96
+    face_crop_max_long_edge_px: int = 96
+
     # Face bounding box drawn on annotated previews (separate from the body box).
     annotation_face_box_color:        tuple[int, int, int] = field(default=(0, 255, 255))  # yellow
     annotation_face_box_thickness:    int                  = 1

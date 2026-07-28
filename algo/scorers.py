@@ -9,7 +9,7 @@ import numpy as np
 from algo.config import app_config
 from algo.models import Body, Box, Face
 from algo.sharpness import sharpness_evaluator
-from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, _narrow_face_box, cap_long_edge
+from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, _narrow_face_box, clamp_long_edge
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -194,7 +194,7 @@ class FaceSharpnessScorer(BodyScorerBase):
             crop = normalized_image[fy1:fy2, fx1:fx2]
             if crop.size == 0:
                 continue
-            crop = cap_long_edge(crop, max(h, w) * 0.04)
+            crop = clamp_long_edge(crop, app_config.face_crop_min_long_edge_px, app_config.face_crop_max_long_edge_px)
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             s, lv, t = sharpness_evaluator.score(gray)
             log.debug("[scorer:sharpness] face conf=%.3f score=%.4f (lap=%.2f ten=%.2f)",

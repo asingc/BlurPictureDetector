@@ -134,6 +134,29 @@ def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:
     return cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
+def clamp_long_edge(image: np.ndarray, min_long_edge: float, max_long_edge: float) -> np.ndarray:
+    """
+    Resize *image* so its long edge falls within [min_long_edge, max_long_edge].
+
+    Unlike cap_long_edge (which only ever shrinks), this also upscales images
+    whose long edge is below min_long_edge — so passing the same value for
+    both bounds normalizes every image to that exact long-edge size. Returns
+    the original array unchanged when already within range.
+    """
+    h, w = image.shape[:2]
+    long_edge = max(h, w)
+    if long_edge > max_long_edge:
+        target = max_long_edge
+    elif long_edge < min_long_edge:
+        target = min_long_edge
+    else:
+        return image
+    scale = target / long_edge
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    return cv2.resize(image, (new_w, new_h), interpolation=interp)
+
+
 def _narrow_face_box(
     face: Face,
     conf_threshold: float = 0.3,
