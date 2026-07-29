@@ -14,9 +14,13 @@ setlocal EnableDelayedExpansion
 ::      a plain Command Prompt, not just an "Anaconda Prompt". If none is
 ::      found anywhere, it prints an install URL and stops.
 ::   2. Creates an isolated conda environment (Python 3.12) for the project,
-::      and makes sure pip itself is actually installed in it (a plain
+::      and makes sure pip AND git are actually installed in it (a plain
 ::      `conda create ... python=X.Y` doesn't always pull pip in as a
-::      dependency) - installing it via conda if it's missing.
+::      dependency, and a plain Command Prompt often has no git at all) -
+::      installing whichever is missing via conda. git isn't used for `git
+::      clone`/`git+` URLs anywhere below, but some pip source installs
+::      (setuptools_scm version detection, etc.) shell out to it, so it's
+::      verified/installed here rather than failing deep inside a later step.
 ::   3. Pins setuptools<81 right away, immediately after the conda environment
 ::      is created, so pkg_resources stays available for
 ::      face_recognition_models - done first, before the much slower GPU
@@ -170,6 +174,35 @@ if errorlevel 1 (
     if errorlevel 1 goto :fail
 )
 
+:: Make sure git is available too - not for `git clone`/`git+` (this script
+:: and the face_recognition_models install below deliberately avoid those),
+:: but some pip source installs shell out to a system git during their build
+:: (e.g. setuptools_scm version detection) and fail confusingly deep inside
+:: a later step if it's missing, especially from a plain Command Prompt that
+:: never had Git for Windows installed. Install it into the conda env via
+:: conda if it isn't found anywhere on PATH.
+echo       Verifying git is available...
+where git >nul 2>nul
+if errorlevel 1 (
+    echo       git not found - installing it into the environment ^(conda-forge^)...
+    "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels git
+    if errorlevel 1 goto :fail
+)
+
+:: Put the conda environment's own folders on PATH now - not just later when
+:: the final launcher is written - so a conda-installed git/pip above, and
+:: dlib/PyTorch's native DLLs below, are resolvable by every subprocess pip
+:: or conda spawns for the remainder of this script, not only by the
+:: generated RunPhotoProcessing.bat.
+set "PATH=%ENV_DIR%\Library\bin;%ENV_DIR%\Scripts;%ENV_DIR%;%PATH%"
+
+where git >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: git still not found on PATH after attempting to install it.
+    goto :fail
+)
+echo       Found git: & where git
+
 :: ----------------------------------------------------------------------------
 :: [3/10] Pin setuptools (pkg_resources compatibility for face_recognition_models)
 :: ----------------------------------------------------------------------------
@@ -307,7 +340,9 @@ if errorlevel 1 goto :fail
 :: "Please install `face_recognition_models`..." even though face-recognition
 :: itself installed fine above. Installed via a plain GitHub ZIP-archive URL
 :: (pip can install directly from a URL to a source archive) rather than a
-:: `git+...` URL, so this doesn't require git to be installed at all.
+:: `git+...` URL - git is still ensured earlier in step 2 as a safety net in
+:: case pip's own build step shells out to it (e.g. setuptools_scm), but
+:: this script itself never runs `git clone`/`git+`.
 ::
 :: setuptools<81 was already pinned early in step 3 (so pkg_resources stays
 :: available for face_recognition_models' __init__.py); re-assert it here
