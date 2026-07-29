@@ -6,6 +6,26 @@ Runs two YOLO models (body pose + face detection) on a folder of images, filters
 
 ---
 
+## Getting started (Windows, no git/download-zip needed)
+
+Anaconda or Miniconda must already be installed ([Miniconda download](https://docs.conda.io/en/latest/miniconda.html)) — everything else is handled for you. Open a plain Command Prompt (an "Anaconda Prompt" is not required) and paste these two commands:
+
+1. Create a working folder and switch into it:
+
+   ```
+   mkdir BlurPictureDetector && cd BlurPictureDetector
+   ```
+
+2. Download and run the setup script:
+
+   ```
+   curl -L -o InitPhotoProcessing.bat https://raw.githubusercontent.com/asingc/BlurPictureDetector/main/InitPhotoProcessing.bat && InitPhotoProcessing.bat
+   ```
+
+   (`curl` is built into Windows 10/11 by default.) This installs a dedicated Python environment, downloads the app, and writes a `RunPhotoProcessing.bat` launcher in the same folder. Double-click `RunPhotoProcessing.bat` any time afterwards to open the web app — see below. Re-run the same command above any time to update everything to the latest version.
+
+---
+
 ## Quick start: the web app (`culling_app.py`)
 
 The easiest way to use this tool day-to-day is the built-in web app — it wraps the whole pipeline (import, review, face tagging, export) behind a browser UI, so you rarely need the individual scripts described below.
