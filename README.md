@@ -6,6 +6,28 @@ Runs two YOLO models (body pose + face detection) on a folder of images, filters
 
 ---
 
+## Quick start: the web app (`culling_app.py`)
+
+The easiest way to use this tool day-to-day is the built-in web app — it wraps the whole pipeline (import, review, face tagging, export) behind a browser UI, so you rarely need the individual scripts described below.
+
+```
+python culling_app.py
+```
+
+This starts a local web server and opens a browser tab automatically (use `--no-browser` to skip that, `--port <n>` to change the port). If you set the project up with `InitPhotoProcessing.bat`, just double-click the generated `RunPhotoProcessing.bat` instead.
+
+The app walks through five pages (top nav):
+
+| Page | Purpose |
+|---|---|
+| **Team** | Create/edit a team: jersey colour(s), roster, optional OpenAI API key for LLM-assisted burst culling. You need at least one team before importing photos — the app takes you here automatically if none exists yet. |
+| **Select Album** | Pick an existing album, or click **+** to import a new folder of photos: choose the team, blur sensitivity, whether to run face recognition, and optionally **Ignore jersey color** to score every person regardless of team colour (handy for practices/non-game shoots). This kicks off `1_prep_review.py` in the background. |
+| **Culling** | Review the scored photos (blurry/sharp/skipped), override any calls, and star-rate keepers. |
+| **Faces** | Tag detected face clusters with player names. |
+| **Summary** | Export the kept, tagged photos to a destination folder. |
+
+---
+
 ## How it works
 
 ```
@@ -135,7 +157,7 @@ Open the `previews/` folder in your photo viewer and **delete any preview images
 
 Leave previews you agree with untouched.
 
-Then use the web app (`culling_app.py`) to review, tag faces, and export the kept photos — see below.
+Then use the web app (`culling_app.py`) to review, tag faces, and export the kept photos — see "Quick start" above.
 
 ---
 

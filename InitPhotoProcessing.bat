@@ -13,32 +13,41 @@ setlocal EnableDelayedExpansion
 ::      then in common per-user/per-machine install folders - so it works from
 ::      a plain Command Prompt, not just an "Anaconda Prompt". If none is
 ::      found anywhere, it prints an install URL and stops.
-::   2. Creates an isolated conda environment (Python 3.12) for the project.
-::   3. Pins setuptools<81 right away, immediately after the conda environment
+::   2. Looks for an existing Git for Windows installation the same way -
+::      first on PATH, then common install folders - and adds it to PATH for
+::      the rest of this script's run if it was found off-PATH. Needed for
+::      the face_recognition_models install (pulled straight from its git
+::      source repo, see step 10 below). If none is found anywhere, it prints
+::      an install URL and stops.
+::   3. Creates an isolated conda environment (Python 3.12) for the project.
+::   4. Pins setuptools<81 right away, immediately after the conda environment
 ::      is created, so pkg_resources stays available for
 ::      face_recognition_models - done first, before the much slower GPU
 ::      detection/download/dlib/PyTorch/requirements.txt steps below, so a
 ::      broken pip environment is caught fast instead of after a long wait.
-::   4. Detects an NVIDIA GPU/driver (nvidia-smi) and installs CUDA-enabled
+::   5. Detects an NVIDIA GPU/driver (nvidia-smi) and installs CUDA-enabled
 ::      PyTorch if found, otherwise CPU-only PyTorch.
-::   5. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
-::      (no git required) and updates the local app folder in place (existing
-::      albums\ and other local-only data are never deleted).
-::   6. Installs dlib via conda-forge (prebuilt Windows binary - no C++
+::   6. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
+::      (no git required for this step) and updates the local app folder in
+::      place (existing albums\ and other local-only data are never deleted).
+::   7. Installs dlib via conda-forge (prebuilt Windows binary - no C++
 ::      compiler / CMake needed) - GPU-accelerated build + cudnn when an
 ::      NVIDIA GPU was detected, otherwise the CPU build - then the rest of
 ::      requirements.txt via pip.
-::   7. Installs face_recognition_models straight from source (PyPI releases
-::      of it are unreliable and can leave face-recognition non-functional).
-::   8. Writes a small RunPhotoProcessing.bat launcher.
+::   8. Installs face_recognition_models straight from source (PyPI releases
+::      of it are unreliable and can leave face-recognition non-functional) -
+::      this is the one step that needs git (see step 2 above).
+::   9. Writes a small RunPhotoProcessing.bat launcher.
 ::
-:: Requires: Anaconda or Miniconda already installed somewhere on this
-:: machine (does not need to be on PATH - common install folders are
-:: searched automatically). If it isn't installed yet, get it from:
+:: Requires: Anaconda or Miniconda, AND Git for Windows, already installed
+:: somewhere on this machine (neither needs to be on PATH - common install
+:: folders are searched automatically). If either isn't installed yet, get
+:: it from:
 ::   https://www.anaconda.com/download
 ::   https://docs.conda.io/en/latest/miniconda.html
+::   https://git-scm.com/download/win
 :: then re-run this script (a plain Command Prompt/double-click is fine,
-:: an "Anaconda Prompt" is not required).
+:: an "Anaconda Prompt" or "Git Bash" window is not required).
 ::
 :: Safe to re-run at any time: it re-checks/updates the environment,
 :: dependencies, and pulls the latest app code.
@@ -78,7 +87,7 @@ set "WORK_DIR=%INSTALL_ROOT%\_setup_tmp"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
 :: ----------------------------------------------------------------------------
-:: [1/10] Find an existing Anaconda / Miniconda installation
+:: [1/11] Find an existing Anaconda / Miniconda installation
 :: ----------------------------------------------------------------------------
 :: Checks PATH first (fast path when run from an "Anaconda Prompt"), then
 :: falls back to scanning common per-user / per-machine install folders so
@@ -86,7 +95,7 @@ if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 :: to PATH. Does not install anything itself - if nothing is found, it
 :: prints the download URL and stops so the user can install once and
 :: re-run this script.
-echo [1/10] Checking for an existing Anaconda/Miniconda installation...
+echo [1/11] Checking for an existing Anaconda/Miniconda installation...
 set "CONDA_DIR="
 
 where conda >nul 2>nul
@@ -140,22 +149,82 @@ set "ENV_DIR=%INSTALL_ROOT%\envs\%ENV_NAME%"
 set "ENV_PY=%ENV_DIR%\python.exe"
 
 :: ----------------------------------------------------------------------------
-:: [2/10] Conda environment
+:: [2/11] Find an existing Git for Windows installation
+:: ----------------------------------------------------------------------------
+:: Same PATH-then-common-folders approach as the conda lookup above. Git is
+:: needed later (step 10) to install face_recognition_models straight from
+:: its source repo. If conda was found via PATH scanning above, the user is
+:: not necessarily in a shell where git is already usable either, so this is
+:: detected and (if needed) added to PATH the same way, rather than asking
+:: the user to open a "Git Bash" / dev shell themselves.
+echo [2/11] Checking for an existing Git installation...
+set "GIT_DIR="
+
+where git >nul 2>nul
+if not errorlevel 1 (
+    for /f "usebackq delims=" %%G in (`where git`) do (
+        if not defined GIT_DIR set "GIT_DIR=%%~dpG"
+    )
+)
+if defined GIT_DIR if "%GIT_DIR:~-1%"=="\" set "GIT_DIR=%GIT_DIR:~0,-1%"
+
+if not defined GIT_DIR (
+    echo       "git" not found on PATH - checking common install locations...
+    for %%D in (
+        "%ProgramFiles%\Git\cmd"
+        "%ProgramFiles(x86)%\Git\cmd"
+        "%LOCALAPPDATA%\Programs\Git\cmd"
+        "%USERPROFILE%\scoop\apps\git\current\cmd"
+        "%ProgramData%\chocolatey\bin"
+        "C:\Git\cmd"
+    ) do (
+        if not defined GIT_DIR (
+            if exist "%%~D\git.exe" set "GIT_DIR=%%~D"
+        )
+    )
+)
+
+if not defined GIT_DIR (
+    echo ERROR: no Git installation found ^(checked PATH and common install
+    echo folders^).
+    echo.
+    echo This script requires Git for Windows to be installed first ^(used to
+    echo install face_recognition_models from source^). Install it, then
+    echo re-run this script:
+    echo   https://git-scm.com/download/win
+    goto :fail
+)
+
+if not exist "%GIT_DIR%\git.exe" (
+    echo ERROR: found a possible Git installation at "%GIT_DIR%" but
+    echo "%GIT_DIR%\git.exe" is missing.
+    goto :fail
+)
+echo       Found git at "%GIT_DIR%".
+
+:: Make sure "git" resolves for the rest of this script's run (and for any
+:: subprocess pip spawns, e.g. `pip install git+...` in step 10) even if it
+:: wasn't already on PATH.
+where git >nul 2>nul
+if errorlevel 1 set "PATH=%GIT_DIR%;%PATH%"
+
+:: ----------------------------------------------------------------------------
+:: [3/11] Conda environment
 :: ----------------------------------------------------------------------------
 echo       Accepting Anaconda Terms of Service for default channels (best effort)...
 "%CONDA_DIR%\Scripts\conda.exe" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >nul 2>nul
 "%CONDA_DIR%\Scripts\conda.exe" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >nul 2>nul
 
 if exist "%ENV_PY%" (
-    echo [2/10] Conda environment "%ENV_NAME%" already present - skipping creation.
+    echo [3/11] Conda environment "%ENV_NAME%" already present - skipping creation.
 ) else (
-    echo [2/10] Creating conda environment "%ENV_NAME%" ^(python %PYTHON_VERSION%^)...
+    echo [3/11] Creating conda environment "%ENV_NAME%" ^(python %PYTHON_VERSION%^)...
     "%CONDA_DIR%\Scripts\conda.exe" create -y -p "%ENV_DIR%" python=%PYTHON_VERSION%
     if errorlevel 1 goto :fail
 )
 
 :: ----------------------------------------------------------------------------
-:: [3/10] Pin setuptools (pkg_resources compatibility for face_recognition_models)
+:: [4/11] Pin setuptools (pkg_resources compatibility for face_recognition_models)
 :: ----------------------------------------------------------------------------
 :: face_recognition_models' __init__.py still imports the old `pkg_resources`
 :: API (from setuptools). Recent setuptools versions (81+) dropped
@@ -166,14 +235,14 @@ if exist "%ENV_PY%" (
 :: available. Done as early as possible (right after env creation, before
 :: the much slower dlib/PyTorch/requirements.txt installs below) so a
 :: broken pip/environment is caught immediately instead of after a long wait.
-echo [3/10] Pinning setuptools ^(pkg_resources compatibility for face_recognition_models^)...
+echo [4/11] Pinning setuptools ^(pkg_resources compatibility for face_recognition_models^)...
 "%ENV_PY%" -m pip install "setuptools<81"
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
-:: [4/10] Detect CUDA / NVIDIA GPU
+:: [5/11] Detect CUDA / NVIDIA GPU
 :: ----------------------------------------------------------------------------
-echo [4/10] Detecting NVIDIA GPU / CUDA driver...
+echo [5/11] Detecting NVIDIA GPU / CUDA driver...
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
     echo       NVIDIA driver found - will install CUDA-enabled PyTorch ^(cu126^) and GPU-accelerated dlib.
@@ -186,9 +255,9 @@ if not errorlevel 1 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [5/10] Download latest app code (no git required)
+:: [6/11] Download latest app code (no git required)
 :: ----------------------------------------------------------------------------
-echo [5/10] Downloading latest source from GitHub ^(%REPO_OWNER%/%REPO_NAME%@%REPO_BRANCH%^)...
+echo [6/11] Downloading latest source from GitHub ^(%REPO_OWNER%/%REPO_NAME%@%REPO_BRANCH%^)...
 set "APP_ZIP=%WORK_DIR%\source.zip"
 if exist "%APP_ZIP%" del /f /q "%APP_ZIP%"
 call :download "https://github.com/%REPO_OWNER%/%REPO_NAME%/archive/refs/heads/%REPO_BRANCH%.zip" "%APP_ZIP%"
@@ -221,9 +290,9 @@ if errorlevel 8 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [6/10] Hard-to-build native dependency: dlib (via conda-forge, prebuilt)
+:: [7/11] Hard-to-build native dependency: dlib (via conda-forge, prebuilt)
 :: ----------------------------------------------------------------------------
-:: Prefer the GPU build when an NVIDIA GPU was detected in step 4. conda-forge
+:: Prefer the GPU build when an NVIDIA GPU was detected in step 5. conda-forge
 :: ships dlib-cpu/dlib-gpu as separate packages; unlike the plain "dlib"
 :: metapackage (which only requires cudnn to BUILD the CUDA variant, not to
 :: run it), we explicitly install "cudnn" alongside dlib-gpu here so
@@ -243,12 +312,12 @@ if errorlevel 8 (
 ::   "defaults" channel, which otherwise makes the solve far slower.
 :: - Installing dlib-gpu can pull in a newer numpy (e.g. 2.x) as a conda
 ::   dependency, silently corrupting the pip-installed numpy<2 (torch 2.2.2
-::   needs numpy<2 - see requirements.txt comment). Step 8 below re-asserts
+::   needs numpy<2 - see requirements.txt comment). Step 9 below re-asserts
 ::   the numpy<2 pin via pip --force-reinstall to fix this deterministically
 ::   regardless of which branch ran here.
 "%CONDA_DIR%\Scripts\conda.exe" remove -y -p "%ENV_DIR%" dlib dlib-cpu dlib-gpu --force >nul 2>nul
 if "%HAS_NVIDIA_GPU%"=="1" (
-    echo [6/10] Installing dlib-gpu + cudnn ^(conda-forge, CUDA-accelerated^)...
+    echo [7/11] Installing dlib-gpu + cudnn ^(conda-forge, CUDA-accelerated^)...
     "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-gpu cudnn
     if errorlevel 1 (
         echo       dlib-gpu install failed - falling back to CPU-only dlib.
@@ -256,24 +325,24 @@ if "%HAS_NVIDIA_GPU%"=="1" (
         if errorlevel 1 goto :fail
     )
 ) else (
-    echo [6/10] Installing dlib-cpu ^(conda-forge prebuilt binary - no compiler required^)...
+    echo [7/11] Installing dlib-cpu ^(conda-forge prebuilt binary - no compiler required^)...
     "%CONDA_DIR%\Scripts\conda.exe" install -y -p "%ENV_DIR%" -c conda-forge --override-channels dlib-cpu
     if errorlevel 1 goto :fail
 )
 
 :: ----------------------------------------------------------------------------
-:: [7/10] PyTorch
+:: [8/11] PyTorch
 :: ----------------------------------------------------------------------------
-echo [7/10] Installing PyTorch...
+echo [8/11] Installing PyTorch...
 "%ENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
 "%ENV_PY%" -m pip install torch torchvision !TORCH_INDEX!
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
-:: [8/10] Remaining Python dependencies (dlib already handled by conda above)
+:: [9/11] Remaining Python dependencies (dlib already handled by conda above)
 :: ----------------------------------------------------------------------------
-echo [8/10] Installing remaining dependencies from requirements.txt...
+echo [9/11] Installing remaining dependencies from requirements.txt...
 set "REQ_FILTERED=%WORK_DIR%\requirements.filtered.txt"
 findstr /V /R "^dlib" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
 "%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
@@ -284,19 +353,19 @@ echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency c
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
-:: [9/10] face_recognition_models (PyPI releases of this are unreliable / can
+:: [10/11] face_recognition_models (PyPI releases of this are unreliable / can
 :: silently fail to register; installing straight from the source repo is
 :: the fix the upstream face_recognition project itself recommends). Without
 :: this, the dlib face-recognition provider fails at runtime with
 :: "Please install `face_recognition_models`..." even though face-recognition
 :: itself installed fine above.
 ::
-:: setuptools<81 was already pinned early in step 3 (so pkg_resources stays
+:: setuptools<81 was already pinned early in step 4 (so pkg_resources stays
 :: available for face_recognition_models' __init__.py); re-assert it here
 :: too since torch/requirements.txt installs above could have pulled in a
 :: newer setuptools as a transitive dependency.
 :: ----------------------------------------------------------------------------
-echo [9/10] Re-asserting setuptools^<81 pin ^(pkg_resources compatibility^)...
+echo [10/11] Re-asserting setuptools^<81 pin ^(pkg_resources compatibility^)...
 "%ENV_PY%" -m pip install "setuptools<81"
 if errorlevel 1 goto :fail
 
@@ -312,9 +381,9 @@ if errorlevel 1 (
 )
 
 :: ----------------------------------------------------------------------------
-:: [10/10] Convenience launcher
+:: [11/11] Convenience launcher
 :: ----------------------------------------------------------------------------
-echo [10/10] Writing launcher...
+echo [11/11] Writing launcher...
 :: Prepend the env's native-library folders (Library\bin has cudnn/cuda DLLs,
 :: e.g. cudnn_ops64_9.dll for GPU dlib; Scripts/DLLs are the usual conda-env
 :: PATH entries) to PATH before invoking python.exe directly - without this,
@@ -324,7 +393,7 @@ echo [10/10] Writing launcher...
 (
     echo @echo off
     echo set "PATH=%ENV_DIR%\Library\bin;%ENV_DIR%\Scripts;%ENV_DIR%;%%PATH%%"
-    echo "%ENV_PY%" "%APP_DIR%\1_prep_review.py" %%*
+    echo "%ENV_PY%" "%APP_DIR%\culling_app.py" %%*
 ) > "%INSTALL_ROOT%\RunPhotoProcessing.bat"
 
 echo.
@@ -334,8 +403,8 @@ echo.
 echo  App folder:   %APP_DIR%
 echo  Python env:   %ENV_DIR%
 echo.
-echo  To process a folder of photos, run:
-echo    "%INSTALL_ROOT%\RunPhotoProcessing.bat" "C:\path\to\photos"
+echo  To start the photo culling web app, run:
+echo    "%INSTALL_ROOT%\RunPhotoProcessing.bat"
 echo.
 echo  Re-run this script any time to update everything to the latest.
 echo ============================================================

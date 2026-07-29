@@ -87,7 +87,7 @@ class FaceRecoConfig:
     # FaceRecoPipeline._collect_qualified_bodies) so a strict album setting
     # (e.g. "high") doesn't also start discarding faces that are perfectly
     # recognizable but merely a bit softer than that stricter overall bar.
-    sensitivity_threshold: float = 0.5
+    sensitivity_threshold: float = 0.4
 @dataclass
 class FaceSample:
     body: BodyRecord
@@ -787,7 +787,7 @@ class FaceRecoPipeline:
         total_bodies = skipped_blurry = skipped_no_ann = 0
         # Capped at 0.5 regardless of how strict the album's own sensitivity
         # setting is -- see FaceRecoConfig.sensitivity_threshold.
-        min_face_sharpness = min(self.config.sensitivity_threshold, 0.5)
+        min_face_sharpness = min(self.config.sensitivity_threshold, 0.4)
         log.debug("FaceReco [collect]: scanning %d result entries  (min_face_sharpness=%.3f)",
                   total_results, min_face_sharpness)
         for result in payload.get("results", []):

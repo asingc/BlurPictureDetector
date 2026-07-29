@@ -126,6 +126,7 @@ class StartProcessingRequest(BaseModel):
     sensitivityMode: str = "medium"       # "low" | "medium" | "high" | "custom"
     sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
     recognizeFaces: bool = True
+    noTeam: bool = False                  # "Ignore jersey color" — bypasses team-colour filtering entirely (--noteam)
     teamId: str = ""                      # which team's jersey colors/roster/API key to use
 
 
@@ -217,26 +218,34 @@ export_state = ExportState()
 
 # --------------------------------------------------------------------------- #
 # Heartbeat watchdog — the browser pings /api/heartbeat periodically from
-# every page (common.js); if none arrives within the timeout, the server
-# exits automatically so we don't leave orphaned local servers running after
-# the browser tab/window is closed. Mirrors face_tag_ui.py's watchdog.
+# every page (common.js); if none arrives within the timeout, the watchdog
+# prints a reminder (with the relaunch link) instead of shutting the server
+# down, since a closed/idle tab shouldn't kill an otherwise-healthy local
+# server out from under a still-running job. Mirrors face_tag_ui.py's
+# watchdog, which still auto-exits (it's often launched hidden/headless with
+# no console to show this message in).
 # --------------------------------------------------------------------------- #
 class HeartbeatState:
     def __init__(self, timeout: float = 180.0) -> None:
         self.lock = threading.Lock()
         self.timeout = timeout
         self.last_heartbeat = time.time()
+        self.url = ""
+        self.notified = False
 
 
 heartbeat_state = HeartbeatState()
 
 
 def _heartbeat_watchdog() -> None:
-    """Exit the process if no browser heartbeat arrives within the timeout.
+    """Print a reminder (once) if no browser heartbeat arrives within the
+    timeout — the server keeps running either way.
 
     Runs as a daemon thread. The timer starts from server launch, so the
     browser has one full timeout window to load the page and send its first
-    heartbeat before the watchdog can fire.
+    heartbeat before the watchdog can fire. The reminder re-arms if a
+    heartbeat resumes and then stops again later (e.g. the tab is reopened
+    and closed a second time).
     """
     poll_interval = max(1.0, min(5.0, heartbeat_state.timeout / 3))
     last_poll = time.time()
@@ -252,24 +261,33 @@ def _heartbeat_watchdog() -> None:
             # included) was suspended, not just the browser tab/window being
             # closed — a closed tab doesn't affect our own thread's timing at
             # all. Since the browser suspends/resumes together with us on the
-            # same machine, forgive this cycle instead of shutting down: it
-            # will send a fresh heartbeat shortly after waking anyway.
+            # same machine, forgive this cycle instead of treating it as a
+            # real timeout: it will send a fresh heartbeat shortly after
+            # waking anyway.
             log.info(
                 "Watchdog poll delayed %.0fs (expected ~%.0fs) — system likely "
-                "resumed from sleep; resetting heartbeat timer instead of exiting.",
+                "resumed from sleep; resetting heartbeat timer.",
                 poll_gap, poll_interval,
             )
             with heartbeat_state.lock:
                 heartbeat_state.last_heartbeat = now
+                heartbeat_state.notified = False
             continue
         with heartbeat_state.lock:
             elapsed = now - heartbeat_state.last_heartbeat
-        if elapsed > heartbeat_state.timeout:
+            already_notified = heartbeat_state.notified
+            if elapsed > heartbeat_state.timeout and not already_notified:
+                heartbeat_state.notified = True
+            elif elapsed <= heartbeat_state.timeout:
+                heartbeat_state.notified = False
+        if elapsed > heartbeat_state.timeout and not already_notified:
             log.info(
-                "No heartbeat received for %.0fs (timeout %.0fs) — shutting down.",
-                elapsed, heartbeat_state.timeout,
+                "No heartbeat received for %.0fs (timeout %.0fs) — the server "
+                "is still running. Here is your link if you wish to re-launch "
+                "the web app: %s",
+                elapsed, heartbeat_state.timeout, heartbeat_state.url,
             )
-            os._exit(0)
+            log.info("Press Ctrl+C in this window to end the process.")
 
 
 def _sensitivity_arg(mode: str, custom_value: float) -> str:
@@ -286,7 +304,7 @@ def _jerseycolor_arg(team: TeamData) -> str:
     return ";".join(parts)
 
 
-def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool, team_id: str) -> None:
+def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool, no_team: bool, team_id: str) -> None:
     team = _resolve_team(team_id)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     folder_stem = _sanitize_player_dirname(album_name.strip()) if album_name.strip() else Path(path).stem
@@ -301,9 +319,12 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
     ]
     if not recognize_faces:
         cmd += ["--skip-facereco"]
-    jerseycolor = _jerseycolor_arg(team)
-    if jerseycolor:
-        cmd += ["--jerseycolor", jerseycolor]
+    if no_team:
+        cmd += ["--noteam"]
+    else:
+        jerseycolor = _jerseycolor_arg(team)
+        if jerseycolor:
+            cmd += ["--jerseycolor", jerseycolor]
     if team.id:
         cmd += ["--team-id", team.id]
     if team.openaiApiKey:
@@ -1393,6 +1414,12 @@ PAGE_STEPS: tuple[str, ...] = ("team", "import", "review", "cluster", "apply")
 
 @app.get("/")
 def root() -> RedirectResponse:
+    # Send first-time users straight to the Team page until at least one
+    # team has been created — every other page (Select Album, Review, etc.)
+    # assumes a team already exists.
+    teams_file = _load_teams_file()
+    if not teams_file.Teams:
+        return RedirectResponse(url="/team")
     return RedirectResponse(url="/import")
 
 
@@ -1663,7 +1690,7 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
 
     thread = threading.Thread(
         target=_run_processing,
-        args=(str(path.resolve()), req.albumName, req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces, req.teamId),
+        args=(str(path.resolve()), req.albumName, req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces, req.noTeam, req.teamId),
         daemon=True,
     )
     thread.start()
@@ -1867,16 +1894,18 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser tab")
     parser.add_argument("--heartbeat-timeout", type=float, default=0.0,
                         help="Seconds without a browser heartbeat before the "
-                             "server exits automatically. Use 0 to disable "
+                             "server logs a reminder (with the relaunch link) "
+                             "that it's still running. Use 0 to disable "
                              "(default: disabled for now).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    url = f"http://{args.host}:{args.port}/"
     heartbeat_state.timeout = args.heartbeat_timeout
     heartbeat_state.last_heartbeat = time.time()
+    heartbeat_state.url = url
 
-    url = f"http://{args.host}:{args.port}/"
     log.info("team.json:  %s", TEAM_JSON_PATH)
     log.info("state file: %s", STATE_JSON_PATH)
     log.info("Open %s in your browser", url)
@@ -1885,7 +1914,7 @@ def main() -> None:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
     if heartbeat_state.timeout > 0:
-        log.info("Heartbeat watchdog: exit after %.0fs without a browser ping", heartbeat_state.timeout)
+        log.info("Heartbeat watchdog: notify after %.0fs without a browser ping", heartbeat_state.timeout)
         threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
     else:
         log.info("Heartbeat watchdog disabled")

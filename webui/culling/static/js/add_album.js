@@ -255,6 +255,7 @@ $(function () {
 
     const { mode, customValue } = readSensitivityFromUI();
     const recognizeFaces = $("#recognizeFacesInput").is(":checked");
+    const noTeam = $("#ignoreJerseyColorInput").is(":checked");
     setImportUIEnabled(false);
     $("#processingOutput").val("");
     pollSince = 0;
@@ -268,6 +269,7 @@ $(function () {
         sensitivityMode: mode,
         sensitivityCustomValue: customValue,
         recognizeFaces,
+        noTeam,
         teamId: selectedTeamId,
       });
       pollTimer = setInterval(pollProcessingOutput, 500);
