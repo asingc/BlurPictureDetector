@@ -38,6 +38,30 @@
   <textarea id="importMoreOutput" class="output-box" rows="16" readonly></textarea>
 </div>
 
+<div class="panel" id="rerunFacerecoPanel">
+  <h3>Re-run Face Detection</h3>
+  <p class="muted">
+    Re-clusters faces from scratch using this album's already-detected
+    photos (no re-import, no re-detecting blur). Existing tagged players
+    and deletions from the Faces page are preserved; untagged/pending
+    clusters may be renumbered or grouped differently.
+  </p>
+  <div class="row actions">
+    <span id="rerunFacerecoStatus" class="muted"></span>
+    <button id="rerunFacerecoBtn" class="btn btn-icon-text" title="Re-run face detection/clustering">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+      </svg>
+      <span>Re-run Face Detection</span>
+    </button>
+  </div>
+</div>
+
+<div id="rerunFacerecoDialog" title="Re-running face detection…" style="display:none">
+  <textarea id="rerunFacerecoOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
 <div class="panel" id="exportPanel">
   <h3>Export to Folder</h3>
   <p class="muted">

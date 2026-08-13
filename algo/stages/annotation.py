@@ -10,7 +10,7 @@ from algo.config import AppConfig
 from algo.frame import Frame
 from algo.models import Box, Face
 from algo.stage import ProcessStage
-from algo.utils import apply_auto_adjustment
+from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, apply_auto_adjustment, write_cover_thumbnail
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -82,6 +82,7 @@ def _annotate_frame(
             frame.image,
             [cv2.IMWRITE_JPEG_QUALITY, 60],
         )
+        write_cover_thumbnail(frame.image, output_dir / THUMBNAILS_SUBDIR / (frame.key_stem + ".jpg"), THUMBNAIL_SIZE)
         return
 
     annotated = apply_auto_adjustment(frame.image, frame.auto_adjustment).copy()
@@ -210,6 +211,7 @@ def _annotate_frame(
     anno_subdir = output_dir / "previews"
     anno_subdir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    write_cover_thumbnail(annotated, output_dir / THUMBNAILS_SUBDIR / out_name, THUMBNAIL_SIZE)
 
 
 # ---------------------------------------------------------------------------

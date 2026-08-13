@@ -31,6 +31,31 @@ function reviewThumbUrl(category, anno) {
   return `/api/review/thumb?category=${encodeURIComponent(category)}&file=${encodeURIComponent(anno)}`;
 }
 
+// Full-resolution images for the large main preview pane, toggled between
+// via the 'x' hotkey (see viewMode below) — the small cached-thumbnail
+// endpoint above is always used for the nav/strip thumbnails, regardless.
+function annoImgUrl(anno) {
+  return `/api/anno_img?file=${encodeURIComponent(anno)}`;
+}
+function originalImgUrl(file) {
+  return `/api/original?file=${encodeURIComponent(file)}`;
+}
+
+// Main-pane view mode ("anno" | "original"), toggled page-wide by the 'x'
+// hotkey (see the keydown handler below) and persisted across reloads.
+// Only changes which URL renderMain() uses — the other version is never
+// pre-fetched/pre-loaded until the user actually switches to it.
+const VIEW_MODE_STORAGE_KEY = "review.viewMode";
+let viewMode = localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "original" ? "original" : "anno";
+function mainImgUrl(im) {
+  return viewMode === "original" ? originalImgUrl(im.file) : annoImgUrl(im.anno);
+}
+function toggleViewMode() {
+  viewMode = viewMode === "original" ? "anno" : "original";
+  localStorage.setItem(VIEW_MODE_STORAGE_KEY, viewMode);
+  renderMain();
+}
+
 // Initial active image within a group when it's first loaded/navigated to:
 // the first image at or above the baseline "keep" star tier (3+), same as
 // the star-driven color scheme used everywhere else on this page.
@@ -154,14 +179,31 @@ function previewImgAt(e) {
   return $fromTarget.length ? $fromTarget : previewImgs().first();
 }
 
-// Hovering over a zoomed-in image pans it proportionally to the cursor
-// position; entering/leaving the preview area does nothing on its own —
-// zoom only changes via scroll, click, or the '1'/Esc hotkeys below, and
-// persists across image/group navigation until reset.
-$("#reviewPreview").on("mousemove", function (e) {
-  const $img = previewImgAt(e);
-  if (!$img.length) return;
-  previewZoomCtl.panTo(previewImgs(), $img[0], e.clientX, e.clientY);
+// Drag-to-pan while zoomed in. `dragging` tracks whether a drag started on
+// the image is still in progress (tracked on document so the drag keeps
+// following the cursor even if it leaves the preview pane); `dragMoved`
+// distinguishes an actual drag from a plain click so the click handler
+// below (fit/actual toggle) doesn't also fire once the drag ends. Zoom
+// itself only changes via scroll, click, or the '1'/Esc hotkeys below, and
+// persists (along with pan position) across image/group navigation and the
+// annotated/original view-mode toggle until reset.
+let draggingPreview = false;
+let previewDragMoved = false;
+
+$("#reviewPreview").on("mousedown", ".review-preview-cell img", function (e) {
+  e.preventDefault(); // suppress the browser's native image-ghost drag
+  previewDragMoved = false;
+  draggingPreview = previewZoomCtl.dragStart(this, e.clientX, e.clientY);
+});
+
+$(document).on("mousemove.reviewPreviewDrag", function (e) {
+  if (!draggingPreview) return;
+  previewDragMoved = true;
+  previewZoomCtl.dragMove(previewImgs(), e.clientX, e.clientY);
+});
+
+$(document).on("mouseup.reviewPreviewDrag", function () {
+  draggingPreview = false;
 });
 
 $("#reviewPreview").on("wheel", function (e) {
@@ -173,11 +215,16 @@ $("#reviewPreview").on("wheel", function (e) {
   previewZoomCtl.adjustByStep(previewImgs(), delta, $img[0], oe.clientX, oe.clientY);
 });
 
-// Clicking a preview image toggles it between "fit" and 100% (actual pixel
-// size), centered on the click point.
+// Clicking a preview image (without dragging) toggles it between "fit" and
+// 100% (actual pixel size), centered on the click point.
 $("#reviewPreview").on("click", ".review-preview-cell img", function (e) {
+  if (previewDragMoved) {
+    previewDragMoved = false;
+    return;
+  }
   previewZoomCtl.toggleClick(previewImgs(), this, e.clientX, e.clientY);
 });
+
 
 // Give a preview viewport the image's intrinsic aspect ratio so pure CSS
 // (max-width/max-height: 100% of the cell, see .review-preview-viewport)
@@ -239,6 +286,10 @@ function renderMain() {
   if (activeImage.burstRanking) {
     $rankInfo.append($("<span>", { class: "rank-reason" }).text(activeImage.burstRanking.reason || ""));
   }
+  if (viewMode === "original") {
+    $rankInfo.append($("<span>", { class: "view-mode-badge" }).text("Original (x to toggle)"));
+    hasRankInfo = true;
+  }
   if (hasRankInfo) $rankInfo.show();
 
   const { start, end } = computeWindow(group.images.length, data.activeImage, previewCount);
@@ -247,7 +298,7 @@ function renderMain() {
     const im = group.images[i];
     const $cell = $("<div>", { class: "review-preview-cell" });
     const $viewport = $("<div>", { class: `review-preview-viewport star-${im.stars || 3}` });
-    const $img = $("<img>", { src: reviewThumbUrl(currentCategory, im.anno), alt: im.file });
+    const $img = $("<img>", { src: mainImgUrl(im), alt: im.file });
     $viewport.append($img);
     if (im.burstRanking) {
       $viewport.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
@@ -318,7 +369,8 @@ function setActiveStars(stars) {
 
 // ------------------------------------------------------------------ //
 // Hotkeys — w/s move between groups, a/d move within a group, space toggles.
-// Arrow keys are aliases: Up=w, Down=s, Left=a, Right=d.
+// Arrow keys are aliases: Up=w, Down=s, Left=a, Right=d. x toggles the main
+// pane between the annotated and original image (page-wide, persisted).
 // ------------------------------------------------------------------ //
 const ARROW_KEY_ALIASES = { ArrowUp: "w", ArrowDown: "s", ArrowLeft: "a", ArrowRight: "d" };
 
@@ -385,6 +437,9 @@ $(document).on("keydown", (e) => {
       break;
     case "Escape":
       previewZoomCtl.resetToFit(previewImgs());
+      break;
+    case "x":
+      toggleViewMode();
       break;
     default:
       return;

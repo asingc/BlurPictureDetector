@@ -138,6 +138,12 @@ SENSITIVITY_THRESHOLDS: dict[str, float] = {
     "high":   0.68,
 }
 
+# Album folder names are "<timestamp>-<input stem>" (see _build_album_dir_name)
+# — capped so a long source folder/file name can't blow past Windows' legacy
+# 260-char MAX_PATH once nested album subpaths (previews/, .FaceReco/<cluster>/
+# Face/<crop>.png, etc.) are appended on top.
+ALBUM_DIR_NAME_MAX_LEN = 60
+
 # COCO 17-keypoint skeleton: pairs of indices to connect with a line.
 # Keypoint order: 0=nose 1=L-eye 2=R-eye 3=L-ear 4=R-ear
 #   5=L-shoulder 6=R-shoulder 7=L-elbow 8=R-elbow 9=L-wrist 10=R-wrist
@@ -160,6 +166,49 @@ _COCO_SKELETON: tuple[tuple[int, int], ...] = (
 # ---------------------------------------------------------------------------
 
 log = logging.getLogger("BlurPictureDetector")
+
+
+def _build_album_dir_name(ts: str, stem: str) -> str:
+    """Return "<ts>-<stem>", truncating *stem* so the whole name fits within
+    ALBUM_DIR_NAME_MAX_LEN characters (the timestamp itself is never cut)."""
+    prefix = f"{ts}-"
+    max_stem_len = max(1, ALBUM_DIR_NAME_MAX_LEN - len(prefix))
+    return prefix + stem[:max_stem_len].rstrip(" -_")
+
+
+def _try_enable_windows_long_paths() -> None:
+    """Best-effort, opt-in (only called when --enable-long-paths is passed):
+    sets the machine-wide HKLM LongPathsEnabled=1 policy so paths beyond the
+    legacy 260-char MAX_PATH work. No-ops on non-Windows. Requires admin —
+    logs the manual command instead of failing if we don't have it, since we
+    never attempt to self-elevate."""
+    if os.name != "nt":
+        return
+    manual_cmd = (
+        'New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
+        "-Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force"
+    )
+    try:
+        import winreg
+        key_path = r"SYSTEM\CurrentControlSet\Control\FileSystem"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                current, _ = winreg.QueryValueEx(key, "LongPathsEnabled")
+            except FileNotFoundError:
+                current = 0
+            if current == 1:
+                log.debug("Windows long-path support already enabled.")
+                return
+            winreg.SetValueEx(key, "LongPathsEnabled", 0, winreg.REG_DWORD, 1)
+            log.info("Enabled Windows long-path support (LongPathsEnabled=1).")
+    except PermissionError:
+        log.warning(
+            "Could not enable Windows long-path support (needs an elevated/Administrator "
+            "terminal). Run this once as Administrator, then re-run this script:\n  %s",
+            manual_cmd,
+        )
+    except OSError as err:
+        log.warning("Could not enable Windows long-path support: %s\n  Run manually: %s", err, manual_cmd)
 
 
 def _setup_console_logging() -> None:
@@ -908,6 +957,29 @@ def _ensure_face_model() -> Path:
     return _FACE_MODEL_PATH
 
 
+_TEAM_JSON_PATH = Path(__file__).resolve().parent / "team.json"
+
+
+def _load_registered_team(team_id: str) -> dict | None:
+    """Look up team_id's entry in team.json (the same file culling_app.py's
+    Team Setup page reads/writes), returning its raw dict, or None if
+    team_id doesn't match any registered team. Parsed directly (no pydantic
+    dependency here, unlike culling_app.py) since this is a standalone CLI
+    script."""
+    try:
+        with open(_TEAM_JSON_PATH, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    teams = payload.get("Teams") if isinstance(payload, dict) else None
+    if not isinstance(teams, list):
+        return None
+    for team in teams:
+        if isinstance(team, dict) and team.get("id") == team_id:
+            return team
+    return None
+
+
 _FACE_DB_DIR_CANDIDATES: tuple[str, ...] = (".FaceReco", ".facereco", ".Facereco")
 
 
@@ -1006,7 +1078,7 @@ def process(
         threshold = SENSITIVITY_THRESHOLDS[sensitivity]
     files      = collect_images(input_path)
     ts         = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = output_root if output_root is not None else Path("albums") / f"{ts}-{input_path.stem}"
+    output_dir = output_root if output_root is not None else Path("albums") / _build_album_dir_name(ts, input_path.stem)
 
     if not files:
         log.warning("No supported image files found in: %s", input_path)
@@ -1579,7 +1651,9 @@ def main() -> None:
     )
     parser.add_argument(
         "path",
-        help="Path to a single image file or a directory of images.",
+        nargs="?",
+        default=None,
+        help="Path to a single image file or a directory of images. Not needed with --rerun-facereco-only.",
     )
     def _sensitivity_type(value: str) -> str:
         if value in SENSITIVITY_THRESHOLDS:
@@ -1781,6 +1855,17 @@ def main() -> None:
         help="Id of the team (from team.json) this album was processed for. Stored in album.json.",
     )
     parser.add_argument(
+        "--enable-long-paths",
+        action="store_true",
+        help=(
+            "Windows only: best-effort opt-in to the OS-wide 'Enable Win32 long "
+            "paths' policy (HKLM LongPathsEnabled=1), on top of the 60-char cap "
+            "already applied to the album directory name, in case deeply nested "
+            "album subpaths still exceed MAX_PATH. Requires an elevated/Administrator "
+            "terminal to actually take effect; otherwise just logs the manual command."
+        ),
+    )
+    parser.add_argument(
         "--llm-model",
         default="gpt-4o-mini",
         metavar="MODEL",
@@ -1791,16 +1876,35 @@ def main() -> None:
         action="store_true",
         help="Skip LLM-assisted burst culling even when an OpenAI API key is available.",
     )
+    parser.add_argument(
+        "--rerun-facereco-only",
+        action="store_true",
+        help=(
+            "Skip image analysis/grading/annotation/LLM-culling entirely and "
+            "just re-run face recognition clustering against an existing "
+            "album's already-written album.json (requires --output pointing "
+            "at that album; no positional path needed). Re-run reclusters "
+            "from scratch but replays manual_overrides.json on top, same as "
+            "any other FaceRecoStage run."
+        ),
+    )
     args = parser.parse_args()
+    if args.rerun_facereco_only:
+        if not args.output:
+            parser.error("--rerun-facereco-only requires --output <existing album directory>")
+    elif not args.path:
+        parser.error("the following arguments are required: path")
 
     _setup_console_logging()
+    if args.enable_long_paths:
+        _try_enable_windows_long_paths()
     log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s face_db=%s",
               args.path, args.sensitivity, args.output, args.jerseycolor, args.skip_facereco, args.noteam, args.face_db)
     if args.cpu_only:
         log.info("CPU-only mode enabled: forcing YOLO and FaceReco providers to CPU")
 
-    input_path = Path(args.path).resolve()
-    if not input_path.exists():
+    input_path = Path(args.path).resolve() if args.path else None
+    if input_path is not None and not input_path.exists():
         log.error("Path does not exist: %s", input_path)
         sys.exit(1)
 
@@ -1867,6 +1971,24 @@ def main() -> None:
             args.team_id = _lock("team_id", args.team_id)
             args.autoadjust = _lock("autoadjust", args.autoadjust)
 
+    # Every album must be associated with exactly one registered team --
+    # used for jersey-colour filtering (unless --noteam) and the OpenAI key
+    # lookup. Prefer the album's own already-recorded team_id on merge
+    # (covers albums written before run_settings existed, where
+    # args.team_id was never locked above).
+    team_id = existing_payload.get("team_id") if merge_mode and existing_payload.get("team_id") else args.team_id
+    if not team_id:
+        parser.error("--team-id is required (must match a team registered in team.json)")
+    registered_team = _load_registered_team(team_id)
+    if registered_team is None:
+        parser.error(f"--team-id {team_id!r} does not match any team registered in team.json")
+    # Roster names restrict face-DB matching to this team (see FaceRecoStage below).
+    roster_names: frozenset[str] | None = frozenset(
+        p.get("name", "").strip()
+        for p in (registered_team.get("players") or [])
+        if isinstance(p, dict) and p.get("name", "").strip()
+    ) or None
+
     # Parse the semicolon-separated jersey colour list, normalise to title-case.
     # Colours prefixed with '+' are forced-include: they are always added to the
     # filter regardless of what other colours are listed (e.g. goalie colours).
@@ -1896,10 +2018,37 @@ def main() -> None:
         sensitivity_threshold = SENSITIVITY_THRESHOLDS[args.sensitivity]
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir  = output_root if output_root is not None else Path("albums") / f"{ts}-{input_path.stem}"
+    output_dir  = output_root if output_root is not None else Path("albums") / _build_album_dir_name(ts, input_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
     _add_file_logging(output_dir / "run.log")
     log.debug("Output directory: %s", output_dir.resolve())
+
+    if args.rerun_facereco_only:
+        if not merge_mode:
+            log.error("--rerun-facereco-only requires an existing album.json under --output: %s", output_dir)
+            sys.exit(1)
+        facereco_input_path = input_path or Path(existing_info.get("SrcDir") or output_dir)
+        face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, facereco_input_path)
+        if face_db_dir is None:
+            log.warning("Re-running face detection without a face DB (no dictionary found) — clusters will be unnamed.")
+        FaceRecoStage(
+            output_dir,
+            face_db_dir=face_db_dir,
+            face_db_allowed_names=roster_names,
+            face_db_match_threshold=args.face_db_match_threshold,
+            face_db_match_margin=args.face_db_match_margin,
+            face_db_prototype_threshold=args.face_db_prototype_threshold,
+            use_face_db_calibration=not args.disable_face_db_calibration,
+            min_face_crop_px=args.min_face_crop_px,
+            debug_align=args.debug_align,
+            cpu_only=args.cpu_only,
+            engine=run_settings.get("engine", args.engine),
+            sensitivity_threshold=sensitivity_threshold,
+        ).process([], app_config)
+        if not args.no_tag_ui:
+            _launch_face_tag_ui(output_dir)
+        log.info("Face detection re-run complete.")
+        return
 
     log.info("Loading models … (engine=%s)", args.engine)
     if args.engine == "yolo":
@@ -1944,9 +2093,6 @@ def main() -> None:
         log.info("No new images found to import — album is already up to date.")
 
     our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
-    # Prefer the album's own recorded team_id on merge (covers albums written
-    # before run_settings existed, where args.team_id was never locked above).
-    team_id = existing_payload.get("team_id") if merge_mode and existing_payload.get("team_id") else args.team_id
     new_import_record = {"src": str(input_path), "timestamp": ts, "image_count": len(frames)}
     run_settings_out = run_settings or {
         "sensitivity": args.sensitivity,
@@ -1997,6 +2143,7 @@ def main() -> None:
             FaceRecoStage(
                 output_dir,
                 face_db_dir=face_db_dir,
+                face_db_allowed_names=roster_names,
                 face_db_match_threshold=args.face_db_match_threshold,
                 face_db_match_margin=args.face_db_match_margin,
                 face_db_prototype_threshold=args.face_db_prototype_threshold,

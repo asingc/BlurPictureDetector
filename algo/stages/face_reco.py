@@ -54,6 +54,7 @@ class FaceRecoStage(ProcessStage):
         output_dir: Path,
         cpu_only: bool,
         face_db_dir: Path | None = None,
+        face_db_allowed_names: frozenset[str] | None = None,
         face_db_match_threshold: float | None = None,
         face_db_match_margin: float | None = None,
         face_db_prototype_threshold: float | None = None,
@@ -65,6 +66,7 @@ class FaceRecoStage(ProcessStage):
     ) -> None:
         self.output_dir = output_dir
         self.face_db_dir = face_db_dir
+        self.face_db_allowed_names = face_db_allowed_names
         self.face_db_match_threshold = face_db_match_threshold
         self.face_db_match_margin = face_db_match_margin
         self.face_db_prototype_threshold = face_db_prototype_threshold
@@ -106,6 +108,7 @@ class FaceRecoStage(ProcessStage):
 
             facereco_config = FaceRecoConfig(
                 face_db_dir=self.face_db_dir,
+                face_db_allowed_names=self.face_db_allowed_names,
                 face_db_match_threshold=self.face_db_match_threshold,
                 face_db_match_margin=self.face_db_match_margin,
                 face_db_prototype_threshold=self.face_db_prototype_threshold,

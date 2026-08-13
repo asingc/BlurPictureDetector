@@ -13,16 +13,30 @@ let importMorePollTimer = null;
 let importMorePollSince = 0;
 let importMoreRunning = false;
 
+let rerunFacerecoPollTimer = null;
+let rerunFacerecoPollSince = 0;
+let rerunFacerecoRunning = false;
+
 function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #minStarsInput, #exportBtn").prop("disabled", !enabled);
-  // Importing more images and exporting both mutate/read the album at the
-  // same time — keep them mutually exclusive from the UI side (each is
-  // already independently guarded server-side too).
-  $("#importMoreBtn").prop("disabled", !enabled || importMoreRunning);
+  // Importing more images, re-running face detection, and exporting all
+  // mutate/read the album at the same time — keep them mutually exclusive
+  // from the UI side (each is already independently guarded server-side
+  // too, via the shared processing_state lock for import-more/rerun).
+  $("#importMoreBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning);
+  $("#rerunFacerecoBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning);
 }
 
 function setImportMoreUIEnabled(enabled) {
   importMoreRunning = !enabled;
+  $("#importMoreBtn").prop("disabled", !enabled);
+  $("#rerunFacerecoBtn").prop("disabled", !enabled);
+  $("#exportBtn").prop("disabled", !enabled);
+}
+
+function setRerunFacerecoUIEnabled(enabled) {
+  rerunFacerecoRunning = !enabled;
+  $("#rerunFacerecoBtn").prop("disabled", !enabled);
   $("#importMoreBtn").prop("disabled", !enabled);
   $("#exportBtn").prop("disabled", !enabled);
 }
@@ -137,6 +151,67 @@ async function pollImportMoreOutput() {
   }
 }
 
+// ------------------------------------------------------------------ //
+// Re-run face detection progress dialog — same pattern as import-more.
+// ------------------------------------------------------------------ //
+function initRerunFacerecoDialog() {
+  $("#rerunFacerecoDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openRerunFacerecoDialog() {
+  const $dialog = $("#rerunFacerecoDialog");
+  $dialog.dialog("option", "title", "Re-running face detection…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function appendRerunFacerecoLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("rerunFacerecoOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function finishRerunFacerecoDialog(returnCode) {
+  const $dialog = $("#rerunFacerecoDialog");
+  const success = returnCode === 0;
+  $dialog.dialog("option", "title", success ? "Face detection complete" : `Face detection failed (exit code ${returnCode})`);
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+  if (success) {
+    $("#rerunFacerecoStatus").text("Face detection re-run complete.");
+    loadSummary();
+  } else {
+    $("#rerunFacerecoStatus").text(`Face detection re-run exited with code ${returnCode}.`);
+  }
+}
+
+async function pollRerunFacerecoOutput() {
+  let data;
+  try {
+    data = await apiGet(`/api/processing-output?since=${rerunFacerecoPollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendRerunFacerecoLines(data.lines);
+  rerunFacerecoPollSince = data.next;
+  if (!data.running) {
+    clearInterval(rerunFacerecoPollTimer);
+    rerunFacerecoPollTimer = null;
+    setRerunFacerecoUIEnabled(true);
+    finishRerunFacerecoDialog(data.returnCode);
+  }
+}
+
 const STAR_TIERS = [5, 4, 3, 2, 1];
 
 function renderStarBreakdown(breakdown, unrated) {
@@ -222,6 +297,7 @@ $(function () {
   loadSummary();
   initExportDialog();
   initImportMoreDialog();
+  initRerunFacerecoDialog();
 
   $("#minStarsInput").on("change", updateExportCount);
 
@@ -255,6 +331,23 @@ $(function () {
       $("#importMoreStatus").text("Failed: " + err.message);
       setImportMoreUIEnabled(true);
       $("#importMoreDialog").dialog("close");
+    }
+  });
+
+  $("#rerunFacerecoBtn").on("click", async () => {
+    setRerunFacerecoUIEnabled(false);
+    $("#rerunFacerecoStatus").text("Starting…");
+    $("#rerunFacerecoOutput").val("");
+    rerunFacerecoPollSince = 0;
+    openRerunFacerecoDialog();
+    $("#rerunFacerecoStatus").text("Re-running face detection…");
+    try {
+      await apiPost("/api/apply/rerun-facereco", {});
+      rerunFacerecoPollTimer = setInterval(pollRerunFacerecoOutput, 500);
+    } catch (err) {
+      $("#rerunFacerecoStatus").text("Failed: " + err.message);
+      setRerunFacerecoUIEnabled(true);
+      $("#rerunFacerecoDialog").dialog("close");
     }
   });
 

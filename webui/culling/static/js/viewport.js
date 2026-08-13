@@ -14,27 +14,52 @@ const Viewport = (function () {
     return { width: Math.round(naturalW * scale), height: Math.round(naturalH * scale) };
   }
 
-  // A zoom/pan controller: holds the current zoom level and applies it (via
-  // a CSS transform) to whatever set of <img> elements is passed in at call
-  // time. Callers own which images are "live" (e.g. the review page
-  // re-queries its currently displayed preview cells so up to 4 images can
-  // share one zoom level), so the same controller instance can be reused
-  // across image/group navigation without resetting.
+  // A zoom/pan controller: holds the current zoom level + pan offset and
+  // applies them (via a CSS transform) to whatever set of <img> elements is
+  // passed in at call time. Callers own which images are "live" (e.g. the
+  // review page re-queries its currently displayed preview cells so up to 4
+  // images can share one zoom/pan state), so the same controller instance
+  // can be reused across image/group navigation (and, on the review page,
+  // across the annotated/original toggle — see toggleViewMode/renderMain in
+  // review.js) without resetting.
+  //
+  // Pan is tracked as a `translate(tx, ty) scale(zoom)` transform (in that
+  // order) with transform-origin pinned to the image's top-left corner, so
+  // tx/ty are plain screen pixels regardless of zoom: dragging the mouse by
+  // (dx, dy) always just adds (dx, dy) to (tx, ty), and "zoom centered on a
+  // point" is solved by picking a new tx/ty that keeps that point's screen
+  // position unchanged (see zoomTo below). Since the <img> itself is always
+  // sized to exactly fill its (fixed-size, non-scaling) viewport parent at
+  // zoom 1, that parent's rect doubles as the img's un-transformed base
+  // rect for both of those calculations.
   function createZoomController({ min = 1, max = 6, step = 0.25 } = {}) {
     let zoom = min;
+    let tx = 0;
+    let ty = 0;
 
-    function origin(clientX, clientY, imgEl) {
-      const rect = imgEl.getBoundingClientRect();
-      return { x: ((clientX - rect.left) / rect.width) * 100, y: ((clientY - rect.top) / rect.height) * 100 };
+    function baseRectOf(imgEl) {
+      return imgEl.parentElement.getBoundingClientRect();
     }
 
-    function apply($imgs, originX, originY) {
+    // Keeps the pan offset within the range that leaves the (scaled) image
+    // fully covering its viewport — i.e. no empty gap at any edge.
+    function clamp(imgEl) {
+      const r = baseRectOf(imgEl);
+      tx = Math.min(0, Math.max(r.width * (1 - zoom), tx));
+      ty = Math.min(0, Math.max(r.height * (1 - zoom), ty));
+    }
+
+    function apply($imgs) {
       if (zoom <= min) {
+        tx = 0;
+        ty = 0;
         $imgs.removeClass("zoomed").css({ transform: "", "transform-origin": "" });
         return;
       }
-      const o = originX != null && originY != null ? `${originX}% ${originY}%` : "50% 50%";
-      $imgs.addClass("zoomed").css({ transform: `scale(${zoom})`, "transform-origin": o });
+      $imgs.addClass("zoomed").css({
+        transform: `translate(${tx}px, ${ty}px) scale(${zoom})`,
+        "transform-origin": "0 0",
+      });
     }
 
     function resetToFit($imgs) {
@@ -42,37 +67,36 @@ const Viewport = (function () {
       apply($imgs);
     }
 
-    // Zoom to 100% (actual pixel size) of `imgEl`, centered on (clientX,
+    // Changes zoom to `newZoom`, keeping the point under (clientX, clientY)
+    // — relative to `imgEl` — fixed on screen, if given; otherwise zooms
+    // centered on the image itself.
+    function zoomTo($imgs, imgEl, newZoom, clientX, clientY) {
+      newZoom = Math.min(max, Math.max(min, newZoom));
+      if (imgEl) {
+        const r = baseRectOf(imgEl);
+        const cx = clientX != null ? clientX : r.left + r.width / 2;
+        const cy = clientY != null ? clientY : r.top + r.height / 2;
+        const localX = (cx - r.left - tx) / zoom;
+        const localY = (cy - r.top - ty) / zoom;
+        tx += localX * (zoom - newZoom);
+        ty += localY * (zoom - newZoom);
+      }
+      zoom = newZoom;
+      if (imgEl) clamp(imgEl);
+      apply($imgs);
+    }
+
+    // Zoom to 100% (actual pixel size) of `imgEl`, anchored on (clientX,
     // clientY) if given, otherwise centered on the image.
     function zoomToActual($imgs, imgEl, clientX, clientY) {
       if (!imgEl || !imgEl.naturalWidth) return;
-      const rect = imgEl.getBoundingClientRect();
+      const rect = baseRectOf(imgEl);
       const nativeZoom = imgEl.naturalWidth / rect.width;
-      zoom = Math.min(max, Math.max(min, nativeZoom));
-      if (clientX != null && clientY != null) {
-        const o = origin(clientX, clientY, imgEl);
-        apply($imgs, o.x, o.y);
-      } else {
-        apply($imgs);
-      }
+      zoomTo($imgs, imgEl, nativeZoom, clientX, clientY);
     }
 
     function adjustByStep($imgs, delta, imgEl, clientX, clientY) {
-      zoom = Math.min(max, Math.max(min, zoom + delta));
-      if (imgEl && clientX != null) {
-        const o = origin(clientX, clientY, imgEl);
-        apply($imgs, o.x, o.y);
-      } else {
-        apply($imgs);
-      }
-    }
-
-    // Pans a zoomed-in image proportionally to the cursor position. No-op
-    // while at "fit" zoom.
-    function panTo($imgs, imgEl, clientX, clientY) {
-      if (zoom <= min) return;
-      const o = origin(clientX, clientY, imgEl);
-      apply($imgs, o.x, o.y);
+      zoomTo($imgs, imgEl, zoom + delta, clientX, clientY);
     }
 
     // Click-to-toggle: zooms to actual size if currently at fit, or back to
@@ -85,12 +109,45 @@ const Viewport = (function () {
       zoomToActual($imgs, imgEl, clientX, clientY);
     }
 
+    // Drag-to-pan. Starts tracking a drag anchored at (clientX, clientY);
+    // returns false (and starts nothing) while at "fit" zoom, since there's
+    // no room to pan there. `imgEl` is remembered only to know which
+    // viewport to clamp against as the drag proceeds.
+    let dragImg = null;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let dragStartTx = 0;
+    let dragStartTy = 0;
+
+    function dragStart(imgEl, clientX, clientY) {
+      if (zoom <= min) return false;
+      dragImg = imgEl;
+      dragStartX = clientX;
+      dragStartY = clientY;
+      dragStartTx = tx;
+      dragStartTy = ty;
+      return true;
+    }
+
+    function dragMove($imgs, clientX, clientY) {
+      if (!dragImg) return;
+      tx = dragStartTx + (clientX - dragStartX);
+      ty = dragStartTy + (clientY - dragStartY);
+      clamp(dragImg);
+      apply($imgs);
+    }
+
+    function dragEnd() {
+      dragImg = null;
+    }
+
     function isZoomed() {
       return zoom > min;
     }
 
     return {
-      apply, origin, resetToFit, zoomToActual, adjustByStep, panTo, toggleClick, isZoomed,
+      apply, resetToFit, zoomToActual, adjustByStep, toggleClick, isZoomed,
+      dragStart, dragMove, dragEnd,
       get min() { return min; },
       get max() { return max; },
       get step() { return step; },
@@ -100,7 +157,7 @@ const Viewport = (function () {
   // A self-contained modal "frame" hosting a single-image viewport: darkens
   // the background, locks page scroll, and shows a close [x] button. Zoom
   // interactions over the image match the shared viewport behavior (scroll
-  // to zoom, hover to pan while zoomed, click to toggle fit/actual, '1' to
+  // to zoom, drag to pan while zoomed, click to toggle fit/actual, '1' to
   // zoom to actual). Clicking anywhere outside the image, the close button,
   // or any other key (including Esc) closes the window immediately.
   function showImageWindow(imageUrl) {
@@ -125,8 +182,24 @@ const Viewport = (function () {
     else $img.on("load", lock);
     $(window).on("resize.imageWindow", lock);
 
-    $viewport.on("mousemove", "img", function (e) {
-      zoomCtl.panTo(imgs(), this, e.clientX, e.clientY);
+    // Drag-to-pan while zoomed in. `dragging` tracks whether a drag started
+    // on the image is still in progress; `dragMoved` distinguishes an actual
+    // drag from a plain click so the click handler below (fit/actual toggle)
+    // doesn't also fire once the drag ends.
+    let dragging = false;
+    let dragMoved = false;
+    $viewport.on("mousedown", "img", function (e) {
+      e.preventDefault(); // suppress the browser's native image-ghost drag
+      dragMoved = false;
+      dragging = zoomCtl.dragStart(this, e.clientX, e.clientY);
+    });
+    $(document).on("mousemove.imageWindowDrag", function (e) {
+      if (!dragging) return;
+      dragMoved = true;
+      zoomCtl.dragMove(imgs(), e.clientX, e.clientY);
+    });
+    $(document).on("mouseup.imageWindowDrag", function () {
+      dragging = false;
     });
     $viewport.on("wheel", "img", function (e) {
       e.preventDefault();
@@ -135,6 +208,10 @@ const Viewport = (function () {
       zoomCtl.adjustByStep(imgs(), delta, this, oe.clientX, oe.clientY);
     });
     $viewport.on("click", "img", function (e) {
+      if (dragMoved) {
+        dragMoved = false;
+        return;
+      }
       zoomCtl.toggleClick(imgs(), this, e.clientX, e.clientY);
     });
 
@@ -162,6 +239,7 @@ const Viewport = (function () {
 
     function close() {
       document.removeEventListener("keydown", onKeydown, true);
+      $(document).off("mousemove.imageWindowDrag mouseup.imageWindowDrag");
       $(window).off("resize.imageWindow");
       $("body").removeClass("image-window-open");
       $backdrop.remove();

@@ -36,6 +36,14 @@ class FaceRecoConfig:
     # Optional path to a face-DB directory.  Each subdirectory must contain
     # a face.json produced by a previous FaceReco run.
     face_db_dir: Path | None = None
+    # Optional allow-list of person names (e.g. an album's team roster) to
+    # restrict face-DB matching to. When set, face-DB entries whose name
+    # isn't in this set (case-insensitive) are skipped entirely at load
+    # time, so their faces never become match candidates — bodies that
+    # would've matched a filtered-out person fall through to residual
+    # (unnamed/pending) clustering instead. None/empty disables filtering
+    # (every face-DB entry is loaded, the previous behavior).
+    face_db_allowed_names: frozenset[str] | None = None
     # Minimum cosine similarity between a query face and the closest-matching
     # PROTOTYPE (visual sub-cluster — see ``Prototype``/``build_prototypes``)
     # of a face-DB person, required to accept that person as a candidate
@@ -375,7 +383,12 @@ class FaceDb:
         return len(self.entries)
 
     @classmethod
-    def load(cls, db_dir: Path, prototype_similarity_threshold: float = 0.62) -> "FaceDb":
+    def load(
+        cls,
+        db_dir: Path,
+        prototype_similarity_threshold: float = 0.62,
+        allowed_names: frozenset[str] | None = None,
+    ) -> "FaceDb":
         """Walk *db_dir* and load every ``face.json`` found in a sub-directory.
 
         Each person's positive embeddings are split into visually-cohesive
@@ -383,10 +396,15 @@ class FaceDb:
         *prototype_similarity_threshold* -- this is what lets a person's
         photos span multiple visual sub-clusters (lighting, angle, glasses,
         etc.) without diluting matching into one unrepresentative average.
+
+        *allowed_names*, if given, restricts loading to entries whose name
+        matches (case-insensitive); everyone else is skipped entirely so
+        their faces never become match candidates.
         """
         entries: list[FaceDbEntry] = []
         if not db_dir.is_dir():
             raise FileNotFoundError(f"Face-DB directory not found: {db_dir}")
+        allowed_lower = {n.casefold() for n in allowed_names} if allowed_names else None
         for person_dir in sorted(db_dir.iterdir()):
             if not person_dir.is_dir():
                 continue
@@ -401,6 +419,9 @@ class FaceDb:
                 log.warning("FaceDB [load]: %s — failed to parse face.json: %s", person_dir.name, exc)
                 continue
             name = data.get("name") or person_dir.name
+            if allowed_lower is not None and name.casefold() not in allowed_lower:
+                log.debug("FaceDB [load]: %s — not in roster allow-list, skipped", name)
+                continue
             playernum = data.get("playernum")
             provider = str(data.get("provider", ""))
             embeddings = [
@@ -697,6 +718,7 @@ class FaceRecoPipeline:
             face_db = FaceDb.load(
                 self.config.face_db_dir,
                 prototype_similarity_threshold=effective_proto_threshold,
+                allowed_names=self.config.face_db_allowed_names,
             )
             log.info("FaceReco: face DB loaded — %d person(s) from %s",
                      len(face_db), self.config.face_db_dir)

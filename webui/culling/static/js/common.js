@@ -102,3 +102,17 @@ $(function () {
     setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
   }
 });
+
+// ------------------------------------------------------------------ //
+// Publishes the topbar's real rendered height as --topbar-h so sticky
+// elements further down the page (e.g. the cluster page's toolbar) can
+// offset themselves below it without hardcoding a pixel guess.
+// ------------------------------------------------------------------ //
+function syncTopbarHeight() {
+  const el = document.getElementById("topbar");
+  if (el) document.documentElement.style.setProperty("--topbar-h", el.offsetHeight + "px");
+}
+$(function () {
+  syncTopbarHeight();
+  $(window).on("resize", syncTopbarHeight);
+});

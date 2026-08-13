@@ -4,6 +4,7 @@ import gzip
 import json
 import os
 import shutil
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -191,6 +192,38 @@ def apply_auto_adjustment(image: np.ndarray, adjustment: AutoAdjustment | None) 
     out = image.astype(np.float32)
     out *= 2.0 ** adjustment.ev
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# Cached, small "cover crop" square thumbnails used by the review nav strip
+# (culling_app.py) — generated eagerly here (algo/stages/annotation.py) from
+# the in-memory annotated image, alongside the full-size preview.
+THUMBNAILS_SUBDIR = "thumbnails"
+THUMBNAIL_SIZE = 128
+
+
+def write_cover_thumbnail(image: np.ndarray, out_path: Path, size: int = THUMBNAIL_SIZE, quality: int = 85) -> None:
+    """Write a *size* x *size* "cover crop" JPEG thumbnail of *image* to
+    *out_path* (CSS object-fit: cover — scale down so the shorter edge
+    exactly fills the square, then center-crop the longer edge's excess).
+    """
+    h, w = image.shape[:2]
+    scale = size / min(h, w)
+    new_w, new_h = max(size, round(w * scale)), max(size, round(h * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    left = (new_w - size) // 2
+    top = (new_h - size) // 2
+    cropped = resized[top:top + size, left:left + size]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique per-call tmp name (concurrent writers can target the same
+    # thumbnail) that still ends in out_path's suffix — cv2.imwrite() picks
+    # its codec from the filename's extension, so a trailing ".tmp" (with
+    # no image extension) makes it fail every time with "could not find a
+    # writer for the specified extension".
+    tmp_fp = out_path.with_name(f"{out_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp{out_path.suffix}")
+    if not cv2.imwrite(str(tmp_fp), cropped, [cv2.IMWRITE_JPEG_QUALITY, quality]):
+        raise OSError(f"cv2.imwrite failed to write thumbnail: {tmp_fp}")
+    os.replace(tmp_fp, out_path)
 
 
 def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:

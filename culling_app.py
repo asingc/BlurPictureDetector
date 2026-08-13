@@ -49,7 +49,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
-from algo.utils import atomic_save_and_backup, load_album_source_index
+from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, atomic_save_and_backup, load_album_source_index
 
 try:
     from PIL import Image as _PILImage
@@ -428,11 +428,53 @@ def _run_import_more(path: str, album_dir: Path) -> None:
     log.info("Import-more finished (exit code %s)", proc.returncode)
 
 
+def _run_rerun_facereco(album_dir: Path) -> None:
+    """Re-run ONLY the face-recognition/clustering stage against an
+    already-processed album, via 1_prep_review.py --rerun-facereco-only —
+    reuses that album's own already-written album.json (no re-detection of
+    blur/bodies, no re-importing photos) and replays manual_overrides.json
+    on top, so existing tagged players/deletions survive the recluster.
+    """
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "1_prep_review.py"),
+        "--output", str(album_dir),
+        "--rerun-facereco-only",
+        "--no-tag-ui",
+    ]
+
+    log.info("Starting face-detection re-run: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    with processing_state.lock:
+        processing_state.process = proc
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        with processing_state.lock:
+            processing_state.lines.append(line.rstrip("\n"))
+
+    proc.wait()
+    with processing_state.lock:
+        processing_state.running = False
+        processing_state.return_code = proc.returncode
+        processing_state.process = None
+    log.info("Face-detection re-run finished (exit code %s)", proc.returncode)
+
+
 # --------------------------------------------------------------------------- #
 # team.json persistence — {"Teams": [...], "Global": {...}}. Multiple teams
 # are supported; each is identified by a stable `id` assigned the first time
 # it's loaded/saved without one. QueryTeams (below) exposes every team's
-# settings; the Team Setup page can create/update any team by id.
+# settings; the Team Setup page can create/update any team by id.u
 # --------------------------------------------------------------------------- #
 def _default_teams_file() -> TeamsFile:
     return TeamsFile(Teams=[TeamData(name="Team 1")])
@@ -721,6 +763,12 @@ _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno
 # All annotated previews (blur/sharp/skipped alike) live in one shared folder
 # — see algo/stages/annotation.py::AnnotationStage.
 _PREVIEWS_SUBDIR = "previews"
+# Cached, small "cover crop" square thumbnails used by the review nav strip —
+# generated eagerly during processing (algo/stages/annotation.py) alongside
+# the preview; regenerated lazily here (see _ensure_review_thumbnail()) as a
+# fallback for albums processed before that, or if the cache goes stale.
+_THUMBNAILS_SUBDIR = THUMBNAILS_SUBDIR
+_THUMBNAIL_SIZE = THUMBNAIL_SIZE
 # Effective "keep" when album.json has no explicit value yet (older albums,
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
@@ -946,9 +994,16 @@ def _build_clusters(album_path: Path) -> list[dict]:
 
 
 def _collect_names(album_path: Path) -> list[str]:
-    """Collect player names from each cluster's face.json (this album's own
-    .FaceReco plus the shared repo-root face DB used for autocomplete)."""
+    """Collect cluster-page autocomplete names: this album's assigned team
+    roster (team.json) unioned with whatever names are already tagged onto
+    clusters (this album's own .FaceReco plus the shared repo-root face DB)
+    — the union keeps non-roster tags (coaches, etc.) autocompleting too."""
     names: set[str] = set()
+    team = _resolve_team(_album_team_id(album_path))
+    for player in team.players:
+        name = (player.name or "").strip()
+        if name:
+            names.add(name)
     for source in (_global_face_db_dir(), _facereco_dir(album_path)):
         if source is None or not source.is_dir():
             continue
@@ -1551,10 +1606,67 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
     }
 
 
+def _ensure_review_thumbnail(src_fp: Path, thumb_fp: Path) -> Path:
+    """Return a cached _THUMBNAIL_SIZE x _THUMBNAIL_SIZE "cover crop" JPEG
+    thumbnail of *src_fp* at *thumb_fp*, generating (or regenerating, if
+    *src_fp* was modified more recently) it first if needed.
+
+    Cover-crop: scale down so the shorter edge exactly fills the square, then
+    center-crop the longer edge's excess — equivalent to CSS object-fit:
+    cover. Falls back to returning *src_fp* unchanged if Pillow isn't
+    available or thumbnail generation fails for any reason.
+    """
+    if _PILImage is None:
+        return src_fp
+    try:
+        if thumb_fp.is_file() and thumb_fp.stat().st_mtime >= src_fp.stat().st_mtime:
+            return thumb_fp
+        with _PILImage.open(src_fp) as img:
+            # JPEG-only fast path: lets libjpeg decode at a reduced DCT scale
+            # instead of full resolution, since we're about to shrink to
+            # _THUMBNAIL_SIZE anyway — cuts decode time dramatically for the
+            # ~1800px-long-edge previews this reads from. No-op for non-JPEGs.
+            img.draft("RGB", (_THUMBNAIL_SIZE, _THUMBNAIL_SIZE))
+            img = img.convert("RGB")
+            w, h = img.size
+            size = _THUMBNAIL_SIZE
+            scale = size / min(w, h)
+            new_w, new_h = max(size, round(w * scale)), max(size, round(h * scale))
+            img = img.resize((new_w, new_h), _PILImage.LANCZOS)
+            left = (new_w - size) // 2
+            top = (new_h - size) // 2
+            img = img.crop((left, top, left + size, top + size))
+            thumb_fp.parent.mkdir(parents=True, exist_ok=True)
+            # Unique per-call tmp name — concurrent requests (or a running
+            # 1_prep_review.py) can be writing this same thumbnail, and a
+            # shared "<name>.tmp" lets one writer's os.replace() race out
+            # from under the other.
+            tmp_fp = thumb_fp.with_name(f"{thumb_fp.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            img.save(tmp_fp, "JPEG", quality=85)
+            os.replace(tmp_fp, thumb_fp)
+        return thumb_fp
+    except Exception:
+        log.warning("Thumbnail generation failed for %s — serving full image", src_fp, exc_info=True)
+        return src_fp
+
+
 @app.get("/api/review/thumb")
 def api_review_thumb(category: str = Query(...), file: str = Query(...)) -> FileResponse:
     if category not in REVIEW_CATEGORIES:
         raise HTTPException(status_code=400, detail="Invalid category")
+    album_path = _current_album_path()
+    safe_file = _safe_component(file)
+    fp = album_path / _PREVIEWS_SUBDIR / safe_file
+    if not fp.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    thumb_fp = album_path / _THUMBNAILS_SUBDIR / safe_file
+    return FileResponse(_ensure_review_thumbnail(fp, thumb_fp))
+
+@app.get("/api/anno_img")
+def api_anno_img(file: str = Query(...)) -> FileResponse:
+    """Full-resolution annotated preview image — shared by the review page's
+    main pane (toggle-able against /api/original) and any other consumer
+    that wants the annotated (not cropped/resized) version of a photo."""
     album_path = _current_album_path()
     fp = album_path / _PREVIEWS_SUBDIR / _safe_component(file)
     if not fp.is_file():
@@ -1729,6 +1841,30 @@ def api_import_more(req: ImportMoreRequest) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/apply/rerun-facereco")
+def api_rerun_facereco() -> dict:
+    """Re-run face detection/clustering for the current album (Summary
+    page's "Re-run Face Detection" button). Reuses the same
+    processing_state/polling machinery as /api/start-processing and
+    /api/import-more — only one processing job can run at a time."""
+    album_dir = _current_album_path()
+
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="Processing is already running.")
+        processing_state.running = True
+        processing_state.return_code = None
+        processing_state.lines = []
+
+    thread = threading.Thread(
+        target=_run_rerun_facereco,
+        args=(album_dir,),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
 @app.get("/api/processing-output")
 def api_processing_output(since: int = 0) -> dict:
     with processing_state.lock:
@@ -1763,8 +1899,11 @@ def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
     return FileResponse(fp)
 
 
-@app.get("/api/cluster/original")
-def api_cluster_original(file: str = Query(...)) -> FileResponse:
+@app.get("/api/original")
+def api_original(file: str = Query(...)) -> FileResponse:
+    """Original, unmodified source photo for *file* — shared by the cluster
+    page's face-crop context view and the review page's anno/original
+    toggle (see /api/anno_img for the annotated counterpart)."""
     album_path = _current_album_path()
     album_json = album_path / "album.json"
     if album_json.is_file():

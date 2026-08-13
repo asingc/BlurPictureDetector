@@ -1,5 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Face Clustering — Photo Culling{% endblock %}
+{% macro cluster_pagination() %}
+  <div class="panel cluster-pagination">
+    <button class="btn btn-sm cluster-first-page-btn" title="First page">&laquo; First</button>
+    <button class="btn btn-sm cluster-prev-page-btn" title="Previous page">&lsaquo; Prev</button>
+    <span class="cluster-pagination-current">
+      Page <input class="cluster-page-input" type="number" min="1" step="1"> of <span class="cluster-page-total">1</span>
+    </span>
+    <button class="btn btn-sm cluster-next-page-btn" title="Next page">Next &rsaquo;</button>
+    <button class="btn btn-sm cluster-last-page-btn" title="Last page">Last &raquo;</button>
+    <span class="muted cluster-pagination-range"></span>
+  </div>
+{% endmacro %}
 {% block content %}
 <h2>Face Clustering</h2>
 <div id="clusterEmpty" class="panel" style="display:none">
@@ -19,10 +31,13 @@
       <button id="clusterSaveBtn" class="btn btn-primary" disabled>Save</button>
     </div>
   </div>
+  {{ cluster_pagination() }}
   <div id="clusterBands"></div>
+  {{ cluster_pagination() }}
 </div>
 <p id="clusterStatus" class="muted"></p>
 {% endblock %}
 {% block extra_scripts %}
 <script src="{{ static_url('js/cluster.js') }}"></script>
 {% endblock %}
+

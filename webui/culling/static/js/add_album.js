@@ -111,7 +111,7 @@ function initRecognizeFacesCheckbox() {
     open: function () {
       consentAgreed = false;
       $readCheckbox.prop("checked", false);
-      $consentDialog.dialog("widget").find(".btn-primary").prop("disabled", true);
+      $consentDialog.dialog("widget").find(".btn-primary").button("option", "disabled", true);
     },
     close: function () {
       if (!consentAgreed) {
@@ -124,7 +124,14 @@ function initRecognizeFacesCheckbox() {
   });
 
   $readCheckbox.on("change", function () {
-    $consentDialog.dialog("widget").find(".btn-primary").prop("disabled", !this.checked);
+    // Must go through the jQuery UI button widget API here, not a plain
+    // .prop("disabled", ...) — jQuery UI keeps its own "disabled" widget
+    // state/`.ui-state-disabled` class (which sets `pointer-events: none`)
+    // separate from the DOM attribute, so toggling only the DOM prop left
+    // the button visually enabled but still unclickable with the mouse
+    // (keyboard activation via Tab+Enter still worked, which is why this
+    // only showed up for mouse users).
+    $consentDialog.dialog("widget").find(".btn-primary").button("option", "disabled", !this.checked);
   });
 
   $("#recognizeFacesInput").on("change", function () {
