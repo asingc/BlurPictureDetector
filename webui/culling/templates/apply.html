@@ -12,6 +12,115 @@
   </div>
 </div>
 
+<div class="panel" id="sensitivityPanel">
+  <h3>Adjust Blur Sensitivity</h3>
+  <p class="muted">
+    Move the cut-line between Blur and Sharp. Jersey colours are re-evaluated
+    and the team colour re-polled either way; photos where no usable face was
+    detected are only revisited by a deep regrade.
+  </p>
+  <div id="regradeSensitivityPresets" class="sensitivity-options">
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="low" />
+      <span class="option-text">
+        <span class="option-title">Low <span class="muted">(0.35)</span></span>
+        <span class="option-desc muted">Allows through all but the most severely blurred images.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="medium" />
+      <span class="option-text">
+        <span class="option-title">Medium <span class="muted">(0.50)</span></span>
+        <span class="option-desc muted">Allows through mildly soft images; noticeably blurry ones are filtered out.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="high" />
+      <span class="option-text">
+        <span class="option-title">High <span class="muted">(0.68)</span></span>
+        <span class="option-desc muted">Keeps only sharply focused faces.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="custom" />
+      <span class="option-text">
+        <span class="option-title">Custom</span>
+        <span class="option-desc muted">Set your own threshold below.</span>
+      </span>
+    </label>
+  </div>
+  <div class="row">
+    <input type="range" id="regradeSensitivitySlider" min="0" max="0.99" step="0.01" value="0.50" />
+    <span id="regradeSensitivityValue" class="muted">0.50</span>
+  </div>
+  <div class="row actions">
+    <span id="regradeStatus" class="muted"></span>
+    <button id="regradeBtn" class="btn btn-icon-text" title="Re-bucket Blur/Sharp from the sharpness scores already measured">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+      </svg>
+      <span>Quick Regrade</span>
+    </button>
+    <button id="deepRegradeBtn" class="btn btn-icon-text" title="Re-detect and re-score every photo from the originals">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <polyline points="1 20 1 14 7 14"></polyline>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+      </svg>
+      <span>Deep Regrade</span>
+    </button>
+  </div>
+  <p class="muted">
+    <strong>Quick</strong> re-uses the sharpness scores already measured, then
+    re-checks jersey colours and re-polls the team colour against the new cut-line —
+    fast, but it can't revisit photos where no usable face was detected.
+    <strong>Deep</strong> additionally re-detects people and re-measures sharpness
+    from the original photos, so it also fixes albums where detection itself was
+    off — much slower. Both keep your star ratings and face tagging.
+  </p>
+</div>
+
+<div id="deepRegradeDialog" title="Deep regrade…" style="display:none">
+  <textarea id="deepRegradeOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="jerseyColorPanel">
+  <h3>Team Jersey Colour</h3>
+  <p class="muted">
+    By default this album's team colour is auto-detected from the photos.
+    Pin it here if detection picked the wrong colour — every photo is
+    re-checked against the new colour, star ratings for any photo that
+    changes side of the keep line are reset to their baseline, and the
+    previews/thumbnails for those photos are redrawn. Face tagging is
+    untouched — face recognition doesn't depend on jersey colour.
+  </p>
+  <div class="row">
+    <label>Team colour
+      <select id="jerseyColorSelect">
+        <option value="">Auto (detect)</option>
+      </select>
+    </label>
+    <span id="jerseyColorDetected" class="muted"></span>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="jerseyRerunLlmInput" />
+      Re-run LLM burst ranking after this change (uses OpenAI credits)
+    </label>
+  </div>
+  <div class="row actions">
+    <span id="jerseyColorStatus" class="muted"></span>
+    <button id="jerseyColorBtn" class="btn btn-icon-text" title="Apply this jersey colour to the whole album">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"></circle>
+        <path d="M12 3a9 9 0 0 0 0 18 5 5 0 0 0 0-10h4a4 4 0 0 0 0-8z"></path>
+      </svg>
+      <span>Apply Jersey Colour</span>
+    </button>
+  </div>
+</div>
+
 <div class="panel" id="importMorePanel">
   <h3>Import More Images</h3>
   <p class="muted">

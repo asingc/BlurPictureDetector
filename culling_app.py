@@ -49,6 +49,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
+from algo.regrade import regrade_sensitivity
 from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, atomic_save_and_backup, load_album_source_index
 
 try:
@@ -146,6 +147,24 @@ class ExportRequest(BaseModel):
     # the old keep/drop flag as the export criterion. Defaults to 3 (the
     # baseline "keep" tier).
     minStars: int = 3
+
+
+class RegradeSensitivityRequest(BaseModel):
+    sensitivityMode: str = "medium"       # "low" | "medium" | "high" | "custom"
+    sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
+    # "shallow" = re-threshold the stored sharpness scores (instant);
+    # "deep" = re-run the full detection/scoring pipeline (background job).
+    mode: str = "shallow"
+
+
+class JerseyColorRequest(BaseModel):
+    # "Hue:Shade" label pinning the team colour, or "" to restore
+    # auto-detection from the photos.
+    teamColor: str = ""
+    # Burst membership depends on which photos end up "sharp", so a colour
+    # change can invalidate the LLM's rankings/grades. Opt-in because
+    # re-running spends OpenAI credits.
+    rerunLlmCulling: bool = False
 
 
 class AlbumSelectRequest(BaseModel):
@@ -294,6 +313,10 @@ def _sensitivity_arg(mode: str, custom_value: float) -> str:
     if mode == "custom":
         return str(custom_value)
     return mode
+
+
+def _sensitivity_threshold(mode: str, custom_value: float) -> float:
+    return SENSITIVITY_PRESETS.get(mode, custom_value)
 
 
 def _jerseycolor_arg(team: TeamData) -> str:
@@ -468,6 +491,89 @@ def _run_rerun_facereco(album_dir: Path) -> None:
         processing_state.return_code = proc.returncode
         processing_state.process = None
     log.info("Face-detection re-run finished (exit code %s)", proc.returncode)
+
+
+def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
+    """Deep regrade: re-run the full analysis pipeline (person/pose + face
+    detection, sharpness scoring, jersey re-poll, preview regeneration) over
+    the album's already-imported photos at a new sensitivity, via
+    1_prep_review.py --regrade-only. Star ratings/keep flags/LLM culling
+    results are preserved and FaceReco clusters are untouched.
+    """
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "1_prep_review.py"),
+        "--output", str(album_dir),
+        "--regrade-only",
+        "--sensitivity", sensitivity,
+        "--no-tag-ui",
+    ]
+
+    log.info("Starting deep regrade: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    with processing_state.lock:
+        processing_state.process = proc
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        with processing_state.lock:
+            processing_state.lines.append(line.rstrip("\n"))
+
+    proc.wait()
+    with processing_state.lock:
+        processing_state.running = False
+        processing_state.return_code = proc.returncode
+        processing_state.process = None
+    log.info("Deep regrade finished (exit code %s)", proc.returncode)
+
+
+def _run_rerun_llm_culling(album_dir: Path) -> None:
+    """Re-rank the album's bursts with the LLM (RerunLLMCulling.py) after a
+    change that moved photos between sharp and blurry -- burst membership,
+    keep flags, grades and star tiers are all derived from the sharp set."""
+    team = _resolve_team(_album_team_id(album_dir))
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "RerunLLMCulling.py"),
+        str(album_dir),
+    ]
+    if team.openaiApiKey:
+        cmd += ["--openaikey", team.openaiApiKey]
+
+    log.info("Starting LLM re-cull: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    with processing_state.lock:
+        processing_state.process = proc
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        with processing_state.lock:
+            processing_state.lines.append(line.rstrip("\n"))
+
+    proc.wait()
+    with processing_state.lock:
+        processing_state.running = False
+        processing_state.return_code = proc.returncode
+        processing_state.process = None
+    log.info("LLM re-cull finished (exit code %s)", proc.returncode)
 
 
 # --------------------------------------------------------------------------- #
@@ -905,6 +1011,25 @@ def _sort_groups(groups: list[list[dict]], sort_mode: str) -> list[list[dict]]:
     if sort_mode == "new":
         return sorted(groups, key=lambda g: g[0]["timestamp"], reverse=True)
     return sorted(groups, key=lambda g: (-len(g), g[0]["timestamp"]))  # "size" (default)
+
+
+_RATING_GROUP_SIZE = 6
+
+
+def _rating_sort_key(im: dict) -> tuple:
+    """Stars desc, then llmGrade desc (missing sorts lowest), then timestamp
+    asc."""
+    llm_grade = im["llmGrade"]
+    grade_key = (0, -llm_grade) if llm_grade is not None else (1, 0.0)
+    return (-im["stars"], grade_key, im["timestamp"])
+
+
+def _rating_groups(images: list[dict]) -> list[list[dict]]:
+    """"Rating" sort mode: ignore burst/time-gap grouping entirely — sort the
+    full flat image list by rating, then chunk sequentially into fixed
+    groups of _RATING_GROUP_SIZE (last group may be smaller)."""
+    ordered = sorted(images, key=_rating_sort_key)
+    return [ordered[i:i + _RATING_GROUP_SIZE] for i in range(0, len(ordered), _RATING_GROUP_SIZE)]
 
 
 def _facereco_dir(album_path: Path) -> Optional[Path]:
@@ -1593,7 +1718,11 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
     if category not in REVIEW_CATEGORIES:
         raise HTTPException(status_code=400, detail="Invalid category")
     album_path = _current_album_path()
-    groups = _sort_groups(_group_bursts(_review_images(album_path, category)), sort)
+    images = _review_images(album_path, category)
+    if sort == "rating":
+        groups = _rating_groups(images)
+    else:
+        groups = _sort_groups(_group_bursts(images), sort)
     return {
         "category": category,
         "groups": [
@@ -1702,6 +1831,13 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
             stars = int(req.starOverrides.get(src_name, current_stars))
             result["stars"] = stars
             result["keep"] = stars >= 3
+            # Marks a rating the user actually chose, so a later regrade can
+            # re-baseline everyone else's stars without discarding it. Only
+            # keys present in starOverrides were genuinely touched -- every
+            # other entry is rewritten above merely to persist its current
+            # effective value.
+            if src_name in req.starOverrides:
+                result["stars_manual"] = True
 
     atomic_save_and_backup(json.dumps(payload, indent=2), album_path / "album.json")
     log.info("Review changes applied: %s (%d star overrides)",
@@ -1941,7 +2077,8 @@ def api_apply_summary() -> dict:
     kept = len(_kept_image_basenames(album_path))
     clusters = _build_clusters(album_path)
 
-    results = _load_results_payload(album_path).get("results", [])
+    payload = _load_results_payload(album_path)
+    results = payload.get("results", [])
     star_breakdown = {str(n): 0 for n in range(5, 0, -1)}
     unrated = 0
     for entry in results:
@@ -1952,14 +2089,171 @@ def api_apply_summary() -> dict:
         else:
             unrated += 1
 
+    raw_sensitivity = str((payload.get("run_settings") or {}).get("sensitivity", "medium"))
+    if raw_sensitivity in SENSITIVITY_PRESETS:
+        sensitivity_mode, sensitivity_custom_value = raw_sensitivity, 0.50
+    else:
+        try:
+            sensitivity_mode, sensitivity_custom_value = "custom", float(raw_sensitivity)
+        except ValueError:
+            sensitivity_mode, sensitivity_custom_value = "medium", 0.50
+
     return {
         "name": album_path.name,
         "imagesKept": kept,
         "imagesDropped": max(0, total_images - kept),
+        "blurCount": len(info.get("Anno_Blur", [])),
+        "sharpCount": len(info.get("Anno_Sharp", [])),
         "facesDetected": sum(len(c["faces"]) for c in clusters),
         "playersDetected": sum(1 for c in clusters if not c["pending"]),
         "starBreakdown": star_breakdown,
         "unrated": unrated,
+        "sensitivityMode": sensitivity_mode,
+        "sensitivityCustomValue": sensitivity_custom_value,
+    }
+
+
+@app.post("/api/apply/regrade-sensitivity")
+def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
+    """Re-grade the current album's Blur/Sharp verdicts at a NEW sensitivity.
+
+    ``mode="shallow"`` re-buckets from the per-body sharpness scores already
+    stored in album.json (see algo/regrade.py) and returns its result
+    synchronously — near-instant, no pixel decoding.
+
+    ``mode="deep"`` re-runs the FULL analysis pipeline over the album's
+    source photos (1_prep_review.py --regrade-only) in a background thread,
+    streaming progress through the shared processing_state that
+    /api/processing-output already serves.
+
+    Either way this mutates album.json + info.json, so it's blocked while
+    any other operation touching the same album is running."""
+    album_path = _current_album_path()
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="An import/re-run is already in progress.")
+    with export_state.lock:
+        if export_state.running:
+            raise HTTPException(status_code=409, detail="An export is already in progress.")
+
+    threshold = _sensitivity_threshold(req.sensitivityMode, req.sensitivityCustomValue)
+
+    if req.mode == "deep":
+        with processing_state.lock:
+            if processing_state.running:
+                raise HTTPException(status_code=409, detail="Processing is already running.")
+            processing_state.running = True
+            processing_state.return_code = None
+            processing_state.lines = []
+        threading.Thread(
+            target=_run_deep_regrade,
+            args=(album_path, _sensitivity_arg(req.sensitivityMode, req.sensitivityCustomValue)),
+            daemon=True,
+        ).start()
+        return {"mode": "deep", "started": True, "threshold": threshold}
+
+    summary = regrade_sensitivity(album_path, threshold)
+    log.info(
+        "Regraded sensitivity: %s (threshold=%.2f) — recovered=%d demoted=%d team_colour=%s",
+        album_path.resolve(), threshold, summary.recovered, summary.demoted, summary.team_color,
+    )
+    return {
+        "mode": "shallow",
+        "started": False,
+        "threshold": summary.threshold,
+        "imagesConsidered": summary.images_considered,
+        "recovered": summary.recovered,
+        "demoted": summary.demoted,
+        "jerseyRechecked": summary.jersey_rechecked,
+        "jerseyRecheckUnreadable": summary.jersey_recheck_unreadable,
+        "teamColor": summary.team_color,
+        "previewsRegenerated": summary.previews_regenerated,
+        "previewsRegenFailed": summary.previews_regen_failed,
+    }
+
+
+@app.get("/api/apply/jersey-options")
+def api_jersey_options() -> dict:
+    """Colours offerable as a manual team-colour pin for the current album:
+    the album team's own registered jersey colours, minus the forced ones
+    (goalkeeper/alternate kits, which always pass regardless of the team
+    colour and so make no sense as the team colour itself)."""
+    album_path = _current_album_path()
+    payload = _load_results_payload(album_path)
+    run_settings = payload.get("run_settings") or {}
+    team = _resolve_team(_album_team_id(album_path))
+    return {
+        "options": [jc.color for jc in team.jerseyColors if not jc.forced],
+        "current": (run_settings.get("team_color_override") or ""),
+        "detected": payload.get("our_jersey_color") or "",
+        "noTeam": bool(run_settings.get("noteam")),
+    }
+
+
+@app.post("/api/apply/jersey-color")
+def api_set_jersey_color(req: JerseyColorRequest) -> dict:
+    """Pin (or un-pin) the album's team jersey colour and propagate it.
+
+    Re-runs the shallow regrade at the album's current sensitivity with the
+    new colour, which re-applies the jersey filter to every eligible body and
+    rewrites verdicts, info.json buckets, star baselines and previews. Face
+    recognition is deliberately NOT re-run: FaceRecoPipeline selects bodies
+    purely on sharpness_score, so jersey filtering cannot change its input.
+
+    When ``rerunLlmCulling`` is set, LLM burst ranking is re-run afterwards
+    as a background job (burst membership follows the sharp set)."""
+    album_path = _current_album_path()
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="An import/re-run is already in progress.")
+    with export_state.lock:
+        if export_state.running:
+            raise HTTPException(status_code=409, detail="An export is already in progress.")
+
+    payload = _load_results_payload(album_path)
+    run_settings = payload.get("run_settings") or {}
+    if run_settings.get("noteam"):
+        raise HTTPException(
+            status_code=400,
+            detail="This album was imported with jersey-colour filtering disabled.",
+        )
+
+    raw = str(run_settings.get("sensitivity", "medium"))
+    threshold = SENSITIVITY_PRESETS.get(raw)
+    if threshold is None:
+        try:
+            threshold = float(raw)
+        except ValueError:
+            threshold = SENSITIVITY_PRESETS["medium"]
+
+    summary = regrade_sensitivity(album_path, threshold, team_color_override=req.teamColor)
+    log.info(
+        "Jersey colour set on %s: %s (%s) — recovered=%d demoted=%d stars_rebaselined=%d",
+        album_path.resolve(), summary.team_color, "pinned" if summary.team_color_pinned else "auto",
+        summary.recovered, summary.demoted, summary.stars_rebaselined,
+    )
+
+    llm_started = False
+    if req.rerunLlmCulling:
+        with processing_state.lock:
+            if not processing_state.running:
+                processing_state.running = True
+                processing_state.return_code = None
+                processing_state.lines = []
+                llm_started = True
+        if llm_started:
+            threading.Thread(target=_run_rerun_llm_culling, args=(album_path,), daemon=True).start()
+
+    return {
+        "teamColor": summary.team_color,
+        "pinned": summary.team_color_pinned,
+        "imagesConsidered": summary.images_considered,
+        "recovered": summary.recovered,
+        "demoted": summary.demoted,
+        "starsRebaselined": summary.stars_rebaselined,
+        "previewsRegenerated": summary.previews_regenerated,
+        "previewsRegenFailed": summary.previews_regen_failed,
+        "llmRerunStarted": llm_started,
     }
 
 

@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover - non-Windows platforms
 from algo.config import AppConfig, app_config
 from algo.frame import Frame
 from algo.models import Body, Box, ColorLab, Face, Point, PredictedKeyPoint
+from algo.results import NumpyEncoder, baseline_stars, build_result_entries
 from algo.stage import ProcessStage
 from algo.stages.annotation import AnnotationStage
 from algo.stages.auto_adjust import AutoAdjustStage
@@ -1228,118 +1229,6 @@ def write_blur_lst(frames: list[Frame], lst_path: Path, *, append: bool = False)
     log.info("Blur list written to:     %s", lst_path)
 
 
-def _serial_box(b: Box) -> dict:
-    return {"x1": b.x1, "y1": b.y1, "x2": b.x2, "y2": b.y2}
-
-
-def _serial_keypoint(kp: PredictedKeyPoint) -> dict:
-    return {"x": kp.point.x, "y": kp.point.y, "conf": kp.confidence, "passed": kp.passed}
-
-
-def _serial_face(f: Face) -> dict:
-    return {
-        "bbox":       _serial_box(f.bbox),
-        "confidence": f.confidence,
-        "landmarks":  [_serial_keypoint(lm) for lm in f.landmarks],
-        "passed":     f.passed,
-    }
-
-
-def _serial_annotation_data(ann: dict) -> dict:
-    return {
-        "processing_shape": list(ann["processing_shape"]),
-        "overall_blurry":   ann["overall_blurry"],
-        "evaluated": [
-            {
-                "body_bbox":        _serial_box(p["body_bbox"]),
-                "body_keypoints":   [_serial_keypoint(kp) for kp in p["body_keypoints"]],
-                "face_bbox":        _serial_box(p["face_bbox"]) if p["face_bbox"] else None,
-                "narrow_face_bbox": _serial_box(p["narrow_face_bbox"]) if p["narrow_face_bbox"] else None,
-                "face_kps":         _serial_face(p["face_kps"]) if p["face_kps"] else None,
-                "sharpness_score":  p["sharpness_score"],
-                "lap_var":          p["lap_var"],
-                "ten":              p["ten"],
-                "is_blurry":        p["is_blurry"],
-                "cloth_color":      p.get("cloth_color", "N/A"),
-                "cloth_color_detail": p.get("cloth_color_detail", {}),
-            }
-            for p in ann["evaluated"]
-        ],
-    }
-
-
-class _NumpyEncoder(json.JSONEncoder):
-    """Encode numpy scalar types as their Python equivalents."""
-    def default(self, obj: object) -> object:
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
-
-
-def _build_result_entries(frames: list[Frame]) -> list[dict]:
-    """Serialize *frames* into album.json ``results`` entries (scores,
-    bboxes, keypoints). Split out from :func:`write_results_json` so an
-    incremental import (see main()) can build entries for just the newly
-    imported frames and merge them with the existing album's entries."""
-    serializable = []
-    for frame in frames:
-        norm_img = frame.normalized_image
-        auto_adj = frame.auto_adjustment
-        auto_adj_entry = (
-            {"ev": auto_adj.ev} if auto_adj is not None else None
-        )
-        key = frame.output_key or frame.path.name
-        if not frame.bodies:
-            entry: dict = {
-                "file": str(frame.path),
-                "key": key,
-                "status": "skipped",
-                "auto_adjustment": auto_adj_entry,
-                "preview_path": f"previews/{frame.key_stem}.jpg",
-            }
-        else:
-            overall_blurry = not frame.is_sharp()
-            passing = [b for b in frame.bodies if b.passed]
-            best = max(passing or frame.bodies, key=lambda b: b.sharpness_score)
-            entry = {
-                "file":               str(frame.path),
-                "key":                key,
-                "status":             "blurry" if overall_blurry else "sharp",
-                "sharpness_score":    round(best.sharpness_score, 4),
-                "sharpness_grade":    round(best.sharpness_score * 100, 1),
-                "laplacian_variance": round(best.lap_var, 2),
-                "tenengrad_score":    round(best.ten, 2),
-                "auto_adjustment":    auto_adj_entry,
-                "preview_path":       f"previews/{frame.key_stem}.jpg",
-                "annotation_data": {
-                    "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
-                    "overall_blurry":   overall_blurry,
-                    "evaluated": [
-                        {
-                            "body_bbox":          _serial_box(body.bbox),
-                            "body_keypoints":     [_serial_keypoint(kp) for kp in body.keypoints],
-                            "face_bbox":          _serial_box(body.best_face.bbox) if body.best_face else None,
-                            "narrow_face_bbox":   _serial_box(body.best_narrow_box) if body.best_narrow_box else None,
-                            "face_kps":           _serial_face(body.best_face) if body.best_face else None,
-                            "sharpness_score":    body.sharpness_score,
-                            "lap_var":            body.lap_var,
-                            "ten":                body.ten,
-                            "is_blurry":          not body.passed,
-                            "cloth_color":        body.cloth_color,
-                            "cloth_color_detail": body.cloth_color_detail,
-                        }
-                        for body in frame.bodies
-                    ],
-                },
-            }
-        serializable.append(entry)
-    return serializable
-
-
 def write_results_json(
     frames: list[Frame],
     json_path: Path,
@@ -1358,7 +1247,7 @@ def write_results_json(
     appended after them so already-processed images/clusters/reviews are
     never disturbed.
     """
-    serializable = list(existing_entries or []) + _build_result_entries(frames)
+    serializable = list(existing_entries or []) + build_result_entries(frames)
     payload = {
         "team_id": team_id,
         "our_jersey_color": our_jersey_color,
@@ -1367,7 +1256,7 @@ def write_results_json(
         "run_settings": run_settings or {},
         "results": serializable,
     }
-    atomic_save_and_backup(json.dumps(payload, indent=2, cls=_NumpyEncoder), json_path)
+    atomic_save_and_backup(json.dumps(payload, indent=2, cls=NumpyEncoder), json_path)
     log.info("Results JSON written to:  %s", json_path)
 
 
@@ -1381,8 +1270,38 @@ def _mark_import_complete(json_path: Path) -> None:
     with open(json_path, encoding="utf-8") as fh:
         payload = json.load(fh)
     payload["import_status"] = "complete"
-    atomic_save_and_backup(json.dumps(payload, indent=2, cls=_NumpyEncoder), json_path)
+    atomic_save_and_backup(json.dumps(payload, indent=2, cls=NumpyEncoder), json_path)
     log.debug("Import marked complete: %s", json_path)
+
+
+# Fields written onto an album.json entry AFTER the analysis pipeline (by the
+# Review page's Apply step and the LLM burst-culling stage). A deep regrade
+# rebuilds every entry from freshly-computed detections, so these have to be
+# carried over explicitly or the user's review work would be wiped.
+_REGRADE_PRESERVED_FIELDS = ("stars", "stars_manual", "keep", "burst_ranking", "llm_grade", "burst_caption")
+
+
+def _merge_preserved_fields(
+    new_entries: list[dict], old_entries: list[dict], threshold: float
+) -> list[dict]:
+    old_by_key = {
+        (e.get("key") or Path(e.get("file", "")).name): e
+        for e in old_entries if e.get("file")
+    }
+    for entry in new_entries:
+        old = old_by_key.get(entry.get("key") or Path(entry.get("file", "")).name)
+        if not old:
+            continue
+        for field_name in _REGRADE_PRESERVED_FIELDS:
+            if field_name in old:
+                entry[field_name] = old[field_name]
+        # A photo that changed side of the keep line carries a star rating
+        # that no longer reflects it, so reset to the baseline unless the
+        # user rated it by hand (culling_app.py's "stars_manual" marker).
+        if old.get("status") != entry.get("status") and not entry.get("stars_manual"):
+            entry["stars"] = baseline_stars(entry, entry.get("status", "blurry"), threshold)
+            entry["keep"] = entry["stars"] >= 3
+    return new_entries
 
 
 def _compute_jersey_color(all_results: list[dict]) -> str:
@@ -1888,10 +1807,36 @@ def main() -> None:
             "any other FaceRecoStage run."
         ),
     )
+    parser.add_argument(
+        "--team-color",
+        default=None,
+        metavar="HUE:SHADE",
+        help=(
+            "Pin the team's jersey colour to this 'Hue:Shade' label (e.g. "
+            "'Blue:Navy') instead of polling the dominant colour from the "
+            "photos. Pass an empty string to clear an album's existing pin "
+            "and go back to auto-detection."
+        ),
+    )
+    parser.add_argument(
+        "--regrade-only",
+        action="store_true",
+        help=(
+            "Deep regrade: re-run the FULL analysis pipeline (person/pose "
+            "detection, face detection, sharpness scoring, jersey re-poll, "
+            "preview regeneration) over an existing album's already-imported "
+            "source photos at the --sensitivity threshold given, without "
+            "importing anything new (requires --output pointing at that "
+            "album; no positional path needed). Star ratings, keep flags and "
+            "LLM burst-culling results are preserved; FaceReco clusters are "
+            "left untouched."
+        ),
+    )
     args = parser.parse_args()
-    if args.rerun_facereco_only:
+    if args.rerun_facereco_only or args.regrade_only:
         if not args.output:
-            parser.error("--rerun-facereco-only requires --output <existing album directory>")
+            flag = "--rerun-facereco-only" if args.rerun_facereco_only else "--regrade-only"
+            parser.error(f"{flag} requires --output <existing album directory>")
     elif not args.path:
         parser.error("the following arguments are required: path")
 
@@ -1964,7 +1909,10 @@ def main() -> None:
                         name, stored, current,
                     )
                 return stored if stored is not None else current
-            args.sensitivity = _lock("sensitivity", args.sensitivity)
+            # A deep regrade exists precisely to change the sensitivity, so
+            # that one setting is taken from the CLI instead of being locked.
+            if not args.regrade_only:
+                args.sensitivity = _lock("sensitivity", args.sensitivity)
             args.jerseycolor = _lock("jerseycolor", args.jerseycolor)
             args.engine = _lock("engine", args.engine)
             args.noteam = _lock("noteam", args.noteam)
@@ -2017,6 +1965,15 @@ def main() -> None:
     except ValueError:
         sensitivity_threshold = SENSITIVITY_THRESHOLDS[args.sensitivity]
 
+    # An explicit --team-color wins (empty string clears the pin); otherwise
+    # inherit whatever the album already recorded, so a regrade for some
+    # other reason doesn't silently revert a colour the user chose.
+    team_color_override = (
+        args.team_color if args.team_color is not None
+        else run_settings.get("team_color_override")
+    )
+    team_color_override = (team_color_override or "").strip()
+
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir  = output_root if output_root is not None else Path("albums") / _build_album_dir_name(ts, input_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2050,14 +2007,50 @@ def main() -> None:
         log.info("Face detection re-run complete.")
         return
 
+    # Deep regrade: re-analyse the album's ALREADY-imported photos instead of
+    # discovering new ones. Everything downstream (grading, jersey counting,
+    # annotation, album.json serialization) runs through the exact same
+    # stages an import uses -- only the input file list and the final merge
+    # differ.
+    regrade_paths: list[Path] | None = None
+    regrade_keys: dict[Path, str] = {}
+    if args.regrade_only:
+        if not merge_mode:
+            log.error("--regrade-only requires an existing album.json under --output: %s", output_dir)
+            sys.exit(1)
+        regrade_paths = []
+        missing = 0
+        for e in existing_entries:
+            fp = e.get("file")
+            if not fp:
+                continue
+            path = Path(fp)
+            if not path.is_file():
+                missing += 1
+                continue
+            regrade_paths.append(path)
+            regrade_keys[path.resolve()] = e.get("key") or path.name
+        log.info("Deep regrade: re-analysing %d image(s) at sensitivity=%s (threshold=%.2f)%s",
+                 len(regrade_paths), args.sensitivity, sensitivity_threshold,
+                 f" — {missing} source file(s) missing, skipped" if missing else "")
+        if not regrade_paths:
+            log.error("Deep regrade: none of this album's source images are reachable on disk.")
+            sys.exit(1)
+
     log.info("Loading models … (engine=%s)", args.engine)
+    # A deep regrade re-analyses an explicit file list and must NOT skip
+    # already-imported paths (those ARE the files it exists to reprocess).
+    analysis_skip = frozenset() if args.regrade_only else already_imported
     if args.engine == "yolo":
         pose_model = YOLO("yolov8n-pose.pt")
         face_model = YOLO(_ensure_face_model())
         if args.cpu_only:
             pose_model.to("cpu")
             face_model.to("cpu")
-        analysis_stage: ProcessStage = ImageAnalysisStage(input_path, pose_model, face_model, skip_paths=already_imported)
+        analysis_stage: ProcessStage = ImageAnalysisStage(
+            input_path, pose_model, face_model,
+            skip_paths=analysis_skip, only_paths=regrade_paths,
+        )
     else:
         from algo.mediapipe_provider import load_face_landmarker, load_pose_landmarker
         from algo.torchvision_provider import load_person_detector
@@ -2065,10 +2058,13 @@ def main() -> None:
         pose_landmarker = load_pose_landmarker(num_poses=1)
         face_landmarker = load_face_landmarker(num_faces=1)
         analysis_stage = MediaPipeImageAnalysisStage(
-            input_path, person_detector, pose_landmarker, face_landmarker, skip_paths=already_imported,
+            input_path, person_detector, pose_landmarker, face_landmarker,
+            skip_paths=analysis_skip, only_paths=regrade_paths,
         )
 
-    face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, input_path)
+    # Not needed by a deep regrade (it returns before the FaceReco stage) and
+    # input_path is allowed to be None in that mode.
+    face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, output_dir, input_path)
 
     # Run image analysis first (on its own) so each newly-discovered frame
     # can be assigned its disambiguated bookkeeping key -- see
@@ -2076,9 +2072,17 @@ def main() -> None:
     # in the pipeline) uses that key to name preview files.
     frames: list[Frame] = analysis_stage.process([], app_config)
     for frame in frames:
-        frame.output_key = make_unique_import_key(frame.path.name, used_keys, frame.path.resolve())
+        # A regraded frame keeps the key it was assigned at import time, so
+        # its preview/FaceReco/review bookkeeping all stays addressable.
+        frame.output_key = (
+            regrade_keys.get(frame.path.resolve(), frame.path.name) if args.regrade_only
+            else make_unique_import_key(frame.path.name, used_keys, frame.path.resolve())
+        )
 
-    jersey_stage = JerseyCountingStage(forced_colors, regular_colors, no_team=args.noteam)
+    jersey_stage = JerseyCountingStage(
+        forced_colors, regular_colors, no_team=args.noteam,
+        team_color_override=team_color_override,
+    )
     stages: list[ProcessStage] = [
         GradingStage(sensitivity_threshold),
         jersey_stage,
@@ -2089,10 +2093,58 @@ def main() -> None:
     for stage in stages:
         frames = stage.process(frames, app_config)
 
+    our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
+
+    if args.regrade_only:
+        run_settings_out = dict(run_settings)
+        run_settings_out["sensitivity"] = args.sensitivity
+        run_settings_out["team_color_override"] = team_color_override
+        write_results_json(
+            frames, output_dir / "album.json",
+            our_jersey_color=our_jersey_color, team_id=team_id,
+            existing_entries=None,
+            import_status="complete",
+            imports_history=imports_history,
+            run_settings=run_settings_out,
+        )
+        # Re-read and re-merge rather than threading the preserved fields
+        # through write_results_json -- keeps that writer identical for the
+        # import path, which has nothing to preserve.
+        with open(output_dir / "album.json", encoding="utf-8") as fh:
+            regraded_payload = json.load(fh)
+        regraded_payload["results"] = _merge_preserved_fields(
+            regraded_payload.get("results", []), existing_entries, sensitivity_threshold
+        )
+        atomic_save_and_backup(
+            json.dumps(regraded_payload, indent=2, cls=NumpyEncoder), output_dir / "album.json"
+        )
+
+        # Anno_* lists describe THIS full re-analysis, so they're rebuilt
+        # from scratch; SrcDir/SrcDirs/Timestamp are carried over.
+        carried_info = {
+            k: existing_info[k]
+            for k in ("SrcDir", "SrcDirs", "SrcType", "Timestamp")
+            if k in existing_info
+        }
+        write_info_json(
+            frames, Path(existing_info.get("SrcDir") or output_dir),
+            existing_info.get("Timestamp") or ts,
+            output_dir / "info.json", our_jersey_color=our_jersey_color,
+            existing_info=carried_info,
+        )
+        write_csv(frames, output_dir / "blurry.csv")
+        write_blur_lst(frames, output_dir / "blur.lst")
+
+        blurry_n = sum(1 for f in frames if f.bodies and not f.is_sharp())
+        sharp_n = sum(1 for f in frames if f.bodies and f.is_sharp())
+        skipped_n = sum(1 for f in frames if not f.bodies)
+        log.info("Deep regrade complete — Sharp: %d  |  Blurry: %d  |  No person: %d",
+                 sharp_n, blurry_n, skipped_n)
+        return
+
     if merge_mode and not frames:
         log.info("No new images found to import — album is already up to date.")
 
-    our_jersey_color = jersey_stage.our_color.label if jersey_stage.our_color else None
     new_import_record = {"src": str(input_path), "timestamp": ts, "image_count": len(frames)}
     run_settings_out = run_settings or {
         "sensitivity": args.sensitivity,

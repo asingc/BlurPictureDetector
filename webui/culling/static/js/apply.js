@@ -17,6 +17,8 @@ let rerunFacerecoPollTimer = null;
 let rerunFacerecoPollSince = 0;
 let rerunFacerecoRunning = false;
 
+let regrading = false;
+
 function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #minStarsInput, #exportBtn").prop("disabled", !enabled);
   // Importing more images, re-running face detection, and exporting all
@@ -25,6 +27,7 @@ function setExportUIEnabled(enabled) {
   // too, via the shared processing_state lock for import-more/rerun).
   $("#importMoreBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning);
   $("#rerunFacerecoBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning);
+  $("#regradeBtn, #deepRegradeBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning || regrading);
 }
 
 function setImportMoreUIEnabled(enabled) {
@@ -32,6 +35,7 @@ function setImportMoreUIEnabled(enabled) {
   $("#importMoreBtn").prop("disabled", !enabled);
   $("#rerunFacerecoBtn").prop("disabled", !enabled);
   $("#exportBtn").prop("disabled", !enabled);
+  $("#regradeBtn, #deepRegradeBtn").prop("disabled", !enabled);
 }
 
 function setRerunFacerecoUIEnabled(enabled) {
@@ -39,6 +43,86 @@ function setRerunFacerecoUIEnabled(enabled) {
   $("#rerunFacerecoBtn").prop("disabled", !enabled);
   $("#importMoreBtn").prop("disabled", !enabled);
   $("#exportBtn").prop("disabled", !enabled);
+  $("#regradeBtn, #deepRegradeBtn").prop("disabled", !enabled);
+}
+
+// ------------------------------------------------------------------ //
+// Adjust Blur Sensitivity — re-bucket Blur/Sharp using already-measured
+// sharpness scores (see /api/apply/regrade-sensitivity), no re-import.
+// ------------------------------------------------------------------ //
+function applyRegradeSensitivityToUI(mode, customValue) {
+  $(`input[name="regradeSensMode"][value="${mode || "medium"}"]`).prop("checked", true);
+  const custom = customValue ?? 0.50;
+  $("#regradeSensitivitySlider").val(custom);
+  $("#regradeSensitivityValue").text(Number(custom).toFixed(2));
+}
+
+function readRegradeSensitivityFromUI() {
+  const mode = $('input[name="regradeSensMode"]:checked').val() || "medium";
+  const customValue = parseFloat($("#regradeSensitivitySlider").val()) || 0;
+  return { mode, customValue };
+}
+
+function setRegradeUIEnabled(enabled) {
+  regrading = !enabled;
+  $('input[name="regradeSensMode"], #regradeSensitivitySlider').prop("disabled", !enabled);
+  $("#regradeBtn, #deepRegradeBtn").prop("disabled", !enabled || importMoreRunning || rerunFacerecoRunning);
+  $("#importMoreBtn").prop("disabled", !enabled);
+  $("#rerunFacerecoBtn").prop("disabled", !enabled);
+  $("#exportBtn").prop("disabled", !enabled);
+}
+
+// Deep regrade streams 1_prep_review.py's stdout into a non-closable modal
+// that dismisses itself once the run finishes.
+let deepRegradePollTimer = null;
+let deepRegradePollSince = 0;
+
+function initDeepRegradeDialog() {
+  $("#deepRegradeDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 720,
+  });
+}
+
+function openDeepRegradeDialog() {
+  const $dialog = $("#deepRegradeDialog");
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function appendDeepRegradeLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("deepRegradeOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function pollDeepRegradeOutput() {
+  let data;
+  try {
+    data = await apiGet(`/api/processing-output?since=${deepRegradePollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendDeepRegradeLines(data.lines);
+  deepRegradePollSince = data.next;
+  if (data.running) return;
+
+  clearInterval(deepRegradePollTimer);
+  deepRegradePollTimer = null;
+  setRegradeUIEnabled(true);
+  $("#deepRegradeDialog").dialog("close");
+  if (data.returnCode === 0) {
+    $("#regradeStatus").text("Deep regrade complete.");
+    await loadSummary();
+  } else {
+    $("#regradeStatus").text(`Deep regrade failed (exit code ${data.returnCode}).`);
+  }
 }
 
 
@@ -240,15 +324,60 @@ async function loadSummary() {
     renderStarBreakdown(data.starBreakdown, data.unrated);
     $("#statFaces").text(data.facesDetected);
     $("#statPlayers").text(data.playersDetected);
+    applyRegradeSensitivityToUI(data.sensitivityMode, data.sensitivityCustomValue);
     updateExportCount();
   } catch (err) {
     $("#summaryAlbumName").text("Album");
   }
 }
 
+// ------------------------------------------------------------------ //
+// Team Jersey Colour override — see /api/apply/jersey-color.
+// ------------------------------------------------------------------ //
+async function loadJerseyOptions() {
+  try {
+    const data = await apiGet("/api/apply/jersey-options");
+    const $select = $("#jerseyColorSelect");
+    $select.find("option:not(:first)").remove();
+    (data.options || []).forEach((color) => {
+      $select.append($("<option>", { value: color }).text(color));
+    });
+    $select.val(data.current || "");
+    if (data.noTeam) {
+      $("#jerseyColorPanel .row, #jerseyColorPanel .row.actions").find("select, input, button").prop("disabled", true);
+      $("#jerseyColorStatus").text("This album has jersey-colour filtering disabled (--noteam).");
+    }
+    $("#jerseyColorDetected").text(
+      data.current ? "" : (data.detected ? `Currently detected: ${data.detected}` : "")
+    );
+  } catch (err) {
+    // Non-fatal — the panel just stays at its default "Auto" state.
+  }
+}
+
 // Number of images that will be exported at the currently-selected minimum
 // star rating, computed client-side from the star breakdown already loaded
 // by loadSummary() — no extra round-trip needed when the selector changes.
+async function pollJerseyLlmRerun() {
+  let data;
+  try {
+    data = await apiGet("/api/processing-output?since=0");
+  } catch (err) {
+    setTimeout(pollJerseyLlmRerun, 500);
+    return;
+  }
+  if (data.running) {
+    setTimeout(pollJerseyLlmRerun, 500);
+    return;
+  }
+  $("#jerseyColorStatus").text(
+    data.returnCode === 0 ? "Team colour applied; LLM re-cull complete." : `LLM re-cull exited with code ${data.returnCode}.`
+  );
+  $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", false);
+  setRegradeUIEnabled(true);
+  loadSummary();
+}
+
 function updateExportCount() {
   const minStars = parseInt($("#minStarsInput").val(), 10) || 3;
   let count = 0;
@@ -295,11 +424,96 @@ async function pollExportStatus() {
 
 $(function () {
   loadSummary();
+  loadJerseyOptions();
   initExportDialog();
   initImportMoreDialog();
   initRerunFacerecoDialog();
+  initDeepRegradeDialog();
 
   $("#minStarsInput").on("change", updateExportCount);
+
+  $("#regradeSensitivitySlider").on("input", function () {
+    $("#regradeSensitivityValue").text(Number($(this).val()).toFixed(2));
+  });
+
+  $("#regradeBtn").on("click", async () => {
+    setRegradeUIEnabled(false);
+    $("#regradeStatus").text("Regrading…");
+    const { mode, customValue } = readRegradeSensitivityFromUI();
+    try {
+      const res = await apiPost("/api/apply/regrade-sensitivity", {
+        sensitivityMode: mode,
+        sensitivityCustomValue: customValue,
+        mode: "shallow",
+      });
+      const parts = [];
+      if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
+      if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
+      if (res.teamColor) parts.push(`team colour ${res.teamColor}`);
+      if (res.previewsRegenFailed) parts.push(`${res.previewsRegenFailed} preview(s) could not be refreshed (source photo unreadable)`);
+      $("#regradeStatus").text(
+        parts.length
+          ? `Regraded ${res.imagesConsidered} image(s) — ${parts.join(", ")}.`
+          : `Regraded ${res.imagesConsidered} image(s) — no changes.`
+      );
+      await loadSummary();
+    } catch (err) {
+      $("#regradeStatus").text("Regrade failed: " + err.message);
+    } finally {
+      setRegradeUIEnabled(true);
+    }
+  });
+
+  $("#deepRegradeBtn").on("click", async () => {
+    setRegradeUIEnabled(false);
+    $("#regradeStatus").text("Starting deep regrade…");
+    $("#deepRegradeOutput").val("");
+    deepRegradePollSince = 0;
+    const { mode, customValue } = readRegradeSensitivityFromUI();
+    try {
+      await apiPost("/api/apply/regrade-sensitivity", {
+        sensitivityMode: mode,
+        sensitivityCustomValue: customValue,
+        mode: "deep",
+      });
+      openDeepRegradeDialog();
+      $("#regradeStatus").text("Deep regrade running…");
+      deepRegradePollTimer = setInterval(pollDeepRegradeOutput, 500);
+    } catch (err) {
+      $("#regradeStatus").text("Deep regrade failed to start: " + err.message);
+      setRegradeUIEnabled(true);
+    }
+  });
+
+  $("#jerseyColorBtn").on("click", async () => {
+    const teamColor = $("#jerseyColorSelect").val();
+    const rerunLlmCulling = $("#jerseyRerunLlmInput").is(":checked");
+    $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", true);
+    setRegradeUIEnabled(false);
+    $("#jerseyColorStatus").text("Applying…");
+    try {
+      const res = await apiPost("/api/apply/jersey-color", { teamColor, rerunLlmCulling });
+      const parts = [];
+      if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
+      if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
+      if (res.starsRebaselined) parts.push(`${res.starsRebaselined} star rating(s) reset`);
+      $("#jerseyColorStatus").text(
+        `Team colour: ${res.teamColor || "none detected"} (${res.pinned ? "pinned" : "auto"})` +
+        (parts.length ? ` — ${parts.join(", ")}.` : " — no changes.")
+      );
+      await loadSummary();
+      await loadJerseyOptions();
+      if (res.llmRerunStarted) {
+        $("#jerseyColorStatus").append(" LLM re-cull running…");
+        pollJerseyLlmRerun();
+        return; // buttons stay disabled until the background job finishes
+      }
+    } catch (err) {
+      $("#jerseyColorStatus").text("Failed: " + err.message);
+    }
+    $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", false);
+    setRegradeUIEnabled(true);
+  });
 
   $("#importMoreBtn").on("click", async () => {
     setImportMoreUIEnabled(false);

@@ -218,6 +218,84 @@ def _poll_jersey_color(frames: list[Frame]) -> ColorLab | None:
     return _color_from_label(winner_label)
 
 
+def classify_body_jersey(
+    body: Body,
+    forced_colors: frozenset[str],
+    allowed_colors: frozenset[str],
+    forced_labs: list[tuple[float, float, float]],
+    allowed_labs: list[tuple[float, float, float]],
+    team_target_lab: tuple[float, float, float] | None,
+    team_bucket: str | None,
+    our_color: ColorLab,
+    config: AppConfig,
+    *,
+    log_prefix: str = "",
+) -> None:
+    """Apply the forced-colour / allow-list / polled-team-colour decision to a
+    single already-colour-predicted *body*, mutating ``body.passed`` /
+    ``body.rejection_reason`` in place.
+
+    Split out of :meth:`JerseyCountingStage.process` so the exact same
+    per-body decision can be replayed later against just-recovered bodies
+    (see algo/regrade.py) without duplicating the logic.
+    """
+    bcolor = _color_from_label(body.cloth_color)
+
+    # Forced colors (e.g. goalies) always pass — skip further checks.
+    # In LAB mode, also accept a brightness-forgiving distance match.
+    if (_matches_allowed_jersey_color(bcolor, forced_colors)
+            or _matches_lab_refs(body, forced_labs, config)):
+        log.debug("[JerseyCountingStage] %s — body cloth=%s in forced-colors → pass",
+                  log_prefix, body.cloth_color)
+        return
+
+    # Allow-list check (CLI --jerseycolor regular entries).
+    # In LAB mode, also accept a brightness-forgiving distance match.
+    if not (_matches_allowed_jersey_color(bcolor, allowed_colors)
+            or _matches_lab_refs(body, allowed_labs, config)):
+        body.passed = False
+        body.rejection_reason = f"jersey color '{body.cloth_color}' not in allow-list"
+        log.debug("[JerseyCountingStage] %s — body cloth=%s not in allow-list → fail",
+                  log_prefix, body.cloth_color)
+        return
+
+    # Team colour check (polled from all frames).
+    if team_target_lab is not None:
+        blab = _body_lab(body)
+        dist = (
+            _weighted_lab_distance(
+                blab, team_target_lab,
+                config.jersey_lab_l_weight, config.jersey_lab_c_weight, config.jersey_lab_h_weight,
+            )
+            if blab is not None else None
+        )
+        if dist is None or dist > config.jersey_lab_max_dist:
+            body.passed = False
+            body.rejection_reason = (
+                f"jersey color '{body.cloth_color}' LAB dist {dist:.1f} > {config.jersey_lab_max_dist:.1f}"
+                if dist is not None
+                else f"jersey color '{body.cloth_color}' has no usable LAB"
+            )
+            log.debug("[JerseyCountingStage] %s — body cloth=%s LAB dist=%s > %.1f → fail",
+                      log_prefix, body.cloth_color,
+                      f"{dist:.1f}" if dist is not None else "N/A",
+                      config.jersey_lab_max_dist)
+    elif team_bucket is not None:
+        body_bucket = _body_lightness_bucket(body, config)
+        if body_bucket != team_bucket:
+            body.passed = False
+            body.rejection_reason = (
+                f"jersey lightness '{body_bucket or 'Unknown'}' != team bucket '{team_bucket}'"
+            )
+            log.debug("[JerseyCountingStage] %s — body cloth=%s bucket=%s != team bucket %s → fail",
+                      log_prefix, body.cloth_color, body_bucket, team_bucket)
+    elif not _colors_match(bcolor, our_color):
+        body.passed = False
+        body.rejection_reason = f"jersey color '{body.cloth_color}' != team colour '{our_color.label}'"
+        log.debug("[JerseyCountingStage] %s — body cloth=%s != team colour %s → fail",
+                  log_prefix, body.cloth_color, our_color.label)
+
+
 class JerseyCountingStage(ProcessStage):
     """Determine the dominant jersey colour and invalidate non-matching bodies.
 
@@ -252,6 +330,7 @@ class JerseyCountingStage(ProcessStage):
         forced_colors:  frozenset[str],
         allowed_colors: frozenset[str],
         no_team: bool = False,
+        team_color_override: str | None = None,
     ) -> None:
         if forced_colors is None:
             raise TypeError("forced_colors must be a frozenset, not None")
@@ -260,6 +339,8 @@ class JerseyCountingStage(ProcessStage):
         self.forced_colors  = forced_colors
         self.allowed_colors = allowed_colors
         self.no_team        = no_team
+        # "Hue:Shade" label pinning the team colour instead of polling it.
+        self.team_color_override = (team_color_override or "").strip() or None
         self.our_color: ColorLab | None = None
         self.our_bucket: str | None = None
 
@@ -267,12 +348,16 @@ class JerseyCountingStage(ProcessStage):
         if self.no_team:
             return frames
 
-        our_color = _poll_jersey_color(frames)
-        if our_color is None:
-            log.warning("[JerseyCountingStage] no usable cloth colour found — skipping team-colour filter")
-            return frames
+        if self.team_color_override:
+            our_color = _color_from_label(self.team_color_override)
+            log.info("[JerseyCountingStage] team colour pinned: %s", our_color.label)
+        else:
+            our_color = _poll_jersey_color(frames)
+            if our_color is None:
+                log.warning("[JerseyCountingStage] no usable cloth colour found — skipping team-colour filter")
+                return frames
+            log.info("[JerseyCountingStage] polled team colour: %s", our_color.label)
         self.our_color = our_color
-        log.info("[JerseyCountingStage] polled team colour: %s", our_color.label)
 
         team_bucket: str | None = None
         team_target_lab: tuple[float, float, float] | None = None
@@ -288,10 +373,18 @@ class JerseyCountingStage(ProcessStage):
                      config.jersey_lab_l_weight, config.jersey_lab_c_weight,
                      config.jersey_lab_h_weight, config.jersey_lab_max_dist)
         elif config.jersey_binary_lightness:
-            team_bucket = _poll_lightness_bucket(frames, config)
+            # A pinned colour must anchor the bucket too, otherwise this
+            # strategy would still judge against the polled majority.
+            if self.team_color_override:
+                ref = _REF_LAB_BY_LABEL.get(our_color.label)
+                team_bucket = _lightness_class(
+                    ref, config.jersey_light_l_min, config.jersey_light_chroma_max
+                ) if ref else None
+            else:
+                team_bucket = _poll_lightness_bucket(frames, config)
             self.our_bucket = team_bucket
-            log.info("[JerseyCountingStage] binary lightness mode — polled team bucket: %s",
-                     team_bucket or "N/A")
+            log.info("[JerseyCountingStage] binary lightness mode — team bucket: %s (%s)",
+                     team_bucket or "N/A", "pinned" if self.team_color_override else "polled")
 
         if self.forced_colors:
             log.info("[JerseyCountingStage] forced colors: %s", ", ".join(sorted(self.forced_colors)))
@@ -303,63 +396,11 @@ class JerseyCountingStage(ProcessStage):
             for body in frame.bodies:
                 if not body.passed:
                     continue
-
-                bcolor = _color_from_label(body.cloth_color)
-
-                # Forced colors (e.g. goalies) always pass — skip further checks.
-                # In LAB mode, also accept a brightness-forgiving distance match.
-                if (_matches_allowed_jersey_color(bcolor, self.forced_colors)
-                        or _matches_lab_refs(body, forced_labs, config)):
-                    log.debug("[JerseyCountingStage] %s — body cloth=%s in forced-colors → pass",
-                              frame.path.name, body.cloth_color)
-                    continue
-
-                # Allow-list check (CLI --jerseycolor regular entries).
-                # In LAB mode, also accept a brightness-forgiving distance match.
-                if not (_matches_allowed_jersey_color(bcolor, self.allowed_colors)
-                        or _matches_lab_refs(body, allowed_labs, config)):
-                    body.passed = False
-                    body.rejection_reason = f"jersey color '{body.cloth_color}' not in allow-list"
-                    log.debug("[JerseyCountingStage] %s — body cloth=%s not in allow-list → fail",
-                              frame.path.name, body.cloth_color)
-                    continue
-
-               
-                # Team colour check (polled from all frames).
-                if team_target_lab is not None:
-                    blab = _body_lab(body)
-                    dist = (
-                        _weighted_lab_distance(
-                            blab, team_target_lab,
-                            config.jersey_lab_l_weight, config.jersey_lab_c_weight, config.jersey_lab_h_weight,
-                        )
-                        if blab is not None else None
-                    )
-                    if dist is None or dist > config.jersey_lab_max_dist:
-                        body.passed = False
-                        body.rejection_reason = (
-                            f"jersey color '{body.cloth_color}' LAB dist {dist:.1f} > {config.jersey_lab_max_dist:.1f}"
-                            if dist is not None
-                            else f"jersey color '{body.cloth_color}' has no usable LAB"
-                        )
-                        log.debug("[JerseyCountingStage] %s — body cloth=%s LAB dist=%s > %.1f → fail",
-                                  frame.path.name, body.cloth_color,
-                                  f"{dist:.1f}" if dist is not None else "N/A",
-                                  config.jersey_lab_max_dist)
-                elif team_bucket is not None:
-                    body_bucket = _body_lightness_bucket(body, config)
-                    if body_bucket != team_bucket:
-                        body.passed = False
-                        body.rejection_reason = (
-                            f"jersey lightness '{body_bucket or 'Unknown'}' != team bucket '{team_bucket}'"
-                        )
-                        log.debug("[JerseyCountingStage] %s — body cloth=%s bucket=%s != team bucket %s → fail",
-                                  frame.path.name, body.cloth_color, body_bucket, team_bucket)
-                elif not _colors_match(bcolor, our_color):
-                    body.passed = False
-                    body.rejection_reason = f"jersey color '{body.cloth_color}' != team colour '{our_color.label}'"
-                    log.debug("[JerseyCountingStage] %s — body cloth=%s != team colour %s → fail",
-                              frame.path.name, body.cloth_color, our_color.label)
+                classify_body_jersey(
+                    body, self.forced_colors, self.allowed_colors,
+                    forced_labs, allowed_labs, team_target_lab, team_bucket, our_color,
+                    config, log_prefix=frame.path.name,
+                )
 
         return frames
 

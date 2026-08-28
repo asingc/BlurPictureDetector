@@ -303,14 +303,19 @@ class ImageAnalysisStage(ProcessStage):
     def __init__(
         self, input_path: Path, pose_model: YOLO, face_model: YOLO,
         skip_paths: frozenset[Path] | None = None,
+        only_paths: list[Path] | None = None,
     ) -> None:
         self.input_path = input_path
         self.pose_model = pose_model
         self.face_model = face_model
         self.skip_paths = skip_paths or frozenset()
+        # Explicit file list (deep regrade re-analysing an album's already-
+        # recorded sources, which may span several directories) -- bypasses
+        # the input_path directory scan entirely when set.
+        self.only_paths = only_paths
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
-        files = collect_images(self.input_path)
+        files = list(self.only_paths) if self.only_paths is not None else collect_images(self.input_path)
         if self.skip_paths:
             before = len(files)
             files = [f for f in files if f.resolve() not in self.skip_paths]
@@ -392,8 +397,8 @@ def detect_qualified_persons_mp(
             keypoints=keypoints,
         ))
 
-    for body in bodies:
-        face = detect_face_for_body_mp(image, body, face_landmarker)
+    for body, box in zip(bodies, person_boxes):
+        face = detect_face_for_body_mp(image, body, face_landmarker, scan_box=box)
         if face is not None:
             body.faces = [face]
             fx1, fy1, fx2, fy2 = face.bbox.as_px_ints(w, h)
@@ -434,15 +439,18 @@ class MediaPipeImageAnalysisStage(ProcessStage):
     def __init__(
         self, input_path: Path, person_detector, pose_landmarker, face_landmarker,
         skip_paths: frozenset[Path] | None = None,
+        only_paths: list[Path] | None = None,
     ) -> None:
         self.input_path = input_path
         self.person_detector = person_detector
         self.pose_landmarker = pose_landmarker
         self.face_landmarker = face_landmarker
         self.skip_paths = skip_paths or frozenset()
+        # See ImageAnalysisStage.only_paths.
+        self.only_paths = only_paths
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
-        files = collect_images(self.input_path)
+        files = list(self.only_paths) if self.only_paths is not None else collect_images(self.input_path)
         if self.skip_paths:
             before = len(files)
             files = [f for f in files if f.resolve() not in self.skip_paths]
