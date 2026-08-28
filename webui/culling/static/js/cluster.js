@@ -21,6 +21,18 @@ const ClusterApp = {
 
 function ckey(clusterId, crop) { return clusterId + "::" + crop; }
 
+// Shared observer that lazy-loads thumbnail <img> src just before it
+// scrolls into view, instead of every thumbnail across every cluster
+// fetching its image up front.
+const thumbLazyLoadObserver = new IntersectionObserver((entries) => {
+  entries.forEach((entry) => {
+    if (!entry.isIntersecting) return;
+    const img = entry.target;
+    img.src = img.dataset.src;
+    thumbLazyLoadObserver.unobserve(img);
+  });
+}, { rootMargin: "400px" });
+
 function stateFor(clusterId, crop) {
   const k = ckey(clusterId, crop);
   if (!ClusterApp.staged.has(k)) ClusterApp.staged.set(k, { assignedName: null, pendingDelete: false });
@@ -265,11 +277,12 @@ function renderThumb(cluster, face) {
   const thumbUrl = "/api/cluster/thumb/" + encodeURIComponent(cluster.id) + "/" + encodeURIComponent(face.crop);
   const originalUrl = "/api/original?file=" + encodeURIComponent(face.origFilename);
 
-  const img = $("<img>").attr("src", thumbUrl).attr("title", face.origFilename)
+  const img = $("<img>").attr("data-src", thumbUrl).attr("title", face.origFilename)
     .on("click", (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return; // handled by the card-level handler below
       Viewport.showImageWindow(originalUrl);
     });
+  thumbLazyLoadObserver.observe(img[0]);
 
   const mask = $("<div class='mask'>").text("IGNORE");
   const badge = $("<div class='assigned-badge'>").text(st.assignedName ? "\u2192 " + st.assignedName : "");

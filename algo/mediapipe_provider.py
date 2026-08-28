@@ -342,7 +342,78 @@ _HEAD_CROP_PAD_Y_FRAC = 1.2
 _HEAD_CROP_PAD_MIN = 0.03
 
 
-def detect_face_for_body_mp(image: np.ndarray, body: Body, face_landmarker) -> Face | None:
+def _face_from_crop(
+    image: np.ndarray,
+    crop_box: tuple[int, int, int, int],
+    face_landmarker,
+) -> Face | None:
+    h, w = image.shape[:2]
+    cx1, cy1, cx2, cy2 = crop_box
+    crop = image[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+
+    result = face_landmarker.detect(_to_mp_image(crop))
+    if not result.face_landmarks:
+        return None
+
+    mesh = result.face_landmarks[0]
+    crop_h, crop_w = crop.shape[:2]
+    mesh_xs = [lm.x for lm in mesh]
+    mesh_ys = [lm.y for lm in mesh]
+    face_box = Box(
+        max(0.0, (cx1 + min(mesh_xs) * crop_w) / w),
+        max(0.0, (cy1 + min(mesh_ys) * crop_h) / h),
+        min(1.0, (cx1 + max(mesh_xs) * crop_w) / w),
+        min(1.0, (cy1 + max(mesh_ys) * crop_h) / h),
+    )
+    if face_box.width <= 0 or face_box.height <= 0:
+        return None
+
+    if app_config.face_min_size_fraction > 0:
+        face_long = max(face_box.width, face_box.height)
+        if face_long < app_config.face_min_size_fraction:
+            log.debug("[faces:mp] face too small (min=%.3f) — skipped",
+                      app_config.face_min_size_fraction)
+            return None
+
+    landmarks = [
+        PredictedKeyPoint(
+            Point((cx1 + mesh[idx].x * crop_w) / w, (cy1 + mesh[idx].y * crop_h) / h),
+            1.0,
+        )
+        for idx in _MP_FACE_5PT
+    ]
+    return Face(bbox=face_box, confidence=1.0, landmarks=landmarks)
+
+
+def _body_scan_tiles(box: Box, image_w: int, image_h: int) -> list[tuple[int, int, int, int]]:
+    x1, y1, x2, y2 = box.as_px_ints(image_w, image_h)
+    box_w, box_h = x2 - x1, y2 - y1
+    tile_size = min(box_w, box_h)
+    if tile_size <= 0:
+        return []
+
+    step = max(1, tile_size // 2)
+    if box_h >= box_w:
+        starts = list(range(y1, max(y1 + 1, y2 - tile_size + 1), step))
+        tiles = [(x1, start, x2, min(start + tile_size, y2)) for start in starts]
+        last = (x1, y2 - tile_size, x2, y2)
+    else:
+        starts = list(range(x1, max(x1 + 1, x2 - tile_size + 1), step))
+        tiles = [(start, y1, min(start + tile_size, x2), y2) for start in starts]
+        last = (x2 - tile_size, y1, x2, y2)
+    if tiles[-1] != last:
+        tiles.append(last)
+    return tiles
+
+
+def detect_face_for_body_mp(
+    image: np.ndarray,
+    body: Body,
+    face_landmarker,
+    scan_box: Box | None = None,
+) -> Face | None:
     """Return a :class:`Face` for *body* by running Face Landmarker on a crop
     around its confident head keypoints (nose/eyes/ears — COCO indices 0-4),
     or ``None`` if no face is found in the crop.
@@ -374,43 +445,16 @@ def detect_face_for_body_mp(image: np.ndarray, body: Body, face_landmarker) -> F
     if cx2 <= cx1 or cy2 <= cy1:
         return None
 
-    crop = image[cy1:cy2, cx1:cx2]
-    if crop.size == 0:
-        return None
+    face = _face_from_crop(image, (cx1, cy1, cx2, cy2), face_landmarker)
+    if face is not None:
+        return face
 
-    result = face_landmarker.detect(_to_mp_image(crop))
-    if not result.face_landmarks:
-        return None
-
-    mesh = result.face_landmarks[0]
-    crop_h, crop_w = crop.shape[:2]
-    mesh_xs = [lm.x for lm in mesh]
-    mesh_ys = [lm.y for lm in mesh]
-    # Face bbox in full-image normalised coordinates.
-    face_box = Box(
-        max(0.0, (cx1 + min(mesh_xs) * crop_w) / w),
-        max(0.0, (cy1 + min(mesh_ys) * crop_h) / h),
-        min(1.0, (cx1 + max(mesh_xs) * crop_w) / w),
-        min(1.0, (cy1 + max(mesh_ys) * crop_h) / h),
-    )
-    if face_box.width <= 0 or face_box.height <= 0:
-        return None
-
-    if app_config.face_min_size_fraction > 0:
-        face_long = max(face_box.width, face_box.height)
-        if face_long < app_config.face_min_size_fraction:
-            log.debug("[faces:mp] face too small (min=%.3f) — skipped",
-                      app_config.face_min_size_fraction)
-            return None
-
-    landmarks = [
-        PredictedKeyPoint(
-            Point((cx1 + mesh[idx].x * crop_w) / w, (cy1 + mesh[idx].y * crop_h) / h),
-            1.0,
-        )
-        for idx in _MP_FACE_5PT
-    ]
-    return Face(bbox=face_box, confidence=1.0, landmarks=landmarks)
+    for tile in _body_scan_tiles(scan_box or body.bbox, w, h):
+        face = _face_from_crop(image, tile, face_landmarker)
+        if face is not None:
+            log.debug("[faces:mp] pose-guided crop missed; body scan recovered face")
+            return face
+    return None
 
 
 # ---------------------------------------------------------------------------
