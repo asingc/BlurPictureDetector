@@ -300,13 +300,15 @@ def _heartbeat_watchdog() -> None:
             elif elapsed <= heartbeat_state.timeout:
                 heartbeat_state.notified = False
         if elapsed > heartbeat_state.timeout and not already_notified:
+            log.info("=" * 70)
             log.info(
-                "No heartbeat received for %.0fs (timeout %.0fs) — the server "
-                "is still running. Here is your link if you wish to re-launch "
-                "the web app: %s",
-                elapsed, heartbeat_state.timeout, heartbeat_state.url,
+                "No heartbeat received for %.0fs (timeout %.0fs) — the browser "
+                "tab appears to be closed or idle.", elapsed, heartbeat_state.timeout,
             )
-            log.info("Press Ctrl+C in this window to end the process.")
+            log.info("The server is still running. Either:")
+            log.info("  - Press Ctrl+C in this window to exit, or")
+            log.info("  - Open this URL to restart the web app: %s", heartbeat_state.url)
+            log.info("=" * 70)
 
 
 def _sensitivity_arg(mode: str, custom_value: float) -> str:
