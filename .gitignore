@@ -1,6 +1,11 @@
 # Downloaded model weights (large binaries — auto-downloaded on first run)
 *.pt
+*.pth
 *.task
+# facexlib (a GFPGAN dependency, used by esrsharpen.py) downloads its own
+# face-detection/parsing weights here, relative to the cwd, regardless of
+# where the other model weights above are configured to live.
+gfpgan/weights/
 
 # Python cache
 __pycache__/
@@ -12,6 +17,8 @@ albums/
 annotated/
 blurry.csv
 blur.lst
+# esrsharpen.py's default -o destination when none is given.
+output/
 
 # Test images (local only)
 TestImg/
