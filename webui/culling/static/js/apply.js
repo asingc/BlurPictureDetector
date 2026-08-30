@@ -332,19 +332,38 @@ async function loadSummary() {
 }
 
 // ------------------------------------------------------------------ //
-// Team Jersey Colour override — see /api/apply/jersey-color.
+// Team Jersey Colour override — see /api/apply/jersey-color. Rendered as
+// round chip buttons ( "Auto" + each registered colour), same interaction
+// pattern as the team/jersey-colour pickers on the Add Album page.
 // ------------------------------------------------------------------ //
+let jerseyColorOptions = [];
+let selectedJerseyColor = "";
+let jerseyColorControlsDisabled = false;
+
+function renderJerseyColorChips() {
+  const $container = $("#jerseyColorPicker").empty();
+  const makeChip = (label, value) => {
+    const chip = $("<button>", {
+      type: "button",
+      class: "color-chip" + (selectedJerseyColor === value ? " selected" : ""),
+      disabled: jerseyColorControlsDisabled,
+    }).text(label);
+    chip.on("click", () => { selectedJerseyColor = value; renderJerseyColorChips(); });
+    $container.append(chip);
+  };
+  makeChip("Auto (detect)", "");
+  jerseyColorOptions.forEach((color) => makeChip(color, color));
+}
+
 async function loadJerseyOptions() {
   try {
     const data = await apiGet("/api/apply/jersey-options");
-    const $select = $("#jerseyColorSelect");
-    $select.find("option:not(:first)").remove();
-    (data.options || []).forEach((color) => {
-      $select.append($("<option>", { value: color }).text(color));
-    });
-    $select.val(data.current || "");
+    jerseyColorOptions = data.options || [];
+    selectedJerseyColor = data.current || "";
+    jerseyColorControlsDisabled = !!data.noTeam;
+    renderJerseyColorChips();
     if (data.noTeam) {
-      $("#jerseyColorPanel .row, #jerseyColorPanel .row.actions").find("select, input, button").prop("disabled", true);
+      $("#jerseyColorPanel .row, #jerseyColorPanel .row.actions").find("input, button").prop("disabled", true);
       $("#jerseyColorStatus").text("This album has jersey-colour filtering disabled (--noteam).");
     }
     $("#jerseyColorDetected").text(
@@ -373,7 +392,9 @@ async function pollJerseyLlmRerun() {
   $("#jerseyColorStatus").text(
     data.returnCode === 0 ? "Team colour applied; LLM re-cull complete." : `LLM re-cull exited with code ${data.returnCode}.`
   );
-  $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", false);
+  $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
+  jerseyColorControlsDisabled = false;
+  renderJerseyColorChips();
   setRegradeUIEnabled(true);
   loadSummary();
 }
@@ -486,9 +507,11 @@ $(function () {
   });
 
   $("#jerseyColorBtn").on("click", async () => {
-    const teamColor = $("#jerseyColorSelect").val();
+    const teamColor = selectedJerseyColor;
     const rerunLlmCulling = $("#jerseyRerunLlmInput").is(":checked");
-    $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", true);
+    $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", true);
+    jerseyColorControlsDisabled = true;
+    renderJerseyColorChips();
     setRegradeUIEnabled(false);
     $("#jerseyColorStatus").text("Applying…");
     try {
@@ -511,7 +534,9 @@ $(function () {
     } catch (err) {
       $("#jerseyColorStatus").text("Failed: " + err.message);
     }
-    $("#jerseyColorBtn, #jerseyColorSelect, #jerseyRerunLlmInput").prop("disabled", false);
+    $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
+    jerseyColorControlsDisabled = false;
+    renderJerseyColorChips();
     setRegradeUIEnabled(true);
   });
 

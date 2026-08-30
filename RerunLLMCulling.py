@@ -6,20 +6,23 @@ without re-doing image analysis / face recognition.
 
 Usage:
     python RunLLMCulling.py <output_dir> [--openaikey KEY] [--model MODEL]
-        [--burst-gap-seconds N] [--min-group-size N] [--image-max-long-edge N]
+        [--burst-gap-seconds N] [--min-sequence-seconds N] [--min-sequence-frames N]
+        [--image-max-long-edge N]
 
     python RunLLMCulling.py
         (no arguments: prints usage plus known OpenAI model pricing and a
         rough per-burst cost estimate, then exits without processing anything)
 
 <output_dir> must already contain a album.json (produced by
-1_prep_review.py). Every qualifying burst of consecutive "sharp" frames
-(grouped by capture-timestamp gap) is re-ranked from scratch by an
-OpenAI-backed CullingProvider (see algo/llm/culling_provider.py) via the
-existing algo/stages/llm_culling.py::LLMCullingStage. album.json is
-overwritten in place: "keep" and "burst_ranking" on every frame in a
-qualifying burst are fully replaced (not merged) with the new verdict, and
-llm_cost_summary is updated with this run's token usage/cost.
+1_prep_review.py). Every qualifying sequence of consecutive "sharp" frames
+(grouped by capture-timestamp gap, then required to span more than
+--min-sequence-seconds or have more than --min-sequence-frames frames) is
+re-ranked from scratch by an OpenAI-backed CullingProvider (see
+algo/llm/culling_provider.py) via the existing
+algo/stages/llm_culling.py::LLMCullingStage. album.json is overwritten in
+place: "keep" and "burst_ranking" on every frame in a qualifying sequence
+are fully replaced (not merged) with the new verdict, and llm_cost_summary
+is updated with this run's token usage/cost.
 
 Note on cost estimates: OpenAI does not expose a pricing or token-counting
 API, so nothing here is queried "live" from OpenAI except the list of
@@ -51,7 +54,8 @@ from algo.llm.culling_provider import (
 from algo.stages.llm_culling import (
     DEFAULT_BURST_GAP_SECONDS,
     DEFAULT_IMAGE_MAX_LONG_EDGE,
-    DEFAULT_MIN_GROUP_SIZE,
+    DEFAULT_MIN_SEQUENCE_FRAMES,
+    DEFAULT_MIN_SEQUENCE_SECONDS,
     LLMCullingStage,
     load_qualifying_bursts,
 )
@@ -148,10 +152,23 @@ def main() -> None:
         help=f"Max seconds between consecutive sharp frames to be treated as the same burst (default: {DEFAULT_BURST_GAP_SECONDS}).",
     )
     parser.add_argument(
-        "--min-group-size",
+        "--min-sequence-seconds",
+        type=float,
+        default=DEFAULT_MIN_SEQUENCE_SECONDS,
+        help=(
+            "A burst only qualifies as a ranked sequence once its capture-time span "
+            f"exceeds this many seconds (OR it has more than --min-sequence-frames frames); "
+            f"smaller bursts are graded individually instead (default: {DEFAULT_MIN_SEQUENCE_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--min-sequence-frames",
         type=int,
-        default=DEFAULT_MIN_GROUP_SIZE,
-        help=f"Minimum burst size to be re-ranked; smaller bursts are left untouched (default: {DEFAULT_MIN_GROUP_SIZE}).",
+        default=DEFAULT_MIN_SEQUENCE_FRAMES,
+        help=(
+            "A burst also qualifies as a ranked sequence once it has more than this many "
+            f"frames (OR its span exceeds --min-sequence-seconds) (default: {DEFAULT_MIN_SEQUENCE_FRAMES})."
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -231,11 +248,13 @@ def main() -> None:
             "proceeding anyway since you asked for it explicitly.", model,
         )
 
-    bursts = load_qualifying_bursts(results_path, args.burst_gap_seconds, args.min_group_size)
+    bursts = load_qualifying_bursts(
+        results_path, args.burst_gap_seconds, args.min_sequence_seconds, args.min_sequence_frames,
+    )
     if bursts:
         total_input = total_output = 0
         total_cost = 0.0
-        log.info("Estimated cost for %d qualifying burst(s) (rough, not authoritative):", len(bursts))
+        log.info("Estimated cost for %d qualifying sequence(s) (rough, not authoritative):", len(bursts))
         for idx, burst in enumerate(bursts):
             input_tokens, output_tokens, cost = estimate_burst_cost(len(burst), model, args.image_max_long_edge)
             total_input += input_tokens
@@ -246,7 +265,10 @@ def main() -> None:
         log.info("  TOTAL: ~%d input / ~%d output tokens, ~$%.5f (model=%s)",
                  total_input, total_output, total_cost, model)
     else:
-        log.info("No qualifying bursts found (>= %d frames) -- nothing to rank.", args.min_group_size)
+        log.info(
+            "No qualifying sequences found (span > %.1fs or > %d frames) -- nothing to rank.",
+            args.min_sequence_seconds, args.min_sequence_frames,
+        )
 
     provider = OpenAIProvider(
         api_key=api_key,
@@ -260,7 +282,8 @@ def main() -> None:
         provider=provider,
         threshold=args.threshold,
         burst_gap_seconds=args.burst_gap_seconds,
-        min_group_size=args.min_group_size,
+        min_sequence_seconds=args.min_sequence_seconds,
+        min_sequence_frames=args.min_sequence_frames,
         image_max_long_edge=args.image_max_long_edge,
     )
     stage.process([], app_config)

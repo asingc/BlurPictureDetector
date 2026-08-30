@@ -56,6 +56,11 @@ function toggleViewMode() {
   renderMain();
 }
 
+// The image currently shown in the main preview pane, kept in sync by
+// renderMain() — read by the "AI edit" button handler below so it always
+// targets whatever's actually on screen.
+let lastActiveImage = null;
+
 // Initial active image within a group when it's first loaded/navigated to:
 // the first image at or above the baseline "keep" star tier (3+), same as
 // the star-driven color scheme used everywhere else on this page.
@@ -240,6 +245,21 @@ function applyPreviewAspectRatio($viewport, imgEl) {
   $viewport.css("aspect-ratio", imgEl.naturalWidth + " / " + imgEl.naturalHeight);
 }
 
+// Sizes the read-only file-path box (below the preview) to the rendered
+// image's larger dimension — its width for landscape/square images, or its
+// height for portrait ones, so narrow portrait photos still get a
+// reasonably wide box to read/copy the path from — capped to the preview
+// pane's own width so it never overflows.
+function syncFilePathWidth($viewport) {
+  const paneWidth = $("#reviewPreview").width();
+  const imgSize = Math.max($viewport.width(), $viewport.height());
+  $("#reviewFilePath").css("width", Math.min(paneWidth, imgSize) + "px");
+}
+$(window).on("resize.reviewFilePath", function () {
+  const $active = $("#reviewPreview .review-preview-cell.active .review-preview-viewport");
+  if ($active.length) syncFilePathWidth($active);
+});
+
 // Maps an LLM quality grade (0.0-1.0, higher = better composition/framing —
 // see algo/llm/prompts.py) to a CSS class controlling the badge color, so
 // low grades read as a warning and high grades read as a strong pick.
@@ -259,6 +279,9 @@ function renderMain() {
   const group = data.groups[data.activeGroup];
   if (!group) return;
   const activeImage = group.images[data.activeImage];
+
+  lastActiveImage = activeImage;
+  $("#reviewFilePath").val(activeImage.path || activeImage.file || "");
 
   // Populate/show the rank-info bar *before* building & measuring the
   // preview cells below. #reviewRankInfo is a flex sibling of
@@ -296,7 +319,7 @@ function renderMain() {
   const cellEntries = [];
   for (let i = start; i < end; i++) {
     const im = group.images[i];
-    const $cell = $("<div>", { class: "review-preview-cell" });
+    const $cell = $("<div>", { class: "review-preview-cell" }).toggleClass("active", i === data.activeImage);
     const $viewport = $("<div>", { class: `review-preview-viewport star-${im.stars || 3}` });
     const $img = $("<img>", { src: mainImgUrl(im), alt: im.file });
     $viewport.append($img);
@@ -305,10 +328,13 @@ function renderMain() {
     }
     $cell.append($viewport);
     $preview.append($cell);
-    cellEntries.push({ $viewport, img: $img[0] });
+    cellEntries.push({ $viewport, img: $img[0], active: i === data.activeImage });
   }
-  cellEntries.forEach(({ $viewport, img }) => {
-    const apply = () => applyPreviewAspectRatio($viewport, img);
+  cellEntries.forEach(({ $viewport, img, active }) => {
+    const apply = () => {
+      applyPreviewAspectRatio($viewport, img);
+      if (active) syncFilePathWidth($viewport);
+    };
     if (img.complete) apply();
     else $(img).on("load", apply);
   });
@@ -489,6 +515,11 @@ $("#reviewApplyBtn").on("click", async function () {
   } finally {
     $(this).prop("disabled", false);
   }
+});
+
+$("#reviewAiEditBtn").on("click", function () {
+  if (!lastActiveImage) return;
+  AiEdit.run(lastActiveImage.file);
 });
 
 $(function () {

@@ -340,6 +340,6 @@ landmarks) is effectively a pass-through under `--engine mediapipe`.
 | `annotation_top_n_bodies` | `5` | Always annotate the N largest bodies regardless of pass/fail |
 | `jersey_lab_match` | `True` | Match team colour by weighted L\*a\*b\* distance (brightness-forgiving) |
 | `jersey_lab_l_weight` | `0.15` | Weight on the L\* (brightness) axis when matching jersey colour |
-| `jersey_lab_max_dist` | `22.0` | Max weighted L\*a\*b\* distance to count as the team colour |
+| `jersey_lab_max_dist` | `28.0` | Max weighted L\*a\*b\* distance to count as the team colour |
 | `jersey_binary_lightness` | `True` | Fallback Light/Dark bucketing when `jersey_lab_match` is off |
 

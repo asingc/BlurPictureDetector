@@ -160,7 +160,16 @@ const Viewport = (function () {
   // to zoom, drag to pan while zoomed, click to toggle fit/actual, '1' to
   // zoom to actual). Clicking anywhere outside the image, the close button,
   // or any other key (including Esc) closes the window immediately.
-  function showImageWindow(imageUrl) {
+  //
+  // `opts.originalPath` / `opts.aiEditKey` (both optional, cluster.js is
+  // the only caller that passes them) add a toolbar below the image: a
+  // readonly path box plus an "AI edit" button (see static/js/ai-edit.js).
+  // Clicks/keystrokes inside that toolbar are excluded from the "anything
+  // closes this window" behavior below, so the path can actually be
+  // selected/copied and the button clicked without the window vanishing
+  // first.
+  function showImageWindow(imageUrl, opts) {
+    opts = opts || {};
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
 
     const $viewport = $("<div>", { class: "image-window-viewport" });
@@ -168,6 +177,19 @@ const Viewport = (function () {
     $viewport.append($img);
     const $closeBtn = $("<button>", { type: "button", class: "image-window-close", "aria-label": "Close" }).html("&times;");
     const $backdrop = $("<div>", { class: "image-window-backdrop" }).append($viewport, $closeBtn);
+    if (opts.originalPath) {
+      const $toolbar = $("<div>", { class: "image-window-toolbar" });
+      $toolbar.append(
+        $("<input>", { type: "text", class: "image-window-path", readonly: true }).val(opts.originalPath)
+      );
+      if (opts.aiEditKey) {
+        $toolbar.append(
+          $("<button>", { type: "button", class: "btn btn-sm" }).text("AI edit")
+            .on("click", () => AiEdit.run(opts.aiEditKey))
+        );
+      }
+      $backdrop.append($toolbar);
+    }
     $("body").append($backdrop).addClass("image-window-open");
 
     function imgs() {
@@ -216,8 +238,9 @@ const Viewport = (function () {
     });
 
     // Clicking outside the viewport (the backdrop) or the close button closes.
+    // Clicks inside the toolbar (path box / AI edit button) are excluded too.
     $backdrop.on("click", function (e) {
-      if ($(e.target).closest(".image-window-viewport").length) return;
+      if ($(e.target).closest(".image-window-viewport, .image-window-toolbar").length) return;
       close();
     });
     $closeBtn.on("click", close);
@@ -227,6 +250,10 @@ const Viewport = (function () {
     // page-level keydown handler (e.g. the cluster page's Delete-key
     // handler) so it never also fires while the window is open.
     function onKeydown(e) {
+      // Let normal typing/selection (e.g. Ctrl+A/Ctrl+C on the readonly path
+      // box) work while focus is in the toolbar, instead of closing the
+      // window on the very first keystroke.
+      if ($(e.target).closest(".image-window-toolbar").length) return;
       e.stopPropagation();
       if (e.key === "1") {
         zoomCtl.zoomToActual(imgs(), $img[0]);

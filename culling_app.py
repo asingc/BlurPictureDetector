@@ -128,6 +128,7 @@ class StartProcessingRequest(BaseModel):
     sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
     recognizeFaces: bool = True
     noTeam: bool = False                  # "Ignore jersey color" — bypasses team-colour filtering entirely (--noteam)
+    teamColor: str = ""                   # pin a specific registered jersey color, or "" for auto-detect (--team-color)
     teamId: str = ""                      # which team's jersey colors/roster/API key to use
 
 
@@ -192,6 +193,13 @@ class ImportMoreRequest(BaseModel):
     # album's own stored run_settings so a second import can never drift
     # from the settings the first import used.
     path: str
+
+
+class AiEditRequest(BaseModel):
+    # album.json bookkeeping "key" (falls back to plain basename for older
+    # albums) identifying which photo to edit — same identifier already used
+    # by /api/original, /api/anno_img, etc.
+    file: str
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +337,7 @@ def _jerseycolor_arg(team: TeamData) -> str:
     return ";".join(parts)
 
 
-def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool, no_team: bool, team_id: str) -> None:
+def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivity_custom_value: float, recognize_faces: bool, no_team: bool, team_color: str, team_id: str) -> None:
     team = _resolve_team(team_id)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     folder_stem = _sanitize_player_dirname(album_name.strip()) if album_name.strip() else Path(path).stem
@@ -350,6 +358,8 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
         jerseycolor = _jerseycolor_arg(team)
         if jerseycolor:
             cmd += ["--jerseycolor", jerseycolor]
+        if team_color:
+            cmd += ["--team-color", team_color]
     if team.id:
         cmd += ["--team-id", team.id]
     if team.openaiApiKey:
@@ -493,6 +503,87 @@ def _run_rerun_facereco(album_dir: Path) -> None:
         processing_state.return_code = proc.returncode
         processing_state.process = None
     log.info("Face-detection re-run finished (exit code %s)", proc.returncode)
+
+
+def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path]:
+    """Resolve the (source, destination) pair for an AI-edit run on *key*.
+
+    Chains onto the existing edited copy if one is already recorded and
+    still on disk (source == destination, autoedit.py overwrites it in
+    place); otherwise starts from the original source file. Raises
+    HTTPException if neither the entry nor a readable source can be found.
+    """
+    payload = _load_results_payload(album_dir)
+    entry = _results_by_filename(payload).get(key)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Image not found in album")
+
+    dest = album_dir / _EDITEDIMAGES_SUBDIR / f"{Path(key).stem}.jpg"
+
+    existing_edited = entry.get("edited_image")
+    if existing_edited:
+        candidate = album_dir / existing_edited
+        if candidate.is_file():
+            return candidate, dest
+
+    index = load_album_source_index(album_dir / "album.json")
+    src = index.get(key) or entry.get("file")
+    if not src or not Path(src).is_file():
+        raise HTTPException(status_code=404, detail="Source image not found on disk")
+    return Path(src), dest
+
+
+def _run_ai_edit(album_dir: Path, key: str, source_path: Path, dest_path: Path) -> None:
+    """Run autoedit.py's default (non-generative) pipeline set against a
+    single photo, writing straight to *dest_path* (editedimages/<key
+    stem>.jpg — RAW originals are rasterized to JPEG in the process).
+    *source_path* may equal *dest_path* (chaining onto an existing edit —
+    see _resolve_ai_edit_paths). On success, records "edited_image" on the
+    album.json entry so later export/review steps can pick it up.
+    """
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "autoedit.py"),
+        str(source_path),
+        "-pipelines", "all",
+        "--out-file", str(dest_path),
+    ]
+
+    log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    with processing_state.lock:
+        processing_state.process = proc
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        with processing_state.lock:
+            processing_state.lines.append(line.rstrip("\n"))
+
+    proc.wait()
+    if proc.returncode == 0 and dest_path.is_file():
+        try:
+            payload = _load_results_payload(album_dir)
+            entry = _results_by_filename(payload).get(key)
+            if entry is not None:
+                entry["edited_image"] = f"{_EDITEDIMAGES_SUBDIR}/{dest_path.name}"
+                atomic_save_and_backup(json.dumps(payload, indent=2), album_dir / "album.json")
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("AI edit succeeded but failed to record edited_image for %s: %s", key, exc)
+
+    with processing_state.lock:
+        processing_state.running = False
+        processing_state.return_code = proc.returncode
+        processing_state.process = None
+    log.info("AI edit finished for %s (exit code %s)", key, proc.returncode)
 
 
 def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
@@ -877,6 +968,9 @@ _PREVIEWS_SUBDIR = "previews"
 # fallback for albums processed before that, or if the cache goes stale.
 _THUMBNAILS_SUBDIR = THUMBNAILS_SUBDIR
 _THUMBNAIL_SIZE = THUMBNAIL_SIZE
+# Where autoedit.py's output for a photo is kept — see api_ai_edit()/
+# _run_ai_edit() below. Sibling of previews/ under the album directory.
+_EDITEDIMAGES_SUBDIR = "editedimages"
 # Effective "keep" when album.json has no explicit value yet (older albums,
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
@@ -969,6 +1063,7 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
         ts_path = src_path if src_path.is_file() else previews_dir / anno_name
         images.append({
             "file": src_name,
+            "path": str(src_path),
             "anno": anno_name,
             "keep": keep,
             "stars": stars,
@@ -1092,6 +1187,7 @@ def _build_clusters(album_path: Path) -> list[dict]:
     if fr is None:
         return []
 
+    source_index = load_album_source_index(album_path / "album.json")
     pending: list[dict] = []
     matched: list[dict] = []
     for child in sorted(fr.iterdir()):
@@ -1103,9 +1199,11 @@ def _build_clusters(album_path: Path) -> list[dict]:
             crop = face.get("cropFileName")
             if not crop:
                 continue
+            orig_filename = face.get("origFilename", "")
             faces.append({
                 "crop": crop,
-                "origFilename": face.get("origFilename", ""),
+                "origFilename": orig_filename,
+                "originalPath": source_index.get(orig_filename, ""),
             })
         cluster = {
             "id": child.name,
@@ -1729,7 +1827,7 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
         "category": category,
         "groups": [
             {"images": [
-                {"file": im["file"], "anno": im["anno"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
+                {"file": im["file"], "path": im["path"], "anno": im["anno"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
                 for im in group
             ]}
             for group in groups
@@ -1940,7 +2038,7 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
 
     thread = threading.Thread(
         target=_run_processing,
-        args=(str(path.resolve()), req.albumName, req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces, req.noTeam, req.teamId),
+        args=(str(path.resolve()), req.albumName, req.sensitivityMode, req.sensitivityCustomValue, req.recognizeFaces, req.noTeam, req.teamColor, req.teamId),
         daemon=True,
     )
     thread.start()
@@ -1997,6 +2095,30 @@ def api_rerun_facereco() -> dict:
     thread = threading.Thread(
         target=_run_rerun_facereco,
         args=(album_dir,),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
+@app.post("/api/edit/ai-edit")
+def api_ai_edit(req: AiEditRequest) -> dict:
+    """Launch autoedit.py against one photo (Review/Faces page "AI edit"
+    button). Reuses the same processing_state/polling machinery as every
+    other background job here — only one can run at a time."""
+    album_dir = _current_album_path()
+    source_path, dest_path = _resolve_ai_edit_paths(album_dir, req.file)
+
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="Processing is already running.")
+        processing_state.running = True
+        processing_state.return_code = None
+        processing_state.lines = []
+
+    thread = threading.Thread(
+        target=_run_ai_edit,
+        args=(album_dir, req.file, source_path, dest_path),
         daemon=True,
     )
     thread.start()

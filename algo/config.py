@@ -125,7 +125,15 @@ class AppConfig:
     # forgiven.
     jersey_lab_h_weight: float = 1.0
     # Maximum weighted LCh distance for a body to match the team colour.
-    jersey_lab_max_dist: float = 22.0
+    # Raised from 22.0 -> 28.0 (2026-08-30) so a dark jersey (e.g. navy) that
+    # reads as near-black under poor lighting — very low L*, chroma crushed
+    # toward 0 — still clears the distance to a properly-lit "Navy" target.
+    # Sanity-checked: a near-black body (L=0,a=0,b=0) vs. a fairly saturated
+    # navy target (L=25,a=10,b=-35) now sits at dist ~22.2, comfortably under
+    # 28; genuinely different hues (e.g. red vs. green) stay far above both
+    # old and new thresholds since the H* term dominates once both colours
+    # carry real chroma, so this does not blur unrelated team colours.
+    jersey_lab_max_dist: float = 28.0
 
     # ------------------------------------------------------------------
     # Auto adjustment (exposure / brightness)

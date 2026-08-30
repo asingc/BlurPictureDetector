@@ -23,12 +23,17 @@ log = logging.getLogger("BlurPictureDetector")
 # run of *already-qualified* shots, so one sharp frame surrounded by 100
 # blurry ones is never treated as part of a "sequence".
 DEFAULT_BURST_GAP_SECONDS = 1.0
-# Bursts smaller than this are left untouched (nothing to rank between).
-DEFAULT_MIN_GROUP_SIZE = 2
+# A burst only qualifies as a "sequence" (see _is_qualifying_sequence) once
+# its duration exceeds this many seconds OR it has more than
+# DEFAULT_MIN_SEQUENCE_FRAMES frames — anything smaller is graded like a
+# standalone image instead (a burst always has >= 2 frames by construction,
+# so both bounds already imply that).
+DEFAULT_MIN_SEQUENCE_SECONDS = 0.5
+DEFAULT_MIN_SEQUENCE_FRAMES = 8
 # Long-edge size (px) of the down-sized copy sent to the LLM.
 DEFAULT_IMAGE_MAX_LONG_EDGE = 999
-# Sharp frames that don't belong to a qualifying burst (see
-# DEFAULT_MIN_GROUP_SIZE) are still sent to the LLM, but graded
+# Sharp frames that don't belong to a qualifying sequence (see
+# _is_qualifying_sequence) are still sent to the LLM, but graded
 # independently rather than ranked/captioned as a group — they're batched
 # together purely to amortize each request's fixed overhead (system prompt,
 # instructions) across multiple images, not because they're related.
@@ -38,10 +43,19 @@ DEFAULT_SINGLETON_BATCH_SIZE = 6
 # lands in the kept fraction, so the score stays visible for manual review.
 DEFAULT_SINGLETON_KEEP_FRACTION = 0.6
 
-# Star-rating thresholds (fraction of all LLM-graded sharp frames, by
-# llm_grade, highest first) — see _assign_star_ratings.
+# Star-rating thresholds for standalone (non-sequence) sharp frames —
+# fraction of all LLM-graded standalone frames, by llm_grade, highest
+# first — see _assign_star_ratings.
 STAR_4_TOP_FRACTION = 0.4
 STAR_5_TOP_FRACTION = 0.1
+
+# Star-rating tiers for frames inside a qualifying sequence (see
+# _assign_sequence_stars): one 4-star pick per this many seconds of burst
+# duration, then the top SEQUENCE_STAR_3_TOP_FRACTION of what's left get 3
+# stars, everything else gets 2 stars. No 5-star tier applies within a
+# sequence.
+SEQUENCE_STAR_4_QUOTA_SECONDS = 0.5
+SEQUENCE_STAR_3_TOP_FRACTION = 0.30
 
 
 def _sorted_sharp_entries(payload: dict) -> list[dict]:
@@ -69,21 +83,39 @@ def _group_bursts(sharp_entries: list[dict], burst_gap_seconds: float) -> list[l
     return bursts
 
 
+def _is_qualifying_sequence(
+    burst: list[dict],
+    min_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
+    min_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
+) -> bool:
+    """Whether *burst* (a group from :func:`_group_bursts`) is long/large
+    enough to be treated as a "sequence" (ranked as a group, and star-rated
+    via :meth:`LLMCullingStage._assign_sequence_stars`) rather than as a set
+    of standalone images. Requires the burst's capture-time span to exceed
+    *min_seconds*, OR its frame count to exceed *min_frames*."""
+    if len(burst) < 2:
+        return False
+    duration = burst[-1]["_timestamp"] - burst[0]["_timestamp"]
+    return duration > min_seconds or len(burst) > min_frames
+
+
 def load_qualifying_bursts(
     results_path: Path,
     burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
-    min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
+    min_sequence_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
+    min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
 ) -> list[list[dict]]:
     """Read *results_path* (read-only — nothing is written back) and return
-    the bursts of consecutive sharp frames that qualify for LLM ranking
-    (>= *min_group_size* frames). Shared by :meth:`LLMCullingStage.process`
-    and pre-flight cost estimates (e.g. RunLLMCulling.py) so the two can
-    never drift out of sync with each other's burst definition."""
+    the bursts of consecutive sharp frames that qualify as sequences (see
+    :func:`_is_qualifying_sequence`) for LLM group-ranking. Shared by
+    :meth:`LLMCullingStage.process` and pre-flight cost estimates (e.g.
+    RerunLLMCulling.py) so the two can never drift out of sync with each
+    other's burst definition."""
     with open(results_path, encoding="utf-8") as fh:
         payload = json.load(fh)
     sharp_entries = _sorted_sharp_entries(payload)
     bursts = _group_bursts(sharp_entries, burst_gap_seconds)
-    return [b for b in bursts if len(b) >= min_group_size]
+    return [b for b in bursts if _is_qualifying_sequence(b, min_sequence_seconds, min_sequence_frames)]
 
 
 class LLMCullingStage(ProcessStage):
@@ -97,18 +129,21 @@ class LLMCullingStage(ProcessStage):
 
     Only entries with ``status == "sharp"`` participate. A burst is a run of
     sharp images whose capture timestamps are each within
-    ``burst_gap_seconds`` of the previous one (sorted chronologically).
-    Bursts with fewer than ``min_group_size`` frames don't qualify for
-    ranking — those frames are instead graded individually (never ranked or
-    captioned against each other) by :meth:`_grade_standalone_entries`,
-    batched only for request efficiency: the top ``singleton_keep_fraction``
-    of them (by ``llm_grade``) are marked keepers, the rest dropped, and
-    every one of them keeps its ``llm_grade`` regardless for manual review.
+    ``burst_gap_seconds`` of the previous one (sorted chronologically). A
+    burst only qualifies as a "sequence" (see :func:`_is_qualifying_sequence`)
+    once its capture-time span exceeds ``min_sequence_seconds`` OR it has
+    more than ``min_sequence_frames`` frames — smaller bursts don't qualify
+    for group ranking; those frames are instead graded individually (never
+    ranked or captioned against each other) by
+    :meth:`_grade_standalone_entries`, batched only for request efficiency:
+    the top ``singleton_keep_fraction`` of them (by ``llm_grade``) are marked
+    keepers, the rest dropped, and every one of them keeps its ``llm_grade``
+    regardless for manual review.
 
-    All qualifying bursts are handed to ``provider.rank_bursts`` in one call
-    so a provider that supports it (e.g. :class:`~algo.llm.culling_provider.
+    All qualifying sequences are handed to ``provider.rank_bursts`` in one
+    call so a provider that supports it (e.g. :class:`~algo.llm.culling_provider.
     OpenAIProvider`) can fan the LLM calls out concurrently instead of
-    waiting on each burst's round-trip one at a time. For each burst the
+    waiting on each burst's round-trip one at a time. For each sequence the
     provider picks the top ``min(3, len(burst))`` shots. Rank 1 gets
     ``keep=True``; every other frame in the burst — ranked #2/#3 or not
     ranked at all — gets ``keep=False``. Ranked (but not #1) frames
@@ -118,7 +153,10 @@ class LLMCullingStage(ProcessStage):
     the ranked top picks) gets an ``llm_grade`` (0.0-1.0 quality score) when
     the provider returns one, and every frame in the burst gets the same
     ``burst_caption`` (a short, punchy caption for the burst as a whole)
-    when the provider returns one.
+    when the provider returns one. Star ratings within a qualifying sequence
+    are then assigned by :meth:`_assign_sequence_stars` instead of the
+    global-percentile rule used for standalone frames — see
+    :meth:`_assign_star_ratings`.
 
     A token-usage/cost summary (``provider.get_cost_summary()``) is logged
     and written to ``album.json`` as ``llm_cost_summary`` once processing
@@ -131,7 +169,8 @@ class LLMCullingStage(ProcessStage):
         provider: CullingProvider,
         threshold: float,
         burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
-        min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
+        min_sequence_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
+        min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
         image_max_long_edge: int = DEFAULT_IMAGE_MAX_LONG_EDGE,
         singleton_batch_size: int = DEFAULT_SINGLETON_BATCH_SIZE,
         singleton_keep_fraction: float = DEFAULT_SINGLETON_KEEP_FRACTION,
@@ -145,7 +184,8 @@ class LLMCullingStage(ProcessStage):
         # keep line". See _assign_star_ratings.
         self.threshold = threshold
         self.burst_gap_seconds = burst_gap_seconds
-        self.min_group_size = min_group_size
+        self.min_sequence_seconds = min_sequence_seconds
+        self.min_sequence_frames = min_sequence_frames
         self.image_max_long_edge = image_max_long_edge
         self.singleton_batch_size = singleton_batch_size
         self.singleton_keep_fraction = singleton_keep_fraction
@@ -155,7 +195,7 @@ class LLMCullingStage(ProcessStage):
         # "import more images" would otherwise re-rank (and re-bill) every
         # burst in the whole album on every single import. None (the
         # default) disables this filter so a fresh, non-merge run still
-        # ranks every qualifying burst as before.
+        # ranks every qualifying sequence as before.
         self.new_keys = new_keys
 
     @staticmethod
@@ -174,35 +214,41 @@ class LLMCullingStage(ProcessStage):
         sharp_entries = _sorted_sharp_entries(payload)
         bursts = _group_bursts(sharp_entries, self.burst_gap_seconds)
 
-        qualifying = [b for b in bursts if len(b) >= self.min_group_size]
+        sequences = [
+            b for b in bursts
+            if _is_qualifying_sequence(b, self.min_sequence_seconds, self.min_sequence_frames)
+        ]
         log.info(
-            "[LLMCullingStage] %d sharp frame(s) -> %d burst(s), %d qualify (>= %d frames)",
-            len(sharp_entries), len(bursts), len(qualifying), self.min_group_size,
+            "[LLMCullingStage] %d sharp frame(s) -> %d burst(s), %d qualify as sequences "
+            "(duration > %.1fs or > %d frames)",
+            len(sharp_entries), len(bursts), len(sequences),
+            self.min_sequence_seconds, self.min_sequence_frames,
         )
 
+        to_rank = sequences
         if self.new_keys is not None:
-            before = len(qualifying)
-            qualifying = [b for b in qualifying if any(self._entry_key(e) in self.new_keys for e in b)]
+            before = len(to_rank)
+            to_rank = [b for b in to_rank if any(self._entry_key(e) in self.new_keys for e in b)]
             log.info(
-                "[LLMCullingStage] import-more: %d/%d qualifying burst(s) touch a newly-imported "
+                "[LLMCullingStage] import-more: %d/%d qualifying sequence(s) touch a newly-imported "
                 "photo -- only those will be (re-)ranked",
-                len(qualifying), before,
+                len(to_rank), before,
             )
 
-        # Build every qualifying burst's provider input up front so they can
-        # all be handed to the provider in one batch call — this is what lets
-        # a concurrency-capable provider (OpenAIProvider) fan the LLM calls
-        # out in parallel instead of waiting on each burst serially.
+        # Build every qualifying sequence's provider input up front so they
+        # can all be handed to the provider in one batch call — this is what
+        # lets a concurrency-capable provider (OpenAIProvider) fan the LLM
+        # calls out in parallel instead of waiting on each burst serially.
         prepared: list[tuple[str, list[dict]]] = []
         burst_inputs_batch: list[list[BurstFrameInput]] = []
-        if qualifying:
-            log.info("[LLMCullingStage] preparing %d qualifying burst(s) for ranking …", len(qualifying))
-        for idx, burst in enumerate(qualifying):
+        if to_rank:
+            log.info("[LLMCullingStage] preparing %d qualifying sequence(s) for ranking …", len(to_rank))
+        for idx, burst in enumerate(to_rank):
             group_id = f"burst-{idx:04d}"
             burst_inputs = [
                 inp for inp in (self._build_frame_input(e) for e in burst) if inp is not None
             ]
-            if len(burst_inputs) < self.min_group_size:
+            if len(burst_inputs) < 2:
                 log.debug(
                     "[LLMCullingStage] %s: only %d/%d frame(s) loaded — skipping",
                     group_id, len(burst_inputs), len(burst),
@@ -210,10 +256,10 @@ class LLMCullingStage(ProcessStage):
                 continue
             prepared.append((group_id, burst))
             burst_inputs_batch.append(burst_inputs)
-            log.debug("[LLMCullingStage] prepared %d/%d burst(s)", idx + 1, len(qualifying))
+            log.debug("[LLMCullingStage] prepared %d/%d sequence(s)", idx + 1, len(to_rank))
 
         if prepared:
-            log.info("[LLMCullingStage] sending %d burst(s) to LLM provider for ranking …", len(prepared))
+            log.info("[LLMCullingStage] sending %d sequence(s) to LLM provider for ranking …", len(prepared))
             try:
                 all_rankings = self.provider.rank_bursts(burst_inputs_batch)
             except Exception as exc:  # noqa: BLE001 — a batch failure must not abort the whole run
@@ -221,9 +267,13 @@ class LLMCullingStage(ProcessStage):
                 all_rankings = [BurstRankingResult(rankings=[], grades={}, caption="") for _ in prepared]
             for (group_id, burst), result in zip(prepared, all_rankings):
                 self._apply_rankings(burst, group_id, result)
-            log.info("[LLMCullingStage] burst ranking complete: %d burst(s) processed", len(prepared))
+            log.info("[LLMCullingStage] sequence ranking complete: %d sequence(s) processed", len(prepared))
 
-        standalone_entries = [e for b in bursts if len(b) < self.min_group_size for e in b]
+        standalone_entries = [
+            e for b in bursts
+            if not _is_qualifying_sequence(b, self.min_sequence_seconds, self.min_sequence_frames)
+            for e in b
+        ]
         if self.new_keys is not None:
             before = len(standalone_entries)
             standalone_entries = [e for e in standalone_entries if self._entry_key(e) in self.new_keys]
@@ -240,7 +290,7 @@ class LLMCullingStage(ProcessStage):
         all_entries = payload.get("results", [])
         blurry_entries = [e for e in all_entries if e.get("status") == "blurry"]
         skipped_entries = [e for e in all_entries if e.get("status") in ("skipped", "error")]
-        self._assign_star_ratings(sharp_entries, blurry_entries, skipped_entries)
+        self._assign_star_ratings(sharp_entries, blurry_entries, skipped_entries, sequences)
 
         for entry in sharp_entries:
             entry.pop("_timestamp", None)
@@ -269,6 +319,7 @@ class LLMCullingStage(ProcessStage):
         sharp_entries: list[dict],
         blurry_entries: list[dict],
         skipped_entries: list[dict],
+        sequences: list[list[dict]],
     ) -> None:
         """Assign a 1-5 star rating to every analysed entry (sharp, blurry,
         or skipped) so the whole album can be ranked on one scale:
@@ -281,17 +332,20 @@ class LLMCullingStage(ProcessStage):
           line, but close to it.
         - 3 stars: baseline for every ``sharp`` frame (it already qualified
           as a keeper).
-        - 4 stars: top ``STAR_4_TOP_FRACTION`` of sharp frames by
-          ``llm_grade`` percentile (measured across every sharp frame that
-          received a grade, whether ranked as part of a burst or graded
-          standalone).
-        - 5 stars: top ``STAR_5_TOP_FRACTION`` by that same percentile.
 
-        Burst ranking then applies a *floor* on top of the 3-5 tiers: a
-        burst's #1 pick is always at least 5 stars and its #2/#3 picks are
-        always at least 4 stars, regardless of where their llm_grade falls
-        in the global percentile (it can never be lowered by this step —
-        only raised).
+        Sharp frames belonging to a qualifying *sequence* (see
+        :func:`_is_qualifying_sequence`) then get their 2/3/4-star tier
+        overridden by :meth:`_assign_sequence_stars` instead — sequences
+        never compete against the rest of the album on one global
+        percentile, and have no 5-star tier.
+
+        Every OTHER sharp frame (standalone images, and frames in a burst
+        too short/small to qualify as a sequence) keeps the original
+        global-percentile rule:
+
+        - 4 stars: top ``STAR_4_TOP_FRACTION`` of those frames by
+          ``llm_grade`` percentile.
+        - 5 stars: top ``STAR_5_TOP_FRACTION`` by that same percentile.
         """
         low_cutoff = min(self.threshold, 0.4)
         for entry in skipped_entries:
@@ -303,7 +357,13 @@ class LLMCullingStage(ProcessStage):
         for entry in sharp_entries:
             entry["stars"] = 3
 
-        graded = [e for e in sharp_entries if e.get("llm_grade") is not None]
+        for burst in sequences:
+            self._assign_sequence_stars(burst)
+
+        sequence_keys = {self._entry_key(e) for burst in sequences for e in burst}
+        non_sequence_sharp = [e for e in sharp_entries if self._entry_key(e) not in sequence_keys]
+
+        graded = [e for e in non_sequence_sharp if e.get("llm_grade") is not None]
         graded.sort(key=lambda e: e["llm_grade"], reverse=True)
         top_4_count = math.ceil(len(graded) * STAR_4_TOP_FRACTION)
         top_5_count = math.ceil(len(graded) * STAR_5_TOP_FRACTION)
@@ -311,13 +371,6 @@ class LLMCullingStage(ProcessStage):
             entry["stars"] = 4
         for entry in graded[:top_5_count]:
             entry["stars"] = 5
-
-        for entry in sharp_entries:
-            rank = (entry.get("burst_ranking") or {}).get("rank")
-            if rank == 1:
-                entry["stars"] = max(entry["stars"], 5)
-            elif rank in (2, 3):
-                entry["stars"] = max(entry["stars"], 4)
 
         log.info(
             "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605, %d5\u2605 (%d sharp/%d blurry/%d skipped)",
@@ -328,6 +381,47 @@ class LLMCullingStage(ProcessStage):
             sum(1 for e in sharp_entries if e["stars"] == 5),
             len(sharp_entries), len(blurry_entries), len(skipped_entries),
         )
+
+    def _assign_sequence_stars(self, burst: list[dict]) -> None:
+        """Star tiers for one qualifying burst sequence, scored independently
+        per-sequence (never pooled against other sequences or the rest of
+        the album):
+
+        - 4 stars: the top ``floor(duration / SEQUENCE_STAR_4_QUOTA_SECONDS)``
+          frames by ``llm_grade`` (clamped to at least 1, and at most every
+          graded frame in the burst) — e.g. a 1.5s sequence picks its top 3.
+        - 3 stars: the top ``SEQUENCE_STAR_3_TOP_FRACTION`` of whatever's
+          left (by ``llm_grade``).
+        - 2 stars: everything else in the sequence.
+
+        There is no 5-star tier here. If the burst has no graded frames at
+        all (e.g. the LLM call failed), it's left at the baseline 3 stars
+        every sharp frame already got, rather than guessing.
+        """
+        graded = [e for e in burst if e.get("llm_grade") is not None]
+        if not graded:
+            return
+        graded.sort(key=lambda e: e["llm_grade"], reverse=True)
+
+        duration = burst[-1]["_timestamp"] - burst[0]["_timestamp"]
+        four_star_count = min(
+            max(math.floor(duration / SEQUENCE_STAR_4_QUOTA_SECONDS), 1),
+            len(graded),
+        )
+        four_star_keys = {self._entry_key(e) for e in graded[:four_star_count]}
+
+        remaining = graded[four_star_count:]
+        three_star_count = math.ceil(len(remaining) * SEQUENCE_STAR_3_TOP_FRACTION)
+        three_star_keys = {self._entry_key(e) for e in remaining[:three_star_count]}
+
+        for entry in burst:
+            key = self._entry_key(entry)
+            if key in four_star_keys:
+                entry["stars"] = 4
+            elif key in three_star_keys:
+                entry["stars"] = 3
+            else:
+                entry["stars"] = 2
 
     def _apply_rankings(self, burst: list[dict], group_id: str, result: BurstRankingResult) -> None:
         rank_by_file = {r.file: r for r in result.rankings}

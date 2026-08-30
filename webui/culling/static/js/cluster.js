@@ -280,7 +280,10 @@ function renderThumb(cluster, face) {
   const img = $("<img>").attr("data-src", thumbUrl).attr("title", face.origFilename)
     .on("click", (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return; // handled by the card-level handler below
-      Viewport.showImageWindow(originalUrl);
+      Viewport.showImageWindow(originalUrl, {
+        originalPath: face.originalPath || face.origFilename,
+        aiEditKey: face.origFilename,
+      });
     });
   thumbLazyLoadObserver.observe(img[0]);
 

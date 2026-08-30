@@ -414,6 +414,36 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 .team-block-add:hover { border-color: var(--accent); color: var(--accent); }
 .team-block-plus { font-size: 24px; font-weight: 300; line-height: 1; }
 
+.panel-divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+/* ------------------------------------------------------------------ *
+ * Color picker — round chip buttons for picking a jersey color. Same
+ * selectable-block styling as .team-block, but pill-shaped/content-width
+ * (no fixed 96x96 square) and shorter so it reads as a distinct, lighter
+ * control next to the team picker. Used on the Add Album and Apply pages.
+ * ------------------------------------------------------------------ */
+.color-picker { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.color-chip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 40px;
+  padding: 0 16px;
+  text-align: center;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.color-chip:hover { border-color: #d4d4da; background: var(--surface-2); }
+.color-chip.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.color-chip:disabled { opacity: 0.5; cursor: not-allowed; }
+
 
 /* ------------------------------------------------------------------ *
  * Player table
@@ -857,6 +887,36 @@ body.page-review #content {
 .review-preview-viewport img.zoomed { cursor: grab; }
 .review-preview-viewport img.zoomed:active { cursor: grabbing; }
 
+/* Read-only original-file path shown below the preview, for copy/paste,
+   plus the "AI edit" button beside it. Width is set inline by
+   syncFilePathWidth() in review.js (min of the preview pane's width and
+   the rendered image's larger dimension); the row itself is centered
+   under the preview instead. */
+.review-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: center;
+  max-width: 100%;
+}
+input.review-file-path {
+  flex: 0 0 auto;
+  max-width: 100%;
+  padding: 3px 8px;
+  font-size: 12px;
+  text-align: center;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: text;
+}
+input.review-file-path:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+
 /* LLM burst-ranking badge — numbered pill overlaid on a thumbnail/preview
    cell, plus the reason panel shown for the active image only. */
 .rank-badge {
@@ -977,8 +1037,10 @@ body.image-window-open { overflow: hidden; }
   inset: 0;
   background: rgba(10, 10, 14, 0.82);
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 12px;
   z-index: 1000;
 }
 .image-window-viewport {
@@ -1012,4 +1074,24 @@ body.image-window-open { overflow: hidden; }
   z-index: 1001;
 }
 .image-window-close:hover { background: rgba(255, 255, 255, 0.3); }
+
+.image-window-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 90vw;
+}
+input.image-window-path {
+  flex: 0 1 auto;
+  min-width: 200px;
+  max-width: 60vw;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  cursor: text;
+}
+input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255, 0.6); }
 

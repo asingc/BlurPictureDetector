@@ -16,6 +16,9 @@ let isProcessing = false;
 let teams = [];
 let selectedTeamId = "";
 
+// Which jersey color is pinned for this album ("" = Auto/detect).
+let selectedTeamColor = "";
+
 // Cookie names for the Face Recognition checkbox's client-only memory.
 const RECOGNIZE_FACES_COOKIE = "recognizeFacesLastState";
 const RECOGNIZE_FACES_CONSENT_COOKIE = "recognizeFacesConsentAck";
@@ -37,6 +40,36 @@ function renderTeamPickerUI() {
     onAddNew: () => { window.location.href = "/team"; },
     addLabel: "Create a New Team",
   });
+  renderTeamColorOptions();
+}
+
+// ------------------------------------------------------------------ //
+// Team jersey color — options are the selected team's registered jersey
+// colors (minus forced ones, e.g. goalie kits, which are always allowed
+// regardless of this choice), plus "Auto" (default) which polls the
+// dominant color from the photos instead of pinning one. Rendered as
+// round chip buttons, same interaction pattern as the team picker above.
+// ------------------------------------------------------------------ //
+function renderTeamColorOptions() {
+  const team = teams.find((t) => t.id === selectedTeamId);
+  const colors = ((team && team.jerseyColors) || []).filter((jc) => !jc.forced);
+  if (!colors.some((jc) => jc.color === selectedTeamColor)) selectedTeamColor = "";
+
+  const $container = $("#teamColorPicker").empty();
+  const disabled = $("#ignoreJerseyColorInput").is(":checked");
+
+  const makeChip = (label, value) => {
+    const chip = $("<button>", {
+      type: "button",
+      class: "color-chip" + (selectedTeamColor === value ? " selected" : ""),
+      disabled: disabled,
+    }).text(label);
+    chip.on("click", () => { selectedTeamColor = value; renderTeamColorOptions(); });
+    $container.append(chip);
+  };
+
+  makeChip("Auto", "");
+  colors.forEach((jc) => makeChip(jc.color, jc.color));
 }
 
 async function loadTeams(preferredTeamId) {
@@ -152,6 +185,9 @@ function setImportUIEnabled(enabled) {
   $("#createAlbumPanel").find("input, button").prop("disabled", !enabled);
   $("#teamPanel").find("button").prop("disabled", !enabled);
   $("#importImagesBtn").prop("disabled", !enabled);
+  if (enabled && $("#ignoreJerseyColorInput").is(":checked")) {
+    $("#teamColorPicker").find("button").prop("disabled", true);
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -263,6 +299,7 @@ $(function () {
     const { mode, customValue } = readSensitivityFromUI();
     const recognizeFaces = $("#recognizeFacesInput").is(":checked");
     const noTeam = $("#ignoreJerseyColorInput").is(":checked");
+    const teamColor = noTeam ? "" : selectedTeamColor;
     setImportUIEnabled(false);
     $("#processingOutput").val("");
     pollSince = 0;
@@ -277,6 +314,7 @@ $(function () {
         sensitivityCustomValue: customValue,
         recognizeFaces,
         noTeam,
+        teamColor,
         teamId: selectedTeamId,
       });
       pollTimer = setInterval(pollProcessingOutput, 500);
@@ -285,6 +323,10 @@ $(function () {
       setImportUIEnabled(true);
       $("#processingDialog").dialog("close");
     }
+  });
+
+  $("#ignoreJerseyColorInput").on("change", function () {
+    $("#teamColorPicker").find("button").prop("disabled", this.checked);
   });
 
   window.addEventListener("beforeunload", (e) => {

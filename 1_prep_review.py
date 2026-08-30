@@ -1275,10 +1275,14 @@ def _mark_import_complete(json_path: Path) -> None:
 
 
 # Fields written onto an album.json entry AFTER the analysis pipeline (by the
-# Review page's Apply step and the LLM burst-culling stage). A deep regrade
-# rebuilds every entry from freshly-computed detections, so these have to be
-# carried over explicitly or the user's review work would be wiped.
-_REGRADE_PRESERVED_FIELDS = ("stars", "stars_manual", "keep", "burst_ranking", "llm_grade", "burst_caption")
+# Review page's Apply step, the LLM burst-culling stage, and the image-editing
+# workflow). A deep regrade rebuilds every entry from freshly-computed
+# detections, so these have to be carried over explicitly or the user's
+# review/editing work would be wiped.
+_REGRADE_PRESERVED_FIELDS = (
+    "stars", "stars_manual", "keep", "burst_ranking", "llm_grade", "burst_caption",
+    "edited_image",
+)
 
 
 def _merge_preserved_fields(
