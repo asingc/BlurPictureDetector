@@ -275,5 +275,134 @@ const Viewport = (function () {
     return { close };
   }
 
-  return { computeContainFit, createZoomController, showImageWindow };
+  // A modal "compare" window: two labelled viewports side by side sharing a
+  // SINGLE zoom controller, so zooming/panning either pane moves both in
+  // lockstep (the two panes are always laid out at identical pixel sizes,
+  // which is what makes one shared transform valid for both). Used by the
+  // AI-edit flow to review a generated image against what it was made from
+  // (see static/js/ai-edit.js).
+  //
+  // Unlike showImageWindow this window is deliberately NOT dismissable by
+  // clicking away, Esc, or any other key: the caller needs an explicit
+  // verdict, so the only ways out are the two action buttons.
+  // `opts`: { title, beforeUrl, afterUrl, beforeLabel, afterLabel,
+  //           acceptLabel, rejectLabel, onAccept, onReject } — the two
+  // handlers may return a promise; the window closes once it settles.
+  function showCompareWindow(opts) {
+    opts = opts || {};
+    const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
+
+    const $panes = $("<div>", { class: "compare-window-panes" });
+    const cells = [
+      { url: opts.beforeUrl, label: opts.beforeLabel || "Before" },
+      { url: opts.afterUrl, label: opts.afterLabel || "After" },
+    ].map((cell) => {
+      const $img = $("<img>", { src: cell.url, alt: cell.label });
+      const $viewport = $("<div>", { class: "image-window-viewport" }).append($img);
+      $panes.append(
+        $("<div>", { class: "compare-pane" }).append(
+          $("<div>", { class: "compare-pane-label" }).text(cell.label),
+          $viewport
+        )
+      );
+      return { $img, $viewport };
+    });
+
+    const $reject = $("<button>", { type: "button", class: "btn btn-danger" }).text(opts.rejectLabel || "Reject");
+    const $accept = $("<button>", { type: "button", class: "btn btn-primary" }).text(opts.acceptLabel || "Accept");
+    const $toolbar = $("<div>", { class: "compare-window-toolbar" }).append(
+      $("<span>", { class: "compare-window-hint" }).text("Scroll to zoom, drag to pan \u2014 both panes stay in sync"),
+      $reject,
+      $accept
+    );
+    const $backdrop = $("<div>", { class: "image-window-backdrop compare-window-backdrop" }).append(
+      $("<div>", { class: "compare-window-title" }).text(opts.title || "Compare"),
+      $panes,
+      $toolbar
+    );
+    $("body").append($backdrop).addClass("image-window-open");
+
+    function imgs() {
+      return $panes.find("img");
+    }
+
+    // Both viewports are sized from the FIRST image that reports a natural
+    // size, so the panes stay pixel-identical even if the two images differ
+    // slightly in dimensions (the odd one out just letterboxes).
+    function lock() {
+      const ref = cells.map((c) => c.$img[0]).find((el) => el.naturalWidth);
+      if (!ref) return;
+      const availW = (window.innerWidth * 0.94 - 24) / 2;
+      const availH = window.innerHeight * 0.72;
+      const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, availW, availH);
+      if (!box) return;
+      cells.forEach((c) => c.$viewport.css({ width: box.width + "px", height: box.height + "px" }));
+      zoomCtl.apply(imgs());
+    }
+    cells.forEach((c) => {
+      if (c.$img[0].complete) lock();
+      else c.$img.on("load", lock);
+    });
+    $(window).on("resize.compareWindow", lock);
+
+    let dragging = false;
+    let dragMoved = false;
+    $panes.on("mousedown", "img", function (e) {
+      e.preventDefault();
+      dragMoved = false;
+      dragging = zoomCtl.dragStart(this, e.clientX, e.clientY);
+    });
+    $(document).on("mousemove.compareWindowDrag", function (e) {
+      if (!dragging) return;
+      dragMoved = true;
+      zoomCtl.dragMove(imgs(), e.clientX, e.clientY);
+    });
+    $(document).on("mouseup.compareWindowDrag", function () {
+      dragging = false;
+    });
+    $panes.on("wheel", "img", function (e) {
+      e.preventDefault();
+      const oe = e.originalEvent;
+      const delta = oe.deltaY < 0 ? zoomCtl.step : -zoomCtl.step;
+      zoomCtl.adjustByStep(imgs(), delta, this, oe.clientX, oe.clientY);
+    });
+    $panes.on("click", "img", function (e) {
+      if (dragMoved) {
+        dragMoved = false;
+        return;
+      }
+      zoomCtl.toggleClick(imgs(), this, e.clientX, e.clientY);
+    });
+
+    // Swallow page-level keyboard shortcuts (e.g. the review page's star
+    // hotkeys) while the window is up; '1' still zooms to actual size.
+    function onKeydown(e) {
+      e.stopPropagation();
+      if (e.key === "1") {
+        e.preventDefault();
+        zoomCtl.zoomToActual(imgs(), cells[0].$img[0]);
+      }
+    }
+    document.addEventListener("keydown", onKeydown, true);
+
+    function close() {
+      document.removeEventListener("keydown", onKeydown, true);
+      $(document).off("mousemove.compareWindowDrag mouseup.compareWindowDrag");
+      $(window).off("resize.compareWindow");
+      $("body").removeClass("image-window-open");
+      $backdrop.remove();
+    }
+
+    function decide(handler) {
+      $accept.prop("disabled", true);
+      $reject.prop("disabled", true);
+      Promise.resolve(handler ? handler() : null).then(close, close);
+    }
+    $accept.on("click", () => decide(opts.onAccept));
+    $reject.on("click", () => decide(opts.onReject));
+
+    return { close };
+  }
+
+  return { computeContainFit, createZoomController, showImageWindow, showCompareWindow };
 })();

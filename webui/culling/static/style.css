@@ -1095,3 +1095,48 @@ input.image-window-path {
 }
 input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255, 0.6); }
 
+/* ------------------------------------------------------------------ *
+ * Compare window (before/after) — reuses the image-window backdrop and
+ * viewport rules above, with two equally sized panes driven by a single
+ * shared zoom controller (static/js/viewport.js::showCompareWindow).
+ * ------------------------------------------------------------------ */
+.compare-window-backdrop { gap: 10px; }
+.compare-window-title {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  max-width: 94vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compare-window-panes {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 24px;
+}
+.compare-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.compare-pane-label {
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  text-align: center;
+}
+.compare-window-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.compare-window-hint {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  margin-right: 8px;
+}
+

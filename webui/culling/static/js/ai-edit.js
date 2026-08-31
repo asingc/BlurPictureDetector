@@ -8,6 +8,10 @@
 // import-more/rerun-facereco/deep-regrade (see static/js/apply.js) — only
 // one such background job can run at a time. The dialog's DOM is built
 // once, lazily, so this file has zero footprint on pages that never use it.
+//
+// On success the log modal gives way to a side-by-side before/after compare
+// window (Viewport.showCompareWindow) whose Accept/Reject buttons decide
+// whether the generated image is kept — see openCompare() below.
 const AiEdit = (function () {
   let $dialog = null;
   let pollTimer = null;
@@ -41,8 +45,57 @@ const AiEdit = (function () {
   function finish(returnCode) {
     const $d = dialog();
     const success = returnCode === 0;
-    $d.dialog("option", "title", success ? "AI edit complete" : `AI edit failed (exit code ${returnCode})`);
+    if (success) {
+      $d.dialog("close");
+      openCompare();
+      return;
+    }
+    $d.dialog("option", "title", `AI edit failed (exit code ${returnCode})`);
     $d.dialog("option", "closeOnEscape", true);
+    $d.dialog("widget").find(".ui-dialog-titlebar-close").show();
+  }
+
+  // Shows the generated image next to what it was made from and waits for
+  // an explicit verdict: the edit is only recorded on the album entry once
+  // accepted, and the generated file is deleted on reject (see
+  // /api/edit/ai-edit/accept|reject in culling_app.py).
+  async function openCompare() {
+    let state;
+    try {
+      state = await apiGet("/api/edit/ai-edit/pending");
+    } catch (err) {
+      state = null;
+    }
+    if (!state || !state.pending) {
+      reopenLog("AI edit finished, but no result was produced.", "AI edit produced no image");
+      return;
+    }
+    const stamp = Date.now();
+    Viewport.showCompareWindow({
+      title: `AI edit \u2014 ${state.file}`,
+      beforeUrl: `/api/edit/ai-edit/image?side=before&t=${stamp}`,
+      afterUrl: `/api/edit/ai-edit/image?side=after&t=${stamp}`,
+      beforeLabel: "Before",
+      afterLabel: "After (AI edit)",
+      acceptLabel: "Accept",
+      rejectLabel: "Reject",
+      onAccept: () => apiPost("/api/edit/ai-edit/accept", {}).catch((err) => {
+        alert(`Failed to keep the edit: ${err.message}`);
+      }),
+      onReject: () => apiPost("/api/edit/ai-edit/reject", {}).catch((err) => {
+        alert(`Failed to discard the edit: ${err.message}`);
+      }),
+    });
+  }
+
+  // Reopens the log modal in a terminal (closable) state with `message`
+  // appended — used when the run ends without something to compare.
+  function reopenLog(message, title) {
+    const $d = dialog();
+    appendLines([message]);
+    $d.dialog("option", "title", title);
+    $d.dialog("option", "closeOnEscape", true);
+    $d.dialog("open");
     $d.dialog("widget").find(".ui-dialog-titlebar-close").show();
   }
 

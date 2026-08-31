@@ -219,6 +219,75 @@ processing_state = ProcessingState()
 
 
 # --------------------------------------------------------------------------- #
+# AI edit (autoedit.py) — the freshly generated image is parked in
+# editedimages/.pending/ until the user accepts or rejects it in the
+# before/after compare view. Only one edit can be pending at a time (the
+# job lock in processing_state already serialises the generation step).
+# --------------------------------------------------------------------------- #
+class AiEditState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.album_dir: Optional[Path] = None
+        self.key: Optional[str] = None
+        self.before_path: Optional[Path] = None
+        self.pending_path: Optional[Path] = None
+        self.final_path: Optional[Path] = None
+
+    def set_pending(
+        self,
+        album_dir: Path,
+        key: str,
+        before_path: Path,
+        pending_path: Path,
+        final_path: Path,
+    ) -> None:
+        with self.lock:
+            self.album_dir = album_dir
+            self.key = key
+            self.before_path = before_path
+            self.pending_path = pending_path
+            self.final_path = final_path
+
+    def snapshot(self) -> Optional[dict]:
+        with self.lock:
+            if self.key is None or self.pending_path is None or not self.pending_path.is_file():
+                return None
+            return {
+                "album_dir": self.album_dir,
+                "key": self.key,
+                "before_path": self.before_path,
+                "pending_path": self.pending_path,
+                "final_path": self.final_path,
+            }
+
+    def clear(self, delete_files: bool = False) -> None:
+        """Forget the pending edit. With *delete_files*, also removes the
+        generated image (and any rasterized "before" cache) from disk — used
+        both by an explicit reject and to sweep up an orphan left behind by a
+        server restart before starting a new edit."""
+        with self.lock:
+            stale = [self.pending_path, self.before_path]
+            self.album_dir = None
+            self.key = None
+            self.before_path = None
+            self.pending_path = None
+            self.final_path = None
+        if not delete_files:
+            return
+        for path in stale:
+            if path is None:
+                continue
+            # Never touch the caller's real source photo: only files that
+            # live inside the pending folder are ours to delete.
+            if path.parent.name != _AI_EDIT_PENDING_SUBDIR:
+                continue
+            path.unlink(missing_ok=True)
+
+
+ai_edit_state = AiEditState()
+
+
+# --------------------------------------------------------------------------- #
 # Export (page 5 — Apply) — copy "keep" images and merge tagged-player faces
 # into a .FaceReco database at a destination folder, run in a background
 # thread with the same buffered-lines-for-polling pattern as ProcessingState.
@@ -505,48 +574,94 @@ def _run_rerun_facereco(album_dir: Path) -> None:
     log.info("Face-detection re-run finished (exit code %s)", proc.returncode)
 
 
-def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path]:
-    """Resolve the (source, destination) pair for an AI-edit run on *key*.
+def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]:
+    """Resolve the (source, pending, final) paths for an AI-edit run on *key*.
 
-    Chains onto the existing edited copy if one is already recorded and
-    still on disk (source == destination, autoedit.py overwrites it in
-    place); otherwise starts from the original source file. Raises
-    HTTPException if neither the entry nor a readable source can be found.
+    Chains onto the existing edited copy if one is already recorded and still
+    on disk (that copy becomes the source — i.e. the "before" image the user
+    compares against); otherwise starts from the original source file.
+    autoedit.py always writes to the *pending* path, never over the source or
+    the final destination, so nothing the user can already see is touched
+    until they explicitly accept the result (see api_ai_edit_accept()).
+    Raises HTTPException if neither the entry nor a readable source is found.
     """
     payload = _load_results_payload(album_dir)
     entry = _results_by_filename(payload).get(key)
     if entry is None:
         raise HTTPException(status_code=404, detail="Image not found in album")
 
-    dest = album_dir / _EDITEDIMAGES_SUBDIR / f"{Path(key).stem}.jpg"
+    stem = Path(key).stem
+    edited_dir = album_dir / _EDITEDIMAGES_SUBDIR
+    final = edited_dir / f"{stem}.jpg"
+    pending = edited_dir / _AI_EDIT_PENDING_SUBDIR / f"{stem}.jpg"
 
     existing_edited = entry.get("edited_image")
     if existing_edited:
         candidate = album_dir / existing_edited
         if candidate.is_file():
-            return candidate, dest
+            return candidate, pending, final
 
     index = load_album_source_index(album_dir / "album.json")
     src = index.get(key) or entry.get("file")
     if not src or not Path(src).is_file():
         raise HTTPException(status_code=404, detail="Source image not found on disk")
-    return Path(src), dest
+    return Path(src), pending, final
 
 
-def _run_ai_edit(album_dir: Path, key: str, source_path: Path, dest_path: Path) -> None:
+def _prepare_before_image(source_path: Path, pending_dir: Path) -> Path:
+    """Return a browser-displayable copy of *source_path* for the "before"
+    pane of the compare view. JPEG/PNG/WebP sources are served straight from
+    disk; anything else (RAW originals, TIFF) is rasterized to a JPEG cached
+    next to the pending edit."""
+    if source_path.suffix.lower() in _WEB_DISPLAYABLE_EXTENSIONS:
+        return source_path
+
+    from algo.stages.image_analysis import _read_image  # lazy: pulls in the heavy CV stack
+
+    image = _read_image(source_path)
+    if image is None:
+        raise RuntimeError(f"Could not decode {source_path}")
+    out = pending_dir / f"{source_path.stem}__before.jpg"
+    import cv2  # lazy for the same reason
+
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok:
+        raise RuntimeError(f"Could not encode a preview for {source_path}")
+    out.write_bytes(buf.tobytes())
+    return out
+
+
+def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Path, final_path: Path) -> None:
     """Run autoedit.py's default (non-generative) pipeline set against a
-    single photo, writing straight to *dest_path* (editedimages/<key
+    single photo, writing to *pending_path* (editedimages/.pending/<key
     stem>.jpg — RAW originals are rasterized to JPEG in the process).
-    *source_path* may equal *dest_path* (chaining onto an existing edit —
-    see _resolve_ai_edit_paths). On success, records "edited_image" on the
-    album.json entry so later export/review steps can pick it up.
+
+    Nothing is recorded on the album.json entry here: the result stays
+    parked in the pending folder until the user accepts it in the
+    before/after compare view (api_ai_edit_accept) or discards it
+    (api_ai_edit_reject).
     """
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    # Drop any previously pending edit (including an orphan left by a server
+    # restart) so the folder only ever holds the run we are about to start.
+    ai_edit_state.clear(delete_files=True)
+    for stale in pending_path.parent.iterdir():
+        if stale.is_file():
+            stale.unlink(missing_ok=True)
+
+    try:
+        before_path = _prepare_before_image(source_path, pending_path.parent)
+    except (RuntimeError, OSError, ImportError) as exc:
+        log.warning("AI edit: could not prepare the 'before' image for %s: %s", key, exc)
+        before_path = source_path
+
     cmd = [
         sys.executable,
         str(REPO_ROOT / "autoedit.py"),
         str(source_path),
         "-pipelines", "all",
-        "--out-file", str(dest_path),
+        "--out-file", str(pending_path),
+        "--face-enhance",
     ]
 
     log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
@@ -569,15 +684,14 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, dest_path: Path) 
             processing_state.lines.append(line.rstrip("\n"))
 
     proc.wait()
-    if proc.returncode == 0 and dest_path.is_file():
-        try:
-            payload = _load_results_payload(album_dir)
-            entry = _results_by_filename(payload).get(key)
-            if entry is not None:
-                entry["edited_image"] = f"{_EDITEDIMAGES_SUBDIR}/{dest_path.name}"
-                atomic_save_and_backup(json.dumps(payload, indent=2), album_dir / "album.json")
-        except (OSError, json.JSONDecodeError) as exc:
-            log.warning("AI edit succeeded but failed to record edited_image for %s: %s", key, exc)
+    if proc.returncode == 0 and pending_path.is_file():
+        ai_edit_state.set_pending(
+            album_dir=album_dir,
+            key=key,
+            before_path=before_path,
+            pending_path=pending_path,
+            final_path=final_path,
+        )
 
     with processing_state.lock:
         processing_state.running = False
@@ -971,6 +1085,12 @@ _THUMBNAIL_SIZE = THUMBNAIL_SIZE
 # Where autoedit.py's output for a photo is kept — see api_ai_edit()/
 # _run_ai_edit() below. Sibling of previews/ under the album directory.
 _EDITEDIMAGES_SUBDIR = "editedimages"
+# Freshly generated edits land here first and are only promoted into
+# _EDITEDIMAGES_SUBDIR once the user accepts them in the compare view.
+_AI_EDIT_PENDING_SUBDIR = ".pending"
+# Formats a browser can render directly; anything else (RAW, TIFF) has to be
+# rasterized before it can be shown in the before/after compare view.
+_WEB_DISPLAYABLE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"})
 # Effective "keep" when album.json has no explicit value yet (older albums,
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
@@ -2105,9 +2225,11 @@ def api_rerun_facereco() -> dict:
 def api_ai_edit(req: AiEditRequest) -> dict:
     """Launch autoedit.py against one photo (Review/Faces page "AI edit"
     button). Reuses the same processing_state/polling machinery as every
-    other background job here — only one can run at a time."""
+    other background job here — only one can run at a time. The result is
+    parked as a pending edit for the before/after compare view; it does not
+    become the photo's edited_image until accepted."""
     album_dir = _current_album_path()
-    source_path, dest_path = _resolve_ai_edit_paths(album_dir, req.file)
+    source_path, pending_path, final_path = _resolve_ai_edit_paths(album_dir, req.file)
 
     with processing_state.lock:
         if processing_state.running:
@@ -2118,10 +2240,77 @@ def api_ai_edit(req: AiEditRequest) -> dict:
 
     thread = threading.Thread(
         target=_run_ai_edit,
-        args=(album_dir, req.file, source_path, dest_path),
+        args=(album_dir, req.file, source_path, pending_path, final_path),
         daemon=True,
     )
     thread.start()
+    return {"ok": True}
+
+
+def _require_pending_edit() -> dict:
+    pending = ai_edit_state.snapshot()
+    if pending is None:
+        raise HTTPException(status_code=404, detail="No pending AI edit")
+    return pending
+
+
+@app.get("/api/edit/ai-edit/pending")
+def api_ai_edit_pending() -> dict:
+    """Whether a generated-but-undecided AI edit is waiting for the user's
+    accept/reject verdict, and which photo it belongs to."""
+    pending = ai_edit_state.snapshot()
+    if pending is None:
+        return {"pending": False, "file": None}
+    return {"pending": True, "file": pending["key"]}
+
+
+@app.get("/api/edit/ai-edit/image")
+def api_ai_edit_image(side: str = Query(...)) -> FileResponse:
+    """Serve the "before" (what the edit started from) or "after" (the
+    pending, not-yet-accepted result) image of the current AI edit."""
+    pending = _require_pending_edit()
+    if side == "before":
+        path = pending["before_path"]
+    elif side == "after":
+        path = pending["pending_path"]
+    else:
+        raise HTTPException(status_code=400, detail="side must be 'before' or 'after'")
+    if path is None or not Path(path).is_file():
+        raise HTTPException(status_code=404, detail=f"No {side} image available")
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/edit/ai-edit/accept")
+def api_ai_edit_accept() -> dict:
+    """Promote the pending edit to the photo's edited_image, replacing any
+    previously accepted edit."""
+    pending = _require_pending_edit()
+    album_dir: Path = pending["album_dir"]
+    final_path: Path = pending["final_path"]
+    key: str = pending["key"]
+
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(pending["pending_path"], final_path)
+    try:
+        payload = _load_results_payload(album_dir)
+        entry = _results_by_filename(payload).get(key)
+        if entry is not None:
+            entry["edited_image"] = f"{_EDITEDIMAGES_SUBDIR}/{final_path.name}"
+            atomic_save_and_backup(json.dumps(payload, indent=2), album_dir / "album.json")
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("AI edit accepted but failed to record edited_image for %s: %s", key, exc)
+    ai_edit_state.clear(delete_files=True)
+    log.info("AI edit accepted for %s -> %s", key, final_path)
+    return {"ok": True}
+
+
+@app.post("/api/edit/ai-edit/reject")
+def api_ai_edit_reject() -> dict:
+    """Discard the pending edit, deleting the generated image. Whatever the
+    photo's edited_image was before the run is left untouched."""
+    pending = _require_pending_edit()
+    ai_edit_state.clear(delete_files=True)
+    log.info("AI edit rejected for %s", pending["key"])
     return {"ok": True}
 
 
