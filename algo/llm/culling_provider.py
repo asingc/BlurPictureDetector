@@ -238,9 +238,15 @@ _MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
 _DEFAULT_PRICING_PER_MILLION = _MODEL_PRICING_PER_MILLION["gpt-4o-mini"]
 
 # Default OpenAI model used when a caller doesn't specify one — shared by
-# OpenAIProvider's constructor default and RunLLMCulling.py's CLI default so
-# the two can never drift apart.
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+# OpenAIProvider's constructor default, 1_prep_review.py's --llm-model default,
+# and RunLLMCulling.py's CLI default so all three can never drift apart.
+# gpt-4.1-mini (not gpt-4o-mini): real A/B testing on a full 768-image album
+# (2026-08-30) showed gpt-4.1-mini is ~7x cheaper (patch-based vision tokenizer
+# vs gpt-4o-mini's unusually expensive tile-based one) and noticeably faster
+# under the same rate-limit budget, with comparable average grades — chosen
+# as the new default per explicit user decision after gpt-4o-mini's grading
+# was judged "not too reliable anyway".
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 
 
 def known_model_pricing() -> dict[str, tuple[float, float]]:
@@ -424,28 +430,46 @@ def estimate_burst_cost(num_images: int, model: str, image_long_edge_px: int) ->
     return input_tokens, output_tokens, cost_usd
 
 
-# Conservative default tokens-per-minute budget for OpenAIProvider's rate
-# limiter — matches the TPM cap OpenAI reports for gpt-4o-mini on a fresh/
-# lower-usage-tier account (verified against a real 429 response: "Limit
-# 200000 ... tokens per min (TPM)"). Override via OpenAIProvider's
-# tokens_per_minute constructor arg (or RunLLMCulling.py's --tpm-limit) if
-# your account has a higher tier. OpenAI does not expose account rate limits
-# via any API, so this can't be auto-detected.
+# Conservative INITIAL tokens-per-minute guess for OpenAIProvider's rate
+# limiter, used only until a real response reveals the account's actual
+# limit (see AdaptiveRateLimiter.recalibrate / OpenAIProvider._observe_rate_limits).
+# Matches the TPM cap OpenAI reports for gpt-4o-mini on a fresh/lower-usage-
+# tier account (verified against a real 429 response: "Limit 200000 ...
+# tokens per min (TPM)"). Override via OpenAIProvider's tokens_per_minute
+# constructor arg (or RunLLMCulling.py's --tpm-limit) to change the starting
+# guess -- it matters far less now since the real limit is auto-detected
+# from the first real response's ``x-ratelimit-limit-tokens`` header.
 DEFAULT_TPM_LIMIT = 200_000
 
-# Fraction of tokens_per_minute the rate limiter actually targets, leaving
-# headroom below the real budget for token-estimation error and concurrent-
-# request timing jitter (see TokenBucketRateLimiter). 0.9 = throttle at 90%
-# of the configured TPM limit.
+# Fraction of the (initial-guess-or-recalibrated) limit the rate limiter
+# actually targets, leaving headroom for token-estimation error and
+# concurrent-request timing jitter (see AdaptiveRateLimiter). 0.9 = throttle
+# at 90% of budget.
 DEFAULT_TPM_SAFETY_FACTOR = 0.9
 
+# Conservative INITIAL requests-per-minute guess -- same Tier-1 assumption as
+# DEFAULT_TPM_LIMIT (OpenAI's published Tier-1 limits pair ~500 RPM with
+# ~200,000 TPM for these models). Like TPM, this is only a starting point:
+# recalibrated from the real ``x-ratelimit-limit-requests`` header on the
+# first real response.
+DEFAULT_RPM_LIMIT = 500
+DEFAULT_RPM_SAFETY_FACTOR = 0.9
 
-class TokenBucketRateLimiter:
-    """Thread-safe token-bucket approximating an OpenAI tokens-per-minute
-    (TPM) budget. The bucket starts full (the account's whole per-minute
-    allowance is assumed available immediately) and continuously refills at
-    ``tokens_per_minute / 60`` tokens/sec, mirroring OpenAI's rolling-window
-    rate limiting (not a fixed calendar-minute reset).
+
+class AdaptiveRateLimiter:
+    """Thread-safe token-bucket approximating a per-minute budget (used for
+    both the TPM and RPM budgets). The bucket starts full (assumed available
+    immediately) and continuously refills at ``limit / 60`` units/sec,
+    mirroring OpenAI's rolling-window rate limiting (not a fixed calendar-
+    minute reset).
+
+    Starts from a static guess but is RECALIBRATED ON THE FLY via
+    :meth:`recalibrate` once a real ``x-ratelimit-limit-*`` response header
+    reveals the account's actual limit -- see
+    :meth:`OpenAIProvider._observe_rate_limits`. This is what lets different
+    users/accounts with different API tiers be handled correctly without any
+    manual tuning: the initial guess only matters for the very first burst
+    of requests before the first real response lands.
 
     :meth:`acquire` blocks the calling thread until enough budget is
     available, so concurrent worker threads (see OpenAIProvider.rank_bursts's
@@ -453,37 +477,58 @@ class TokenBucketRateLimiter:
     firing at once and instantly 429'ing.
     """
 
-    def __init__(self, tokens_per_minute: int, safety_factor: float = DEFAULT_TPM_SAFETY_FACTOR) -> None:
-        # safety_factor leaves headroom below the account's real TPM budget —
-        # our per-request token estimates are approximate (not the exact
-        # value OpenAI will bill), and concurrent threads can still overlap
+    def __init__(self, initial_limit: int, safety_factor: float) -> None:
+        # safety_factor leaves headroom below the real budget -- our
+        # per-request token estimates are approximate (not the exact value
+        # OpenAI will bill), and concurrent threads can still overlap
         # slightly within the same instant, so targeting 100% of the real
         # limit leaves no margin for either. Throttling to e.g. 90% trades a
         # bit of throughput for far fewer 429s/retries in practice.
-        safety_factor = min(max(safety_factor, 0.01), 1.0)
-        self.capacity = max(1, int(tokens_per_minute * safety_factor))
+        self._safety_factor = min(max(safety_factor, 0.01), 1.0)
+        self.capacity = max(1, int(initial_limit * self._safety_factor))
         self._rate_per_sec = self.capacity / 60.0
-        self._tokens = float(self.capacity)
+        self._units = float(self.capacity)
         self._last_refill = time.monotonic()
         self._lock = threading.Lock()
 
-    def acquire(self, tokens: int) -> None:
-        """Block until *tokens* worth of budget is available, then consume
+    def acquire(self, amount: int) -> None:
+        """Block until *amount* worth of budget is available, then consume
         it. A single request larger than the whole bucket capacity is capped
         to the capacity so it can still eventually proceed (after a full
         refill) rather than waiting forever."""
-        tokens = min(max(0, tokens), self.capacity)
+        amount = min(max(0, amount), self.capacity)
         while True:
             with self._lock:
-                now = time.monotonic()
-                elapsed = now - self._last_refill
-                self._tokens = min(self.capacity, self._tokens + elapsed * self._rate_per_sec)
-                self._last_refill = now
-                if self._tokens >= tokens:
-                    self._tokens -= tokens
+                self._refill_locked()
+                if self._units >= amount:
+                    self._units -= amount
                     return
-                wait_seconds = (tokens - self._tokens) / self._rate_per_sec
+                wait_seconds = (amount - self._units) / self._rate_per_sec
             time.sleep(min(wait_seconds, 5.0))  # re-check periodically rather than one huge sleep
+
+    def recalibrate(self, real_limit: int) -> bool:
+        """Resize the bucket to *real_limit* (a value observed from a real
+        ``x-ratelimit-limit-*`` response header) at this limiter's safety
+        factor. Preserves the current fill FRACTION rather than resetting to
+        full (would let every already-waiting thread fire at once) or to
+        empty (needless stall). Returns True the first time this actually
+        changes the capacity, so the caller can log the discovery once."""
+        new_capacity = max(1, int(real_limit * self._safety_factor))
+        with self._lock:
+            self._refill_locked()
+            if new_capacity == self.capacity:
+                return False
+            frac_full = self._units / self.capacity if self.capacity else 1.0
+            self.capacity = new_capacity
+            self._rate_per_sec = self.capacity / 60.0
+            self._units = self.capacity * frac_full
+            return True
+
+    def _refill_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._units = min(self.capacity, self._units + elapsed * self._rate_per_sec)
+        self._last_refill = now
 
 
 class OpenAIProvider(CullingProvider):
@@ -493,10 +538,16 @@ class OpenAIProvider(CullingProvider):
     of processing them one at a time — each burst is a fully independent LLM
     call, and the OpenAI SDK releases the GIL while waiting on the network,
     so it's safe (and much faster for a large shoot) to have up to
-    ``max_concurrency`` sessions in flight at once. To avoid instantly
-    blowing through the account's real rate limit when many bursts fire at
-    once, a :class:`TokenBucketRateLimiter` (sized by ``tokens_per_minute``)
-    throttles how fast requests actually go out — see :meth:`rank_burst`.
+    ``max_concurrency`` sessions in flight at once.
+
+    Both the tokens-per-minute (TPM) and requests-per-minute (RPM) budgets
+    start from a conservative static guess (``DEFAULT_TPM_LIMIT`` /
+    ``DEFAULT_RPM_LIMIT``) but are RECALIBRATED FROM THE REAL ACCOUNT LIMITS
+    the moment a real API response comes back — every chat-completions
+    response carries ``x-ratelimit-limit-requests``/``x-ratelimit-limit-
+    tokens`` headers reporting this specific account's actual tier, so
+    different users/accounts with different capacity are handled
+    automatically without manual tuning (see :meth:`_observe_rate_limits`).
     """
 
     def __init__(
@@ -507,6 +558,8 @@ class OpenAIProvider(CullingProvider):
         max_concurrency: int = 50,
         tokens_per_minute: int = DEFAULT_TPM_LIMIT,
         tpm_safety_factor: float = DEFAULT_TPM_SAFETY_FACTOR,
+        requests_per_minute: int = DEFAULT_RPM_LIMIT,
+        rpm_safety_factor: float = DEFAULT_RPM_SAFETY_FACTOR,
     ) -> None:
         super().__init__()
         try:
@@ -519,9 +572,24 @@ class OpenAIProvider(CullingProvider):
         self.model = model
         self.max_concurrency = max_concurrency
         self._pricing_per_million = _lookup_pricing(model)
-        self._rate_limiter = (
-            TokenBucketRateLimiter(tokens_per_minute, tpm_safety_factor) if tokens_per_minute > 0 else None
+        self._token_limiter = (
+            AdaptiveRateLimiter(tokens_per_minute, tpm_safety_factor) if tokens_per_minute > 0 else None
         )
+        self._request_limiter = (
+            AdaptiveRateLimiter(requests_per_minute, rpm_safety_factor) if requests_per_minute > 0 else None
+        )
+        # Real account limits observed from response headers so far (None
+        # until the first real API response lands) -- see get_observed_limits.
+        self._limits_lock = threading.Lock()
+        self.observed_tpm_limit: int | None = None
+        self.observed_rpm_limit: int | None = None
+
+    def get_observed_limits(self) -> dict:
+        """Best-effort snapshot of the real account RPM/TPM limits observed
+        from response headers so far (values are None until at least one
+        real API response has been received)."""
+        with self._limits_lock:
+            return {"rpm_limit": self.observed_rpm_limit, "tpm_limit": self.observed_tpm_limit}
 
     def rank_bursts(self, bursts: list[list[BurstFrameInput]]) -> list[BurstRankingResult]:
         if not bursts:
@@ -555,27 +623,18 @@ class OpenAIProvider(CullingProvider):
             {"role": "system", "content": prompts.CULLING_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_user_content(frames, top_n)},
         ]
-        if self._rate_limiter is not None:
-            estimated_tokens = sum(estimate_tokens_for_b64_image(f.image_b64, self.model) for f in frames) \
-                + _ESTIMATED_PROMPT_TEXT_TOKENS
-            self._rate_limiter.acquire(estimated_tokens)
+        estimated_tokens = sum(estimate_tokens_for_b64_image(f.image_b64, self.model) for f in frames) \
+            + _ESTIMATED_PROMPT_TEXT_TOKENS
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
-            raw = response.choices[0].message.content
-            self._record_usage(response)
+            raw, elapsed = self._chat_completion(messages, estimated_tokens)
         except Exception as exc:  # noqa: BLE001 — a single burst's LLM failure must not abort the run
             log.warning("[OpenAIProvider] rank_burst: LLM call failed for %s: %s", frame_names, exc)
             return BurstRankingResult(rankings=[], grades={}, caption="")
         result = _parse_llm_response(raw, frames, top_n)
         top_picks = [(r.file, r.rank) for r in result.rankings]
         log.info(
-            "[OpenAIProvider] rank_burst: received result for %d frame(s) — top picks=%s, caption=%r",
-            len(frames), top_picks, result.caption,
+            "[OpenAIProvider] rank_burst: received result for %d frame(s) in %.2fs — top picks=%s, caption=%r",
+            len(frames), elapsed, top_picks, result.caption,
         )
         return result
 
@@ -609,23 +668,87 @@ class OpenAIProvider(CullingProvider):
             {"role": "system", "content": prompts.SINGLE_IMAGE_GRADE_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_grade_user_content(frames)},
         ]
-        if self._rate_limiter is not None:
-            estimated_tokens = sum(estimate_tokens_for_b64_image(f.image_b64, self.model) for f in frames) \
-                + _ESTIMATED_PROMPT_TEXT_TOKENS
-            self._rate_limiter.acquire(estimated_tokens)
+        estimated_tokens = sum(estimate_tokens_for_b64_image(f.image_b64, self.model) for f in frames) \
+            + _ESTIMATED_PROMPT_TEXT_TOKENS
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
-            raw = response.choices[0].message.content
-            self._record_usage(response)
+            raw, elapsed = self._chat_completion(messages, estimated_tokens)
         except Exception as exc:  # noqa: BLE001 — a single batch's LLM failure must not abort the run
             log.warning("[OpenAIProvider] standalone grade LLM call failed: %s", exc)
             return {}
-        return _parse_grade_response(raw, frames)
+        grades = _parse_grade_response(raw, frames)
+        log.info("[OpenAIProvider] standalone grade: %d/%d image(s) graded in %.2fs",
+                 len(grades), len(frames), elapsed)
+        return grades
+
+    def _chat_completion(self, messages: list[dict], estimated_tokens: int) -> tuple[str | None, float]:
+        """POST one chat-completions request, throttled by the live
+        token/request budgets, and return ``(raw_content, elapsed_seconds)``.
+
+        Uses ``with_raw_response`` so the real ``x-ratelimit-limit-*``
+        response headers can be read (see :meth:`_observe_rate_limits`)
+        before parsing the body — this is what lets the rate limiter
+        recalibrate to this account's ACTUAL tier instead of relying only on
+        the static initial guess.
+        """
+        if self._request_limiter is not None:
+            self._request_limiter.acquire(1)
+        if self._token_limiter is not None:
+            self._token_limiter.acquire(estimated_tokens)
+        t0 = time.monotonic()
+        raw_response = self._client.chat.completions.with_raw_response.create(
+            model=self.model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        elapsed = time.monotonic() - t0
+        self._observe_rate_limits(raw_response.headers)
+        response = raw_response.parse()
+        self._record_usage(response)
+        return response.choices[0].message.content, elapsed
+
+    def _observe_rate_limits(self, headers) -> None:
+        """Recalibrate the token/request budgets from a real response's
+        ``x-ratelimit-limit-requests``/``x-ratelimit-limit-tokens`` headers.
+        This is the mechanism that makes RPM/TPM handling account-aware: it
+        replaces the static DEFAULT_RPM_LIMIT/DEFAULT_TPM_LIMIT guesses with
+        THIS account's actual tier the moment a real response comes back, so
+        different users with different API capacity are handled correctly
+        without any manual --tpm-limit/--rpm-limit tuning.
+        """
+        limit_requests_raw = headers.get("x-ratelimit-limit-requests")
+        limit_tokens_raw = headers.get("x-ratelimit-limit-tokens")
+        remaining_requests = headers.get("x-ratelimit-remaining-requests")
+        remaining_tokens = headers.get("x-ratelimit-remaining-tokens")
+        changed = False
+        with self._limits_lock:
+            if limit_requests_raw is not None:
+                try:
+                    limit_requests = int(limit_requests_raw)
+                    self.observed_rpm_limit = limit_requests
+                    if self._request_limiter is not None and self._request_limiter.recalibrate(limit_requests):
+                        changed = True
+                except ValueError:
+                    pass
+            if limit_tokens_raw is not None:
+                try:
+                    limit_tokens = int(limit_tokens_raw)
+                    self.observed_tpm_limit = limit_tokens
+                    if self._token_limiter is not None and self._token_limiter.recalibrate(limit_tokens):
+                        changed = True
+                except ValueError:
+                    pass
+        if changed:
+            log.info(
+                "[OpenAIProvider] recalibrated rate limits from real account headers: "
+                "RPM limit=%s (remaining=%s), TPM limit=%s (remaining=%s)",
+                limit_requests_raw, remaining_requests, limit_tokens_raw, remaining_tokens,
+            )
+        else:
+            log.debug(
+                "[OpenAIProvider] rate-limit headers: requests remaining=%s/%s, tokens remaining=%s/%s",
+                remaining_requests, limit_requests_raw, remaining_tokens, limit_tokens_raw,
+            )
 
     def _record_usage(self, response) -> None:
         """Extract token usage from *response* and record its cost. Thread-

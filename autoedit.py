@@ -142,7 +142,7 @@ SHARPEN_MODELS: dict[str, SharpenModelSpec] = {
         kind="rrdbnet", num_feat=64, num_block=23, num_grow_ch=32,
     ),
 }
-DEFAULT_SHARPEN_MODEL = "x4plus"
+DEFAULT_SHARPEN_MODEL = "compact"
 
 # Peak-VRAM-per-output-pixel at tile=0/half precision, measured on a real GPU
 # (Titan V) across 512-1600px square images: compact ~407-494 B/px, rrdbnet
@@ -829,6 +829,7 @@ class EditContext:
 
 class EditPipeline(ABC):
     name: str = ""
+    description: str = ""  # shown in the -pipelines CLI help
 
     @abstractmethod
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
@@ -837,6 +838,7 @@ class EditPipeline(ABC):
 
 class LevelPipeline(EditPipeline):
     name = "level"
+    description = "Auto black/white point correction"
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         return auto_level(image)
@@ -844,6 +846,7 @@ class LevelPipeline(EditPipeline):
 
 class BrightnessPipeline(EditPipeline):
     name = "brightness"
+    description = "Auto exposure correction (highlight-safe gamma)"
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         return auto_brightness(image)
@@ -851,6 +854,7 @@ class BrightnessPipeline(EditPipeline):
 
 class AiSharpenPipeline(EditPipeline):
     name = "aisharpen"
+    description = "Real-ESRGAN detail restoration (--sharpen-model, --face-enhance)"
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         assert ctx.dispatcher is not None
@@ -859,6 +863,7 @@ class AiSharpenPipeline(EditPipeline):
 
 class OpenAiAutoEditPipeline(EditPipeline):
     name = "openai_autoedit"
+    description = "Generative retouch via the OpenAI image model"
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         height, width = image.shape[:2]
@@ -869,6 +874,7 @@ class OpenAiAutoEditPipeline(EditPipeline):
 
 class OpenAiInstagramPipeline(EditPipeline):
     name = "openai_ig"
+    description = "Generative heroic 4:5 Instagram reframe"
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         log.info("[%s] openai_ig at %dx%d", ctx.source.name, *_IG_REQUEST_SIZE)
@@ -982,7 +988,7 @@ def main() -> None:
         "-pipelines", "--pipelines", nargs="*", default=["all"], metavar="NAME",
         help=(
             "Space-separated pipelines to run: "
-            + ", ".join(PIPELINES_BY_NAME)
+            + "; ".join(f"{name} ({cls.description})" for name, cls in PIPELINES_BY_NAME.items())
             + ". 'all' (default) selects every non-openai pipeline. Unknown names are "
               "warned about and ignored; order is decided by this script, not by you."
         ),

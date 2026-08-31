@@ -57,6 +57,7 @@ from algo.stages.grading import GradingStage
 from algo.stages.image_analysis import ImageAnalysisStage, MediaPipeImageAnalysisStage
 from algo.stages.jersey_counting import JerseyCountingStage
 from algo.stages.llm_culling import LLMCullingStage
+from algo.llm.culling_provider import DEFAULT_OPENAI_MODEL
 from algo.scorers import (
     BodyArrayScorer,
     BodyArrayScorerBase,
@@ -1790,9 +1791,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--llm-model",
-        default="gpt-4o-mini",
+        default=DEFAULT_OPENAI_MODEL,
         metavar="MODEL",
-        help="OpenAI model used for LLM-assisted burst culling (default: gpt-4o-mini).",
+        help=f"OpenAI model used for LLM-assisted burst culling (default: {DEFAULT_OPENAI_MODEL}).",
     )
     parser.add_argument(
         "--skip-llm-cull",

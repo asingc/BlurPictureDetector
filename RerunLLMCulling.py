@@ -45,6 +45,8 @@ from pathlib import Path
 from algo.config import app_config
 from algo.llm.culling_provider import (
     DEFAULT_OPENAI_MODEL,
+    DEFAULT_RPM_LIMIT,
+    DEFAULT_RPM_SAFETY_FACTOR,
     DEFAULT_TPM_LIMIT,
     DEFAULT_TPM_SAFETY_FACTOR,
     OpenAIProvider,
@@ -194,11 +196,13 @@ def main() -> None:
         default=DEFAULT_TPM_LIMIT,
         metavar="N",
         help=(
-            f"Your OpenAI account's tokens-per-minute budget for --model, used to "
+            f"Your OpenAI account's INITIAL tokens-per-minute guess for --model, used to "
             f"throttle concurrent requests so a large batch doesn't instantly trip "
             f"rate limits (default: {DEFAULT_TPM_LIMIT}, a conservative lower-tier "
-            "estimate -- raise it if your account has a higher tier; OpenAI does "
-            "not expose this via any API). Pass 0 to disable throttling."
+            "estimate). This is only a starting point -- the real limit is auto-detected "
+            "and recalibrated from the account's actual x-ratelimit-limit-tokens response "
+            "header the moment the first real API response comes back. Pass 0 to disable "
+            "TPM throttling entirely."
         ),
     )
     parser.add_argument(
@@ -207,12 +211,36 @@ def main() -> None:
         default=DEFAULT_TPM_SAFETY_FACTOR,
         metavar="F",
         help=(
-            f"Fraction of --tpm-limit the rate limiter actually targets "
-            f"(default: {DEFAULT_TPM_SAFETY_FACTOR}, i.e. throttle at "
-            f"{int(DEFAULT_TPM_SAFETY_FACTOR * 100)}% of the budget). Leaves headroom "
-            "below the real limit for token-estimation error and concurrent-request "
-            "timing jitter -- lower this if you still see 429s, raise it (up to 1.0) "
-            "for more throughput once you're confident in the estimate."
+            f"Fraction of the tokens-per-minute limit (initial guess, or the real value "
+            f"once recalibrated) the rate limiter actually targets (default: "
+            f"{DEFAULT_TPM_SAFETY_FACTOR}, i.e. throttle at {int(DEFAULT_TPM_SAFETY_FACTOR * 100)}% "
+            "of the budget). Leaves headroom for token-estimation error and concurrent-request "
+            "timing jitter -- lower this if you still see 429s, raise it (up to 1.0) for more "
+            "throughput once you're confident in the estimate."
+        ),
+    )
+    parser.add_argument(
+        "--rpm-limit",
+        type=int,
+        default=DEFAULT_RPM_LIMIT,
+        metavar="N",
+        help=(
+            f"Your OpenAI account's INITIAL requests-per-minute guess for --model "
+            f"(default: {DEFAULT_RPM_LIMIT}, a conservative lower-tier estimate). Same "
+            "auto-recalibration behaviour as --tpm-limit, from the x-ratelimit-limit-requests "
+            "response header. Pass 0 to disable RPM throttling entirely."
+        ),
+    )
+    parser.add_argument(
+        "--rpm-safety-factor",
+        type=float,
+        default=DEFAULT_RPM_SAFETY_FACTOR,
+        metavar="F",
+        help=(
+            f"Fraction of the requests-per-minute limit the rate limiter actually targets "
+            f"(default: {DEFAULT_RPM_SAFETY_FACTOR}, i.e. throttle at "
+            f"{int(DEFAULT_RPM_SAFETY_FACTOR * 100)}% of the budget). Same rationale as "
+            "--tpm-safety-factor."
         ),
     )
     args = parser.parse_args()
@@ -275,6 +303,8 @@ def main() -> None:
         model=model,
         tokens_per_minute=args.tpm_limit,
         tpm_safety_factor=args.tpm_safety_factor,
+        requests_per_minute=args.rpm_limit,
+        rpm_safety_factor=args.rpm_safety_factor,
     )
 
     stage = LLMCullingStage(
