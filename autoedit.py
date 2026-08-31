@@ -16,7 +16,9 @@ Usage:
 Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     level            Auto black/white point correction.
     brightness       Auto exposure correction (highlight-safe gamma).
-    aisharpen        Real-ESRGAN + GFPGAN detail restoration at input resolution.
+    aisharpen        Real-ESRGAN (realesr-general-x4v3, compact) detail
+                     restoration at input resolution. Optional GFPGAN
+                     face-enhance pass via --face-enhance (off by default).
     openai_autoedit  Generative retouch via the OpenAI image model.
     openai_ig        Generative heroic 4:5 Instagram reframe.
 
@@ -51,8 +53,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# facexlib (a GFPGAN dependency) still loads its ResNet50 backbone via
-# torchvision's old pretrained=True API -- harmless noise on every run.
+# facexlib (a GFPGAN dependency, only imported when --face-enhance is used)
+# still loads its ResNet50 backbone via torchvision's old pretrained=True API.
 warnings.filterwarnings("ignore", message=r".*'pretrained'.*deprecated.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=r".*for 'weights' are deprecated.*", category=UserWarning)
 
@@ -105,19 +107,66 @@ _BRIGHTNESS_MAX_GAMMA = 2.20
 # AI sharpening
 # ---------------------------------------------------------------------------
 
-_REALESRGAN_MODEL_NAME = "RealESRGAN_x4plus.pth"
-_REALESRGAN_MODEL_URL = (
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-)
+@dataclass(frozen=True)
+class SharpenModelSpec:
+    """One selectable Real-ESRGAN checkpoint + the net architecture it needs."""
+
+    key: str
+    label: str
+    model_name: str
+    model_url: str
+    kind: str  # "compact" (SRVGGNetCompact) or "rrdbnet" (RRDBNet)
+    num_feat: int = 64
+    num_conv: int = 32     # compact only
+    num_block: int = 23    # rrdbnet only
+    num_grow_ch: int = 32  # rrdbnet only
+
+
+# Two switchable models for A/B testing (-sharpen-model), both restoring detail
+# at outscale=1 (no resolution change):
+# - "compact" (default): realesr-general-x4v3, SRVGGNetCompact — a fraction of
+#   x4plus's size/VRAM/compute, meant for general photo restoration.
+# - "x4plus": the original RealESRGAN_x4plus RRDBNet (23 residual blocks) —
+#   much heavier but restores more/stronger detail; also used by esrsharpen.py.
+SHARPEN_MODELS: dict[str, SharpenModelSpec] = {
+    "compact": SharpenModelSpec(
+        key="compact", label="realesr-general-x4v3 (compact)",
+        model_name="realesr-general-x4v3.pth",
+        model_url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        kind="compact", num_feat=64, num_conv=32,
+    ),
+    "x4plus": SharpenModelSpec(
+        key="x4plus", label="RealESRGAN_x4plus (RRDBNet)",
+        model_name="RealESRGAN_x4plus.pth",
+        model_url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        kind="rrdbnet", num_feat=64, num_block=23, num_grow_ch=32,
+    ),
+}
+DEFAULT_SHARPEN_MODEL = "x4plus"
+
+# Peak-VRAM-per-output-pixel at tile=0/half precision, measured on a real GPU
+# (Titan V) across 512-1600px square images: compact ~407-494 B/px, rrdbnet
+# ~6970-7015 B/px (both stable once the fixed CUDA/model overhead amortizes).
+# Padded up for safety margin/other GPUs' larger fixed overhead.
+_VRAM_BYTES_PER_PIXEL: dict[str, int] = {"compact": 700, "rrdbnet": 9000}
+# Only budget this fraction of currently-free VRAM for a tile, leaving
+# headroom for allocator fragmentation and the next job's ramp-up.
+_VRAM_SAFETY_FACTOR = 0.7
+_TILE_MIN_PX = 256
+_TILE_MAX_PX = 2048
+
+# CPU has no cheap equivalent of torch.cuda.mem_get_info, so it keeps the old
+# fixed-threshold behaviour: above this long edge, tile at a safe fixed size.
+_AUTO_TILE_THRESHOLD_PX = 1600
+_AUTO_TILE_SIZE_PX = 512
+
+# Optional GFPGAN face-restoration pass (--face-enhance, off by default),
+# same checkpoint esrsharpen.py already downloads.
 _GFPGAN_MODEL_NAME = "GFPGANv1.4.pth"
 _GFPGAN_MODEL_URL = (
     "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth"
 )
 
-# Above this long edge the 4x super-resolution pass is tiled so it can't
-# allocate one enormous intermediate tensor and OOM a modest GPU.
-_AUTO_TILE_THRESHOLD_PX = 1600
-_AUTO_TILE_SIZE_PX = 512
 
 # ---------------------------------------------------------------------------
 # OpenAI image model
@@ -389,7 +438,7 @@ def auto_brightness(image: np.ndarray) -> np.ndarray:
 def _patch_basicsr_torchvision_compat() -> None:
     """basicsr imports ``torchvision.transforms.functional_tensor``, removed in
     torchvision >= 0.17 (this repo pins 0.17.2). Must run before ANY
-    basicsr/realesrgan/gfpgan import."""
+    basicsr/realesrgan import."""
     try:
         import torchvision.transforms.functional_tensor  # noqa: F401
         return
@@ -401,21 +450,53 @@ def _patch_basicsr_torchvision_compat() -> None:
     sys.modules["torchvision.transforms.functional_tensor"] = shim
 
 
-def _ensure_sharpen_weights() -> tuple[str, str]:
-    """Download both model files up front, on one thread, so parallel
+def _ensure_sharpen_weights(spec: SharpenModelSpec) -> str:
+    """Download *spec*'s weight file up front, on one thread, so parallel
     processors can't race each other into a half-written checkpoint."""
     _patch_basicsr_torchvision_compat()
     from basicsr.utils.download_util import load_file_from_url
 
-    def fetch(name: str, url: str) -> str:
-        return load_file_from_url(
-            url=url, model_dir=str(_REPO_ROOT), progress=True, file_name=name
-        )
-
-    return (
-        fetch(_REALESRGAN_MODEL_NAME, _REALESRGAN_MODEL_URL),
-        fetch(_GFPGAN_MODEL_NAME, _GFPGAN_MODEL_URL),
+    return load_file_from_url(
+        url=spec.model_url, model_dir=str(_REPO_ROOT), progress=True,
+        file_name=spec.model_name,
     )
+
+
+def _ensure_gfpgan_weights() -> str:
+    """Download the GFPGAN checkpoint up front (--face-enhance only)."""
+    _patch_basicsr_torchvision_compat()
+    from basicsr.utils.download_util import load_file_from_url
+
+    return load_file_from_url(
+        url=_GFPGAN_MODEL_URL, model_dir=str(_REPO_ROOT), progress=True,
+        file_name=_GFPGAN_MODEL_NAME,
+    )
+
+
+def _pick_tile_size(image: np.ndarray, device: str, spec: SharpenModelSpec) -> int:
+    """Return the RealESRGANer tile size to use for *image* on *device*.
+
+    GPU: sized from CURRENTLY FREE VRAM (queried live, so it adapts to other
+    processes/jobs sharing the card) rather than a fixed pixel threshold — a
+    whole image is processed in one shot (tile=0, fastest, no tile seams)
+    whenever it fits the VRAM budget, only falling back to the largest tile
+    that does fit otherwise. CPU has no cheap equivalent of
+    torch.cuda.mem_get_info, so it keeps the old fixed-threshold behaviour.
+    """
+    h, w = image.shape[:2]
+    if not device.startswith("cuda"):
+        long_edge = max(h, w)
+        return _AUTO_TILE_SIZE_PX if long_edge > _AUTO_TILE_THRESHOLD_PX else 0
+
+    import torch
+    free_bytes, _total = torch.cuda.mem_get_info(device)
+    budget = free_bytes * _VRAM_SAFETY_FACTOR
+    bytes_per_px = _VRAM_BYTES_PER_PIXEL[spec.kind]
+    if w * h * bytes_per_px <= budget:
+        return 0
+    tile_edge = int((budget / bytes_per_px) ** 0.5)
+    tile_edge = max(_TILE_MIN_PX, min(_TILE_MAX_PX, tile_edge))
+    return tile_edge - (tile_edge % 32)
 
 
 class SharpenProcessor(ABC):
@@ -437,22 +518,27 @@ class SharpenProcessor(ABC):
 
 
 class LocalSharpenProcessor(SharpenProcessor):
-    """Real-ESRGAN + GFPGAN pinned to one local device.
+    """Real-ESRGAN, optionally with a GFPGAN face-enhance pass, pinned to one
+    local device.
 
     Models are built lazily and are never shared with another processor, which
     is what makes inference thread-safe without locking.
     """
 
-    # Construction is serialised across processors: GFPGAN pulls facexlib's
-    # detector/parser weights into ./gfpgan/weights on first use, and two
-    # processors building at once race into a half-written checkpoint.
+    # Construction is serialised across processors so two processors building
+    # at once can't race into a half-written checkpoint read.
     _build_lock = threading.Lock()
 
-    def __init__(self, device: str, realesrgan_path: str, gfpgan_path: str) -> None:
+    def __init__(
+        self, device: str, realesrgan_path: str, spec: SharpenModelSpec,
+        gfpgan_path: str | None = None,
+    ) -> None:
         self._device = device
         self._realesrgan_path = realesrgan_path
+        self._spec = spec
         self._gfpgan_path = gfpgan_path
-        self._enhancer = None
+        self._upsampler = None
+        self._face_enhancer = None
 
     @property
     def label(self) -> str:
@@ -460,14 +546,22 @@ class LocalSharpenProcessor(SharpenProcessor):
 
     def _build(self):
         import torch
-        from basicsr.archs.rrdbnet_arch import RRDBNet
-        from gfpgan import GFPGANer
         from realesrgan import RealESRGANer
 
         device = torch.device(self._device)
-        net = RRDBNet(
-            num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4
-        )
+        spec = self._spec
+        if spec.kind == "compact":
+            from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+            net = SRVGGNetCompact(
+                num_in_ch=3, num_out_ch=3, num_feat=spec.num_feat,
+                num_conv=spec.num_conv, upscale=4, act_type="prelu",
+            )
+        else:
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            net = RRDBNet(
+                num_in_ch=3, num_out_ch=3, num_feat=spec.num_feat,
+                num_block=spec.num_block, num_grow_ch=spec.num_grow_ch, scale=4,
+            )
         upsampler = RealESRGANer(
             scale=4,
             model_path=self._realesrgan_path,
@@ -478,7 +572,11 @@ class LocalSharpenProcessor(SharpenProcessor):
             half=self._device.startswith("cuda"),
             device=device,
         )
-        return GFPGANer(
+        if self._gfpgan_path is None:
+            return upsampler, None
+
+        from gfpgan import GFPGANer
+        face_enhancer = GFPGANer(
             model_path=self._gfpgan_path,
             upscale=1,
             arch="clean",
@@ -486,21 +584,28 @@ class LocalSharpenProcessor(SharpenProcessor):
             bg_upsampler=upsampler,
             device=device,
         )
+        return upsampler, face_enhancer
 
     def process(self, image: np.ndarray) -> np.ndarray:
-        if self._enhancer is None:
+        if self._upsampler is None:
             with LocalSharpenProcessor._build_lock:
-                if self._enhancer is None:
-                    log.info("[%s] loading Real-ESRGAN + GFPGAN …", self._device)
-                    self._enhancer = self._build()
+                if self._upsampler is None:
+                    log.info("[%s] loading Real-ESRGAN (%s)%s …",
+                             self._device, self._spec.label,
+                             " + GFPGAN face-enhance" if self._gfpgan_path else "")
+                    self._upsampler, self._face_enhancer = self._build()
 
-        long_edge = max(image.shape[0], image.shape[1])
-        self._enhancer.bg_upsampler.tile = (
-            _AUTO_TILE_SIZE_PX if long_edge > _AUTO_TILE_THRESHOLD_PX else 0
-        )
-        _, _, output = self._enhancer.enhance(
-            image, has_aligned=False, only_center_face=False, paste_back=True
-        )
+        # RealESRGANer's tiling knob is `tile_size`, not `tile` (its constructor
+        # arg is named `tile` but stores it as `self.tile_size`) -- setting the
+        # wrong attribute here would silently no-op and always process the
+        # whole image untiled, regardless of size.
+        self._upsampler.tile_size = _pick_tile_size(image, self._device, self._spec)
+        if self._face_enhancer is not None:
+            _, _, output = self._face_enhancer.enhance(
+                image, has_aligned=False, only_center_face=False, paste_back=True
+            )
+        else:
+            output, _ = self._upsampler.enhance(image, outscale=1)
         if output.shape[:2] != image.shape[:2]:
             # outscale=1 should already guarantee this; resize defensively so a
             # library-version quirk can never silently change dimensions.
@@ -531,7 +636,11 @@ class SharpenDispatcher:
 
     _CPU_POLL_SECONDS = 0.05
 
-    def __init__(self) -> None:
+    def __init__(
+        self, model_spec: SharpenModelSpec | None = None, face_enhance: bool = False,
+    ) -> None:
+        self._model_spec = model_spec or SHARPEN_MODELS[DEFAULT_SHARPEN_MODEL]
+        self._face_enhance = face_enhance
         self._queue: queue.Queue[_SharpenJob | None] = queue.Queue()
         self._lock = threading.Lock()
         self._gpu_busy = 0
@@ -540,7 +649,10 @@ class SharpenDispatcher:
         self._stop = threading.Event()
 
     def start(self) -> None:
-        realesrgan_path, gfpgan_path = _ensure_sharpen_weights()
+        log.info("Sharpen model: %s%s", self._model_spec.label,
+                  " + GFPGAN face-enhance" if self._face_enhance else "")
+        realesrgan_path = _ensure_sharpen_weights(self._model_spec)
+        gfpgan_path = _ensure_gfpgan_weights() if self._face_enhance else None
 
         import torch
         self._gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -549,7 +661,7 @@ class SharpenDispatcher:
             device = f"cuda:{index}"
             log.info("Sharpen processor: %s (%s)", device, torch.cuda.get_device_name(index))
             self._spawn(
-                LocalSharpenProcessor(device, realesrgan_path, gfpgan_path),
+                LocalSharpenProcessor(device, realesrgan_path, self._model_spec, gfpgan_path),
                 self._gpu_loop,
                 f"sharpen-{device}",
             )
@@ -559,7 +671,7 @@ class SharpenDispatcher:
             "sole worker" if self._gpu_count == 0 else "spillover only",
         )
         self._spawn(
-            LocalSharpenProcessor("cpu", realesrgan_path, gfpgan_path),
+            LocalSharpenProcessor("cpu", realesrgan_path, self._model_spec, gfpgan_path),
             self._cpu_loop,
             "sharpen-cpu",
         )
@@ -804,8 +916,19 @@ def resolve_pipelines(tokens: list[str]) -> list[EditPipeline]:
 # ---------------------------------------------------------------------------
 
 def output_path_for(source: Path, output_dir: Path, ext: str) -> Path:
+    """Timestamped auto-name for *source*'s output, disambiguated with a
+    '_n' suffix (first available n, starting at 1) if that exact path is
+    already taken — e.g. two sources sharing a stem processed in the same
+    second. An explicit --out-file path bypasses this entirely and always
+    overwrites (handled by the caller/write_image)."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_dir / f"{source.stem}_processed_{stamp}.{ext}"
+    base = f"{source.stem}_processed_{stamp}"
+    candidate = output_dir / f"{base}.{ext}"
+    n = 1
+    while candidate.exists():
+        candidate = output_dir / f"{base}_{n}.{ext}"
+        n += 1
+    return candidate
 
 
 def process_one(
@@ -892,8 +1015,23 @@ def main() -> None:
         help=(
             "Exact output file path, overriding -o/-ext's timestamped naming. Only valid "
             "with a single input image. May equal inputPath to overwrite it in place "
-            "(re-editing an already-edited image)."
+            "(re-editing an already-edited image). If this path already exists it is "
+            "overwritten; auto-named output (no --out-file) instead gets a '_n' suffix."
         ),
+    )
+    parser.add_argument(
+        "--sharpen-model", choices=sorted(SHARPEN_MODELS), default=DEFAULT_SHARPEN_MODEL,
+        metavar="NAME",
+        help=(
+            "Real-ESRGAN checkpoint used by the aisharpen pipeline, to A/B test detail "
+            f"restoration strength (default: {DEFAULT_SHARPEN_MODEL}). Choices: "
+            + ", ".join(f"{k} ({v.label})" for k, v in SHARPEN_MODELS.items())
+        ),
+    )
+    parser.add_argument(
+        "--face-enhance", action="store_true",
+        help="Run a GFPGAN face-restoration pass after Real-ESRGAN in the aisharpen "
+             "pipeline (off by default).",
     )
     args = parser.parse_args()
 
@@ -930,7 +1068,7 @@ def main() -> None:
 
     dispatcher = None
     if any(p.name == "aisharpen" for p in pipelines):
-        dispatcher = SharpenDispatcher()
+        dispatcher = SharpenDispatcher(SHARPEN_MODELS[args.sharpen_model], args.face_enhance)
         dispatcher.start()
 
     log.info(
