@@ -27,8 +27,8 @@ const categoryData = {};
 // keep/drop map to track.
 const pendingStarOverrides = {};
 
-function reviewThumbUrl(category, anno) {
-  return `/api/review/thumb?category=${encodeURIComponent(category)}&file=${encodeURIComponent(anno)}`;
+function reviewThumbUrl(anno) {
+  return `/api/review/thumb/${encodeURIComponent(anno)}`;
 }
 
 // Full-resolution images for the large main preview pane, toggled between
@@ -38,7 +38,7 @@ function annoImgUrl(anno) {
   return `/api/anno_img?file=${encodeURIComponent(anno)}`;
 }
 function originalImgUrl(file) {
-  return `/api/original?file=${encodeURIComponent(file)}`;
+  return `/api/original/${encodeURIComponent(file)}`;
 }
 
 // Main-pane view mode ("anno" | "original"), toggled page-wide by the 'x'
@@ -61,13 +61,26 @@ function toggleViewMode() {
 // targets whatever's actually on screen.
 let lastActiveImage = null;
 
-// Initial active image within a group when it's first loaded/navigated to:
-// the first image at or above the baseline "keep" star tier (3+), same as
-// the star-driven color scheme used everywhere else on this page.
-function firstKeepIndex(group) {
+// Image auto-selected whenever a burst sequence is *entered* (w/s, arrow
+// up/down, or clicking a nav row): the first of its best-rated images,
+// ranked the same way as the server's "rating" sort mode — stars desc, then
+// llmGrade desc, with a missing grade ranking lowest. Strict comparisons
+// keep the earliest image on a tie. Sequential a/d navigation deliberately
+// does NOT use this, so stepping across a burst boundary lands on the
+// adjacent image the way a human reading through the roll would expect.
+function bestIndex(group) {
   if (!group || !group.images.length) return 0;
-  const idx = group.images.findIndex((im) => (im.stars || 3) >= 3);
-  return idx >= 0 ? idx : 0;
+  const grade = (im) => (typeof im.llmGrade === "number" ? im.llmGrade : -1);
+  let best = 0;
+  group.images.forEach((im, i) => {
+    const bestIm = group.images[best];
+    const stars = im.stars || 3;
+    const bestStars = bestIm.stars || 3;
+    if (stars > bestStars || (stars === bestStars && grade(im) > grade(bestIm))) {
+      best = i;
+    }
+  });
+  return best;
 }
 
 // ------------------------------------------------------------------ //
@@ -127,7 +140,7 @@ async function fetchCategory(category) {
   categoryData[category] = {
     groups: data.groups,
     activeGroup: 0,
-    activeImage: firstKeepIndex(data.groups[0]),
+    activeImage: bestIndex(data.groups[0]),
   };
 }
 
@@ -152,7 +165,7 @@ function renderNav() {
     });
     $row.on("click", () => {
       data.activeGroup = gi;
-      data.activeImage = firstKeepIndex(group);
+      data.activeImage = bestIndex(group);
       renderNav();
       renderMain();
     });
@@ -343,7 +356,7 @@ function renderMain() {
   group.images.forEach((im, i) => {
     const $thumb = $("<div>", { class: "review-strip-thumb" }).toggleClass("active", i === data.activeImage);
     const $imgWrap = $("<div>", { class: "review-strip-img-wrap" });
-    $imgWrap.append($("<img>", { src: reviewThumbUrl(currentCategory, im.anno), alt: im.file }));
+    $imgWrap.append($("<img>", { src: reviewThumbUrl(im.anno), alt: im.file }));
     if (im.burstRanking) {
       $imgWrap.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
       $thumb.attr("title", "#" + im.burstRanking.rank + ": " + (im.burstRanking.reason || ""));
@@ -415,7 +428,7 @@ $(document).on("keydown", (e) => {
     case "w":
       if (data.activeGroup > 0) {
         data.activeGroup--;
-        data.activeImage = firstKeepIndex(data.groups[data.activeGroup]);
+        data.activeImage = bestIndex(data.groups[data.activeGroup]);
         renderNav();
         renderMain();
       }
@@ -423,7 +436,7 @@ $(document).on("keydown", (e) => {
     case "s":
       if (data.activeGroup < data.groups.length - 1) {
         data.activeGroup++;
-        data.activeImage = firstKeepIndex(data.groups[data.activeGroup]);
+        data.activeImage = bestIndex(data.groups[data.activeGroup]);
         renderNav();
         renderMain();
       }

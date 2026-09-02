@@ -1075,6 +1075,14 @@ body.image-window-open { overflow: hidden; }
 }
 .image-window-close:hover { background: rgba(255, 255, 255, 0.3); }
 
+/* jQuery UI stacks its modals at z-index 100 by default, which is *below*
+ * the image window above — the AI-edit dialog opened from the cluster
+ * page's preview would render behind it. Lift the whole jQuery UI layer
+ * (overlay < dialog < autocomplete) above the image window instead. */
+.ui-widget-overlay.ui-front { z-index: 1100; }
+.ui-dialog.ui-front { z-index: 1101; }
+.ui-autocomplete.ui-front { z-index: 1102; }
+
 .image-window-toolbar {
   display: flex;
   align-items: center;
@@ -1100,7 +1108,7 @@ input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255,
  * viewport rules above, with two equally sized panes driven by a single
  * shared zoom controller (static/js/viewport.js::showCompareWindow).
  * ------------------------------------------------------------------ */
-.compare-window-backdrop { gap: 10px; }
+.compare-window-backdrop { gap: 10px; z-index: 1200; }
 .compare-window-title {
   color: #fff;
   font-size: 14px;

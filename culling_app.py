@@ -50,7 +50,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
-from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, atomic_save_and_backup, load_album_source_index
+from algo.album import album_for
+from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR
 
 try:
     from PIL import Image as _PILImage
@@ -72,7 +73,10 @@ OUTPUT_DIR = REPO_ROOT / "albums"
 # sharpness-evaluator swap to WeightedGeometricMeanEvaluator (algo/sharpness.py)
 # so "high" sensitivity keeps the same recall (~0.63) the old evaluator
 # achieved at its old 0.70 threshold — see _setup_tmp/sharpness_eval/calibrate_high_threshold.py.
-SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.35, "medium": 0.50, "high": 0.68}
+# Recalibrated again 2026-08-31 (low 0.35 -> 0.40, high 0.68 -> 0.62) alongside
+# the swap to ContrastNormalizedEvaluator, on the same recall-preserving basis.
+# Must stay in sync with 1_prep_review.py's SENSITIVITY_THRESHOLDS.
+SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.40, "medium": 0.50, "high": 0.62}
 
 # Folder-name candidates for a face-DB dir, mirroring 1_prep_review.py / face_tag_ui.py.
 FACE_DB_DIR_CANDIDATES: tuple[str, ...] = (".FaceReco", ".facereco", ".Facereco")
@@ -474,12 +478,7 @@ def _album_team_id(album_dir: Path) -> str:
     server-side by 1_prep_review.py's merge-mode — this is only needed
     because the API key itself is intentionally never persisted into
     album.json/run_settings)."""
-    try:
-        with open(album_dir / "album.json", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        return payload.get("team_id") or ""
-    except (json.JSONDecodeError, OSError):
-        return ""
+    return album_for(album_dir).team_id
 
 
 def _run_import_more(path: str, album_dir: Path) -> None:
@@ -585,8 +584,8 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
     until they explicitly accept the result (see api_ai_edit_accept()).
     Raises HTTPException if neither the entry nor a readable source is found.
     """
-    payload = _load_results_payload(album_dir)
-    entry = _results_by_filename(payload).get(key)
+    album = album_for(album_dir)
+    entry = album.entry(key)
     if entry is None:
         raise HTTPException(status_code=404, detail="Image not found in album")
 
@@ -601,8 +600,7 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
         if candidate.is_file():
             return candidate, pending, final
 
-    index = load_album_source_index(album_dir / "album.json")
-    src = index.get(key) or entry.get("file")
+    src = album.source_index.get(key) or entry.get("file")
     if not src or not Path(src).is_file():
         raise HTTPException(status_code=404, detail="Source image not found on disk")
     return Path(src), pending, final
@@ -922,21 +920,7 @@ def _album_has_facereco(path: Path) -> bool:
 
 
 def _is_album_complete(path: Path) -> bool:
-    """An album is "fully processed" once 1_prep_review.py has written both
-    album.json and info.json - both are always written together (barring a
-    completely empty input folder), regardless of --skip-facereco or whether
-    any blurry images were found. Also requires album.json's own
-    ``import_status`` (see 1_prep_review.py's merge-mode writer) to not be
-    "in_progress" -- an interrupted "import more images" run leaves that flag
-    set so a crashed/partial import isn't mistaken for a finished album."""
-    if not ((path / "album.json").is_file() and (path / "info.json").is_file()):
-        return False
-    try:
-        with open(path / "album.json", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return False
-    return payload.get("import_status", "complete") != "in_progress"
+    return album_for(path).is_complete
 
 
 # How many random sharp-image filenames to hand to the client per album for
@@ -994,7 +978,7 @@ def _read_album_summary(path: Path) -> dict:
         summary["sharpCount"] = len(sharp)
         summary["blurCount"] = len(info.get("Anno_Blur", []))
         summary["skippedCount"] = len(info.get("Anno_Skipped", []))
-        results_by_name = _results_by_filename(_load_results_payload(path))
+        results_by_name = album_for(path).entries
         sharp_previews = []
         for item in sharp:
             result = results_by_name.get(item.get("src"))
@@ -1138,18 +1122,6 @@ def _image_timestamp(path: Path) -> float:
         return 0.0
 
 
-def _load_results_payload(album_path: Path) -> dict:
-    with open(album_path / "album.json", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def _results_by_filename(payload: dict) -> dict[str, dict]:
-    return {
-        (entry.get("key") or Path(entry["file"]).name): entry
-        for entry in payload.get("results", [])
-    }
-
-
 def _review_images(album_path: Path, category: str) -> list[dict]:
     """Per-image metadata for one review category: filename, annotated-preview
     filename, effective star rating, effective keep state (derived from the
@@ -1158,7 +1130,7 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
     src_dir = Path(info.get("SrcDir", ""))
-    results_by_name = _results_by_filename(_load_results_payload(album_path))
+    results_by_name = album_for(album_path).entries
     default_stars = _REVIEW_DEFAULT_STARS[category]
     previews_dir = album_path / _PREVIEWS_SUBDIR
 
@@ -1307,7 +1279,7 @@ def _build_clusters(album_path: Path) -> list[dict]:
     if fr is None:
         return []
 
-    source_index = load_album_source_index(album_path / "album.json")
+    source_index = album_for(album_path).source_index
     pending: list[dict] = []
     matched: list[dict] = []
     for child in sorted(fr.iterdir()):
@@ -1462,18 +1434,15 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
     """
     if not assignments:
         return
-    results_fp = album_path / "album.json"
-    if not results_fp.is_file():
+    album = album_for(album_path)
+    if not album.exists:
         return
-    with open(results_fp, encoding="utf-8") as fh:
-        data = json.load(fh)
 
-    # Index results entries by their disambiguated bookkeeping key (falling
-    # back to basename for older albums written before "key" existed) --
-    # plain basename indexing breaks once two source directories share a
-    # filename (see algo/utils.py::make_unique_import_key).
+    # One key can map to several entries only in malformed albums; keep the
+    # list form so an unexpected duplicate is still updated rather than
+    # silently skipped.
     by_name: dict[str, list[dict]] = {}
-    for entry in data.get("results", []):
+    for entry in album.results:
         key = entry.get("key") or Path(entry.get("file", "")).name
         by_name.setdefault(key, []).append(entry)
 
@@ -1490,7 +1459,7 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
                     changed = True
 
     if changed:
-        atomic_save_and_backup(json.dumps(data, indent=2), results_fp)
+        album.save()
 
 
 def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> dict:
@@ -1999,10 +1968,8 @@ def _ensure_review_thumbnail(src_fp: Path, thumb_fp: Path) -> Path:
         return src_fp
 
 
-@app.get("/api/review/thumb")
-def api_review_thumb(category: str = Query(...), file: str = Query(...)) -> FileResponse:
-    if category not in REVIEW_CATEGORIES:
-        raise HTTPException(status_code=400, detail="Invalid category")
+@app.get("/api/review/thumb/{file:path}")
+def api_review_thumb(file: str) -> FileResponse:
     album_path = _current_album_path()
     safe_file = _safe_component(file)
     fp = album_path / _PREVIEWS_SUBDIR / safe_file
@@ -2036,8 +2003,8 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
-    payload = _load_results_payload(album_path)
-    results_by_name = _results_by_filename(payload)
+    album = album_for(album_path)
+    results_by_name = album.entries
 
     for category in REVIEW_CATEGORIES:
         default_stars = _REVIEW_DEFAULT_STARS[category]
@@ -2059,7 +2026,7 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
             if src_name in req.starOverrides:
                 result["stars_manual"] = True
 
-    atomic_save_and_backup(json.dumps(payload, indent=2), album_path / "album.json")
+    album.save()
     log.info("Review changes applied: %s (%d star overrides)",
              album_path.resolve(), len(req.starOverrides))
     return {"ok": True}
@@ -2292,11 +2259,11 @@ def api_ai_edit_accept() -> dict:
     final_path.parent.mkdir(parents=True, exist_ok=True)
     os.replace(pending["pending_path"], final_path)
     try:
-        payload = _load_results_payload(album_dir)
-        entry = _results_by_filename(payload).get(key)
+        album = album_for(album_dir)
+        entry = album.entry(key)
         if entry is not None:
             entry["edited_image"] = f"{_EDITEDIMAGES_SUBDIR}/{final_path.name}"
-            atomic_save_and_backup(json.dumps(payload, indent=2), album_dir / "album.json")
+            album.save()
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("AI edit accepted but failed to record edited_image for %s: %s", key, exc)
     ai_edit_state.clear(delete_files=True)
@@ -2348,20 +2315,17 @@ def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
     return FileResponse(fp)
 
 
-@app.get("/api/original")
-def api_original(file: str = Query(...)) -> FileResponse:
+@app.get("/api/original/{file:path}")
+def api_original(file: str) -> FileResponse:
     """Original, unmodified source photo for *file* — shared by the cluster
     page's face-crop context view and the review page's anno/original
     toggle (see /api/anno_img for the annotated counterpart)."""
     album_path = _current_album_path()
-    album_json = album_path / "album.json"
-    if album_json.is_file():
-        index = load_album_source_index(album_json)
-        src_path = index.get(file)
-        if src_path:
-            fp = Path(src_path)
-            if fp.is_file():
-                return FileResponse(fp)
+    src_path = album_for(album_path).source_index.get(file)
+    if src_path:
+        fp = Path(src_path)
+        if fp.is_file():
+            return FileResponse(fp)
     # Fall back to the legacy single-SrcDir + basename join for albums
     # written before multi-source-directory import support existed.
     src_dir = _read_album_summary(album_path).get("srcDir")
@@ -2390,8 +2354,8 @@ def api_apply_summary() -> dict:
     kept = len(_kept_image_basenames(album_path))
     clusters = _build_clusters(album_path)
 
-    payload = _load_results_payload(album_path)
-    results = payload.get("results", [])
+    album = album_for(album_path)
+    results = album.results
     star_breakdown = {str(n): 0 for n in range(5, 0, -1)}
     unrated = 0
     for entry in results:
@@ -2402,7 +2366,7 @@ def api_apply_summary() -> dict:
         else:
             unrated += 1
 
-    raw_sensitivity = str((payload.get("run_settings") or {}).get("sensitivity", "medium"))
+    raw_sensitivity = str(album.run_settings.get("sensitivity", "medium"))
     if raw_sensitivity in SENSITIVITY_PRESETS:
         sensitivity_mode, sensitivity_custom_value = raw_sensitivity, 0.50
     else:
@@ -2492,13 +2456,13 @@ def api_jersey_options() -> dict:
     (goalkeeper/alternate kits, which always pass regardless of the team
     colour and so make no sense as the team colour itself)."""
     album_path = _current_album_path()
-    payload = _load_results_payload(album_path)
-    run_settings = payload.get("run_settings") or {}
+    album = album_for(album_path)
+    run_settings = album.run_settings
     team = _resolve_team(_album_team_id(album_path))
     return {
         "options": [jc.color for jc in team.jerseyColors if not jc.forced],
         "current": (run_settings.get("team_color_override") or ""),
-        "detected": payload.get("our_jersey_color") or "",
+        "detected": album.our_jersey_color,
         "noTeam": bool(run_settings.get("noteam")),
     }
 
@@ -2523,8 +2487,7 @@ def api_set_jersey_color(req: JerseyColorRequest) -> dict:
         if export_state.running:
             raise HTTPException(status_code=409, detail="An export is already in progress.")
 
-    payload = _load_results_payload(album_path)
-    run_settings = payload.get("run_settings") or {}
+    run_settings = album_for(album_path).run_settings
     if run_settings.get("noteam"):
         raise HTTPException(
             status_code=400,

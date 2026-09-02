@@ -275,7 +275,7 @@ function renderThumb(cluster, face) {
   });
 
   const thumbUrl = "/api/cluster/thumb/" + encodeURIComponent(cluster.id) + "/" + encodeURIComponent(face.crop);
-  const originalUrl = "/api/original?file=" + encodeURIComponent(face.origFilename);
+  const originalUrl = "/api/original/" + encodeURIComponent(face.origFilename);
 
   const img = $("<img>").attr("data-src", thumbUrl).attr("title", face.origFilename)
     .on("click", (e) => {
