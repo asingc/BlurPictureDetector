@@ -234,6 +234,9 @@ _MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1":      (2.00, 8.00),
     "o4-mini":      (1.10, 4.40),
+    # Verified against https://openai.com/api/pricing/ on 2026-08-31.
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5.6-luna": (0.20, 1.20),
 }
 _DEFAULT_PRICING_PER_MILLION = _MODEL_PRICING_PER_MILLION["gpt-4o-mini"]
 
@@ -316,6 +319,19 @@ _PATCH_BASED_TOKEN_MULTIPLIERS: dict[str, float] = {
     "gpt-4.1-mini": 1.62,
     "gpt-4.1-nano": 2.46,
     "o4-mini":      1.72,
+    "gpt-5.4-mini": 1.2,
+    "gpt-5.6-luna": 1.2,
+}
+# Per-model patch-budget override for models whose "high" (or capped) patch
+# budget differs from the 1536-patch default verified for gpt-4.1-mini/-nano
+# and o4-mini. Per https://developers.openai.com/api/docs/guides/images-vision
+# (fetched 2026-08-31): gpt-5.4-mini's "high"/"auto" detail level and
+# gpt-5.6-luna's "high" detail level (sol/terra/luna have NO patch-budget cap
+# under "auto"/"original" — see OpenAIProvider's image_detail param) both use
+# a 2500-patch budget instead.
+_PATCH_BUDGET_BY_MODEL: dict[str, int] = {
+    "gpt-5.4-mini": 2500,
+    "gpt-5.6-luna": 2500,
 }
 # Typical DSLR aspect ratio (3:2), used when the caller has no real image to
 # measure (e.g. estimating cost before any images have even been listed).
@@ -352,15 +368,16 @@ def _tiles_for_dims(width_px: float, height_px: float) -> tuple[int, int]:
     return math.ceil(width_px / _VISION_TILE_PX), math.ceil(height_px / _VISION_TILE_PX)
 
 
-def _patch_based_tokens(width_px: float, height_px: float, multiplier: float) -> int:
-    """OpenAI's patch-based image tokenization (gpt-4.1-mini/-nano, o4-mini):
-    cover the image in 32x32px patches, shrink proportionally if over the
-    1536-patch budget, then multiply by the model's per-tile multiplier."""
+def _patch_based_tokens(width_px: float, height_px: float, multiplier: float, patch_budget: int = _PATCH_BUDGET) -> int:
+    """OpenAI's patch-based image tokenization (gpt-4.1-mini/-nano, o4-mini,
+    gpt-5.4-mini, gpt-5.6-luna): cover the image in 32x32px patches, shrink
+    proportionally if over the model's patch budget, then multiply by the
+    model's per-tile multiplier."""
     original_patches = math.ceil(width_px / _PATCH_PX) * math.ceil(height_px / _PATCH_PX)
-    if original_patches <= _PATCH_BUDGET:
+    if original_patches <= patch_budget:
         resized_patches = original_patches
     else:
-        shrink = math.sqrt((_PATCH_PX ** 2 * _PATCH_BUDGET) / (width_px * height_px))
+        shrink = math.sqrt((_PATCH_PX ** 2 * patch_budget) / (width_px * height_px))
         shrunk_w, shrunk_h = width_px * shrink, height_px * shrink
         adjusted_shrink = shrink * min(
             math.floor(shrunk_w / _PATCH_PX) / (shrunk_w / _PATCH_PX),
@@ -380,7 +397,8 @@ def estimate_tokens_for_dims(width_px: float, height_px: float, model: str = DEF
     aspect-ratio guess."""
     multiplier = _lookup_prefixed(_PATCH_BASED_TOKEN_MULTIPLIERS, model)
     if multiplier is not None:
-        return _patch_based_tokens(width_px, height_px, multiplier)
+        patch_budget = _lookup_prefixed(_PATCH_BUDGET_BY_MODEL, model) or _PATCH_BUDGET
+        return _patch_based_tokens(width_px, height_px, multiplier, patch_budget)
     params = _lookup_prefixed(_TILE_BASED_TOKEN_PARAMS, model)
     if params is None:
         log.warning(
@@ -560,6 +578,7 @@ class OpenAIProvider(CullingProvider):
         tpm_safety_factor: float = DEFAULT_TPM_SAFETY_FACTOR,
         requests_per_minute: int = DEFAULT_RPM_LIMIT,
         rpm_safety_factor: float = DEFAULT_RPM_SAFETY_FACTOR,
+        image_detail: str | None = None,
     ) -> None:
         super().__init__()
         try:
@@ -571,6 +590,12 @@ class OpenAIProvider(CullingProvider):
         self._client = openai.OpenAI(api_key=api_key, timeout=timeout)
         self.model = model
         self.max_concurrency = max_concurrency
+        # Explicit "detail" level to request for every image_url, e.g.
+        # "high" to force gpt-5.6-luna (which has NO patch-budget cap under
+        # the default "auto"/"original" detail level) into the same capped,
+        # predictable-cost behavior every other model uses. None (default)
+        # omits the field entirely, leaving the API's own default in effect.
+        self._image_detail = image_detail
         self._pricing_per_million = _lookup_pricing(model)
         self._token_limiter = (
             AdaptiveRateLimiter(tokens_per_minute, tpm_safety_factor) if tokens_per_minute > 0 else None
@@ -762,28 +787,26 @@ class OpenAIProvider(CullingProvider):
         cost_usd = (input_tokens / 1_000_000) * price_in + (output_tokens / 1_000_000) * price_out
         self._record_cost(SessionCost(input_tokens=input_tokens, output_tokens=output_tokens, cost_usd=cost_usd))
 
-    @staticmethod
-    def _build_user_content(frames: list[BurstFrameInput], top_n: int) -> list[dict]:
+    def _image_url_content(self, frame: BurstFrameInput) -> dict:
+        image_url: dict = {"url": f"data:image/jpeg;base64,{frame.image_b64}"}
+        if self._image_detail is not None:
+            image_url["detail"] = self._image_detail
+        return {"type": "image_url", "image_url": image_url}
+
+    def _build_user_content(self, frames: list[BurstFrameInput], top_n: int) -> list[dict]:
         content: list[dict] = [
             {"type": "text", "text": prompts.build_user_instructions(frames, top_n)},
         ]
         for i, frame in enumerate(frames):
             content.append({"type": "text", "text": f"Image {i + 1} ({frame.file}):"})
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{frame.image_b64}"},
-            })
+            content.append(self._image_url_content(frame))
         return content
 
-    @staticmethod
-    def _build_grade_user_content(frames: list[BurstFrameInput]) -> list[dict]:
+    def _build_grade_user_content(self, frames: list[BurstFrameInput]) -> list[dict]:
         content: list[dict] = [
             {"type": "text", "text": prompts.build_single_image_grade_instructions(frames)},
         ]
         for i, frame in enumerate(frames):
             content.append({"type": "text", "text": f"Image {i + 1} ({frame.file}):"})
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{frame.image_b64}"},
-            })
+            content.append(self._image_url_content(frame))
         return content
