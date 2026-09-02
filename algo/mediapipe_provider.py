@@ -140,6 +140,10 @@ def load_face_landmarker(num_faces: int = 8):
     Two distinct instances are typically kept alive: one with a high
     ``num_faces`` for full-image detection, and one with ``num_faces=1`` for
     the per-crop landmark-refinement pass used during embedding/alignment.
+
+    Detection confidence comes from
+    ``app_config.face_detection_min_confidence`` (well below MediaPipe's 0.5
+    default — see that setting's rationale).
     """
     if num_faces in _FACE_LANDMARKERS:
         return _FACE_LANDMARKERS[num_faces]
@@ -151,17 +155,19 @@ def load_face_landmarker(num_faces: int = 8):
         from mediapipe.tasks.python import vision as mp_vision
 
         model_path = ensure_face_model()
+        conf = app_config.face_detection_min_confidence
         options = mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=mp_vision.RunningMode.IMAGE,
             num_faces=num_faces,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_face_detection_confidence=conf,
+            min_face_presence_confidence=conf,
+            min_tracking_confidence=conf,
         )
         landmarker = mp_vision.FaceLandmarker.create_from_options(options)
         _FACE_LANDMARKERS[num_faces] = landmarker
-        log.info("MediaPipe Face Landmarker loaded (num_faces=%d)", num_faces)
+        log.info("MediaPipe Face Landmarker loaded (num_faces=%d, min_confidence=%.2f)",
+                 num_faces, conf)
     return landmarker
 
 
@@ -353,12 +359,24 @@ def _face_from_crop(
     if crop.size == 0:
         return None
 
-    result = face_landmarker.detect(_to_mp_image(crop))
+    crop_h, crop_w = crop.shape[:2]
+    # BlazeFace letterboxes its input into a fixed square, so a small head
+    # crop arrives at the network with very few usable pixels.  Upscaling
+    # first measurably improves recall; landmark coordinates come back
+    # normalised to the crop, so the original crop_w/crop_h still map them
+    # back to full-image coordinates.
+    detect_src = crop
+    min_edge = app_config.face_detect_crop_min_long_edge_px
+    long_edge = max(crop_h, crop_w)
+    if min_edge > 0 and 0 < long_edge < min_edge:
+        scale = min_edge / long_edge
+        detect_src = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    result = face_landmarker.detect(_to_mp_image(detect_src))
     if not result.face_landmarks:
         return None
 
     mesh = result.face_landmarks[0]
-    crop_h, crop_w = crop.shape[:2]
     mesh_xs = [lm.x for lm in mesh]
     mesh_ys = [lm.y for lm in mesh]
     face_box = Box(
@@ -369,13 +387,6 @@ def _face_from_crop(
     )
     if face_box.width <= 0 or face_box.height <= 0:
         return None
-
-    if app_config.face_min_size_fraction > 0:
-        face_long = max(face_box.width, face_box.height)
-        if face_long < app_config.face_min_size_fraction:
-            log.debug("[faces:mp] face too small (min=%.3f) — skipped",
-                      app_config.face_min_size_fraction)
-            return None
 
     landmarks = [
         PredictedKeyPoint(
@@ -408,6 +419,121 @@ def _body_scan_tiles(box: Box, image_w: int, image_h: int) -> list[tuple[int, in
     return tiles
 
 
+# ---------------------------------------------------------------------------
+# Pose-keypoint face fallback
+# ---------------------------------------------------------------------------
+#
+# Geometry constants derived from the ArcFace 5-point template that
+# algo/face_crop_embed.py already aligns to (112x112):
+#     L-eye (38.29, 51.69)  R-eye (73.53, 51.50)  nose (56.02, 71.73)
+#     L-mouth (41.55, 92.37)  R-mouth (70.72, 92.20)
+# Everything below is expressed as a multiple of the inter-ocular distance D
+# (= 35.24 px in that template) so it scales with however large the face is.
+_MOUTH_FROM_EYE_ALONG_NOSE = 2.02   # mouth centre = eye centre + 2.02*(nose - eye centre)
+_MOUTH_HALF_WIDTH_D        = 0.41   # half the mouth width, in units of D
+_FACE_BOX_HALF_WIDTH_D     = 1.59   # face bbox half-width, from the landmark centroid
+_FACE_BOX_UP_D             = 2.04   # face bbox extent above the landmark centroid
+_FACE_BOX_DOWN_D           = 1.14   # face bbox extent below the landmark centroid
+
+# Plausibility guards.  The pose model happily reports "confident" eyes and a
+# nose for a head that is turned away or badly cropped, which would otherwise
+# produce a face box sitting on someone's neck, chest or the back of their
+# head.  In the ArcFace template the nose sits 0.57*D off the eye line; a
+# genuine near-frontal view stays well inside this range, whereas a profile or
+# rear view collapses the triangle (ratio -> 0) or scrambles it (ratio -> large).
+_FALLBACK_NOSE_OFFSET_MIN_D = 0.25
+_FALLBACK_NOSE_OFFSET_MAX_D = 1.20
+# The synthesised face must land on the person it belongs to.
+_FALLBACK_MIN_BODY_OVERLAP = 0.85
+
+
+def _face_from_head_keypoints(image: np.ndarray, body: Body) -> Face | None:
+    """Synthesise a :class:`Face` from the pose model's head keypoints.
+
+    BlazeFace is a frontal, close-range detector and silently misses a large
+    fraction of the faces in a sports frame — measured on a real album,
+    only ~56 % of detected bodies got a face even after tuning detection
+    confidence and crop resolution, while the pose model located the head on
+    ~79 % of them.  Rather than discard those bodies as "no matched face"
+    (which is what the photographer sees as "that face is clearly visible"),
+    this reconstructs the standard 5-point face geometry from the nose and
+    eye keypoints, using the same ArcFace template proportions the alignment
+    code already assumes.
+
+    Deliberately conservative: it requires the nose *and both* eyes above
+    ``app_config.face_keypoint_fallback_conf``, a non-degenerate nose/eye
+    triangle, and a resulting face box that actually sits on this body.  A
+    turned-away or badly-cropped head fails one of those and is still
+    correctly reported as having no face.
+
+    Landmark confidences are set to 1.0, matching what the Face Landmarker
+    path reports (see module docstring: MediaPipe exposes no reliable
+    per-landmark occlusion score, so ``face_coverage_min_visible`` is a
+    pass-through under this engine either way).  The pose model's own
+    confidence in the head keypoints is carried on ``Face.confidence``.
+    """
+    if not app_config.face_keypoint_fallback or len(body.keypoints) < 5:
+        return None
+
+    conf_min = app_config.face_keypoint_fallback_conf
+    nose, l_eye, r_eye = body.keypoints[0], body.keypoints[1], body.keypoints[2]
+    if min(nose.confidence, l_eye.confidence, r_eye.confidence) < conf_min:
+        return None
+
+    h, w = image.shape[:2]
+    # Work in pixels so the geometry is not distorted by a non-square frame.
+    def px(kp) -> np.ndarray:
+        return np.array([kp.point.x * w, kp.point.y * h], dtype=np.float64)
+
+    nose_px, l_px, r_px = px(nose), px(l_eye), px(r_eye)
+    eye_centre = (l_px + r_px) / 2.0
+    d = float(np.linalg.norm(r_px - l_px))
+    if d < 2.0:
+        return None
+
+    axis = (r_px - l_px) / d
+    # Perpendicular distance from the nose to the eye line, as a multiple of D.
+    perp = float(abs(np.cross(axis, nose_px - eye_centre))) / d
+    if not (_FALLBACK_NOSE_OFFSET_MIN_D <= perp <= _FALLBACK_NOSE_OFFSET_MAX_D):
+        log.debug("[faces:mp] keypoint fallback rejected: nose offset %.2f*D out of range", perp)
+        return None
+
+    mouth_centre = eye_centre + (nose_px - eye_centre) * _MOUTH_FROM_EYE_ALONG_NOSE
+    mouth_offset = axis * (_MOUTH_HALF_WIDTH_D * d)
+    lm_px = [l_px, r_px, nose_px, mouth_centre - mouth_offset, mouth_centre + mouth_offset]
+
+    centroid = np.mean(lm_px, axis=0)
+    raw = Box(
+        (centroid[0] - _FACE_BOX_HALF_WIDTH_D * d) / w,
+        (centroid[1] - _FACE_BOX_UP_D * d) / h,
+        (centroid[0] + _FACE_BOX_HALF_WIDTH_D * d) / w,
+        (centroid[1] + _FACE_BOX_DOWN_D * d) / h,
+    )
+    if raw.area <= 0:
+        return None
+
+    # The face must belong to this body: reject boxes drifting off it (a sign
+    # the pose model latched onto the wrong person or hallucinated the head).
+    bb = body.bbox
+    ox = max(0.0, min(raw.x2, bb.x2) - max(raw.x1, bb.x1))
+    oy = max(0.0, min(raw.y2, bb.y2) - max(raw.y1, bb.y1))
+    if (ox * oy) / raw.area < _FALLBACK_MIN_BODY_OVERLAP:
+        log.debug("[faces:mp] keypoint fallback rejected: face box only %.0f%% inside the body box",
+                  100 * (ox * oy) / raw.area)
+        return None
+
+    face_box = Box(max(0.0, raw.x1), max(0.0, raw.y1), min(1.0, raw.x2), min(1.0, raw.y2))
+    if face_box.width <= 0 or face_box.height <= 0:
+        return None
+
+    landmarks = [
+        PredictedKeyPoint(Point.from_px(float(p[0]), float(p[1]), w, h), 1.0)
+        for p in lm_px
+    ]
+    confidence = float(np.mean([nose.confidence, l_eye.confidence, r_eye.confidence]))
+    return Face(bbox=face_box, confidence=confidence, landmarks=landmarks)
+
+
 def detect_face_for_body_mp(
     image: np.ndarray,
     body: Body,
@@ -422,6 +548,10 @@ def detect_face_for_body_mp(
     head-region estimate) when fewer than 2 head keypoints are confident —
     this happens when the hybrid engine's per-crop pose refinement fails to
     find a pose at all, in which case ``body.keypoints`` is empty.
+
+    If the Face Landmarker still finds nothing anywhere, but the pose model
+    *does* confidently see the nose and an eye, the face is reconstructed
+    from those keypoints (see :func:`_face_from_head_keypoints`).
 
     *face_landmarker* should be a ``num_faces=1`` instance (see
     :func:`load_face_landmarker`).
@@ -442,19 +572,22 @@ def detect_face_for_body_mp(
     cy1 = max(0, int((y1 - pad_y) * h))
     cx2 = min(w, int((x2 + pad_x) * w))
     cy2 = min(h, int((y2 + pad_y) * h))
-    if cx2 <= cx1 or cy2 <= cy1:
-        return None
-
-    face = _face_from_crop(image, (cx1, cy1, cx2, cy2), face_landmarker)
-    if face is not None:
-        return face
-
-    for tile in _body_scan_tiles(scan_box or body.bbox, w, h):
-        face = _face_from_crop(image, tile, face_landmarker)
+    if cx2 > cx1 and cy2 > cy1:
+        face = _face_from_crop(image, (cx1, cy1, cx2, cy2), face_landmarker)
         if face is not None:
-            log.debug("[faces:mp] pose-guided crop missed; body scan recovered face")
             return face
-    return None
+
+        for tile in _body_scan_tiles(scan_box or body.bbox, w, h):
+            face = _face_from_crop(image, tile, face_landmarker)
+            if face is not None:
+                log.debug("[faces:mp] pose-guided crop missed; body scan recovered face")
+                return face
+
+    face = _face_from_head_keypoints(image, body)
+    if face is not None:
+        log.debug("[faces:mp] face landmarker missed; reconstructed face from pose keypoints "
+                  "(conf=%.3f)", face.confidence)
+    return face
 
 
 # ---------------------------------------------------------------------------

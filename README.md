@@ -334,6 +334,13 @@ landmarks) is effectively a pass-through under `--engine mediapipe`.
 | `use_narrow_face_box` | `True` | Score and annotate on the minimal landmark bbox rather than the full face detection bbox |
 | `face_min_size_fraction` | `0.025` | Discard faces whose long edge is < 2.5 % of the image long edge |
 | `face_crop_min_long_edge_px` / `face_crop_max_long_edge_px` | `96` / `96` | Normalize every face crop's long edge to this pixel range (up *and* down) before sharpness scoring, removing scale-dependence from the Laplacian/Tenengrad metrics |
+| `sharpness_contrast_normalize` | `True` | Rescale each face crop to a fixed contrast before sharpness scoring, so dark skin tones / underexposed subjects aren't penalised by the absolute-contrast metrics |
+| `sharpness_contrast_reference` | `40.0` | Target standard deviation each crop is rescaled to |
+| `sharpness_contrast_min_gain` / `sharpness_contrast_max_gain` | `0.5` / `4.0` | Clamp on that rescaling gain, guarding against noise amplification in near-flat crops |
+| `face_detection_min_confidence` | `0.1` | MediaPipe Face Landmarker detection confidence. Low on purpose — it only ever sees an already-localised head crop |
+| `face_detect_crop_min_long_edge_px` | `256` | Upscale head crops smaller than this before face detection |
+| `face_keypoint_fallback` | `True` | Reconstruct a face from the pose model's nose/eye keypoints when the face detector finds nothing |
+| `face_keypoint_fallback_conf` | `0.5` | Pose-keypoint confidence required to use that fallback |
 | `face_coverage_min_visible` | `2` | Require this many of 5 face landmarks to be confident |
 | `normalized_img_max_long_edge` | `1800` | Downscale input to this long edge before processing (never upscales) |
 | `annotation_alpha` | `0.25` | Annotation translucency (0 = invisible, 1 = opaque) |

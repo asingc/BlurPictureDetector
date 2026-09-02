@@ -134,10 +134,15 @@ IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
 # variable/native crop size achieved at its old threshold — see
 # culling_app.py's SENSITIVITY_PRESETS and
 # _setup_tmp/sharpness_eval/calibrate_96px_thresholds.py.
+#
+# Recalibrated again 2026-08-31 (low 0.35->0.40, high 0.68->0.62; medium
+# unchanged) alongside the swap to ContrastNormalizedEvaluator, which shifts
+# the score scale slightly.  Each threshold was re-picked to preserve the
+# recall the previous evaluator achieved at its old threshold.
 SENSITIVITY_THRESHOLDS: dict[str, float] = {
-    "low":    0.35,
+    "low":    0.40,
     "medium": 0.50,
-    "high":   0.68,
+    "high":   0.62,
 }
 
 # Album folder names are "<timestamp>-<input stem>" (see _build_album_dir_name)

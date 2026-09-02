@@ -33,6 +33,35 @@ class AppConfig:
     # Set to 0 to disable.
     face_min_size_fraction: float = 0.025
 
+    # Detection confidence for MediaPipe's Face Landmarker.
+    # This is deliberately far below MediaPipe's 0.5 default because the
+    # landmarker is never run on a whole frame — it only ever sees a crop that
+    # a person detector plus pose keypoints have already localised to a head
+    # region, so a low-confidence detection there is still overwhelmingly
+    # likely to be that person's face.  Measured on a real album sample
+    # (99 bodies): per-body face recall 39.4 % at 0.5, 44.4 % at 0.3,
+    # 51.5 % at 0.1.
+    face_detection_min_confidence: float = 0.1
+
+    # Head crops smaller than this are upscaled before being handed to the
+    # Face Landmarker.  BlazeFace letterboxes its input to a fixed square, so
+    # a small, non-square head crop loses a lot of its usable resolution;
+    # upscaling first recovered another ~3 pp of per-body face recall in the
+    # same measurement.  Set to 0 to disable.
+    face_detect_crop_min_long_edge_px: int = 256
+
+    # When the Face Landmarker finds nothing in a body's head region but the
+    # pose model *does* see the face (nose and both eyes confidently located,
+    # forming a plausible near-frontal triangle), synthesise a face from those
+    # keypoints rather than discarding the body as "no matched face".
+    # BlazeFace is a frontal, close-range detector and silently misses many
+    # faces that are plainly visible in sports frames; the pose model's head
+    # keypoints are far more robust.
+    face_keypoint_fallback: bool = True
+    # Per-keypoint confidence required before a pose head keypoint may be used
+    # to synthesise a face.
+    face_keypoint_fallback_conf: float = 0.6
+
     # If True, sharpness is scored on the minimal bbox enclosing the 5 face
     # landmarks rather than the face model's full detection bbox.
     # Falls back to the full bbox when fewer than 2 landmarks are detected.
@@ -46,6 +75,28 @@ class AppConfig:
     # removing the scale-dependence of Laplacian/Tenengrad sharpness metrics.
     face_crop_min_long_edge_px: int = 96
     face_crop_max_long_edge_px: int = 96
+
+    # Contrast normalization for sharpness scoring.
+    # Laplacian variance and Tenengrad are *absolute* contrast metrics: their
+    # value scales with the square of the patch's overall signal amplitude.
+    # A dark-skinned face (or any underexposed / backlit subject) reflects
+    # less light, so an equally in-focus face produces far smaller raw metric
+    # values and reads as blurry against the fixed metric scales.  Rescaling
+    # each crop so its standard deviation equals
+    # sharpness_contrast_reference removes that amplitude dependence and
+    # turns both metrics into *relative* sharpness measures.
+    # Validated on 823 real photos / 2499 face crops across two albums
+    # (_setup_tmp/sharpness_eval): ROC AUC 0.672 -> 0.713, and the false
+    # "blurry" rate gap between the darkest and brightest halves of the
+    # ground-truth-sharp photos drops from +0.112 to +0.018 at the "low"
+    # sensitivity preset.
+    sharpness_contrast_normalize: bool  = True
+    sharpness_contrast_reference: float = 40.0
+    # Gain clamp, guarding against amplifying noise in near-flat patches and
+    # against crushing very high-contrast ones.  Empirically binds on <0.3 %
+    # of real crops.
+    sharpness_contrast_min_gain:  float = 0.5
+    sharpness_contrast_max_gain:  float = 4.0
 
     # Face bounding box drawn on annotated previews (separate from the body box).
     annotation_face_box_color:        tuple[int, int, int] = field(default=(0, 255, 255))  # yellow
