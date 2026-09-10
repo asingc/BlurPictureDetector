@@ -1,9 +1,9 @@
 "use strict";
 
-// Page 4 — Face clustering: native review UI (thumbnails / assign / delete)
+// Page 4 — Faces: native review UI (thumbnails / assign / delete)
 // for the current album's .FaceReco clusters.
 
-const ClusterApp = {
+const FacesApp = {
   album: null,
   names: [],
   clusters: [],
@@ -33,12 +33,12 @@ const thumbLazyLoadObserver = new IntersectionObserver((entries) => {
 
 function stateFor(clusterId, crop) {
   const k = ckey(clusterId, crop);
-  if (!ClusterApp.staged.has(k)) ClusterApp.staged.set(k, { assignedName: null, pendingDelete: false });
-  return ClusterApp.staged.get(k);
+  if (!FacesApp.staged.has(k)) FacesApp.staged.set(k, { assignedName: null, pendingDelete: false });
+  return FacesApp.staged.get(k);
 }
 
 function isDirty() {
-  for (const st of ClusterApp.staged.values()) {
+  for (const st of FacesApp.staged.values()) {
     if (st.pendingDelete || st.assignedName) return true;
   }
   return false;
@@ -46,54 +46,54 @@ function isDirty() {
 
 function refreshDirty() {
   const dirty = isDirty();
-  $("#clusterSaveBtn").prop("disabled", !dirty);
-  $("#clusterDirtyBadge").toggle(dirty);
+  $("#facesSaveBtn").prop("disabled", !dirty);
+  $("#facesDirtyBadge").toggle(dirty);
 }
 
 // ------------------------------------------------------------------ //
 // Load
 // ------------------------------------------------------------------ //
-async function initCluster() {
-  $("#clusterEmpty").hide();
-  $("#clusterReady").hide();
-  $("#clusterStatus").text("Loading\u2026");
+async function initFaces() {
+  $("#facesEmpty").hide();
+  $("#facesReady").hide();
+  $("#facesStatus").text("Loading\u2026");
 
   let current;
   try {
     current = await apiGet("/api/current-album");
   } catch (err) {
-    $("#clusterStatus").text("Failed to load current album: " + err.message);
+    $("#facesStatus").text("Failed to load current album: " + err.message);
     return;
   }
 
   if (!current.album) {
-    $("#clusterEmpty").show();
-    $("#clusterStatus").text("");
+    $("#facesEmpty").show();
+    $("#facesStatus").text("");
     return;
   }
 
   if (!current.album.hasFaceReco) {
-    $("#clusterStatus").text("This album has no face-recognition data (.FaceReco) to review.");
+    $("#facesStatus").text("This album has no face-recognition data (.FaceReco) to review.");
     return;
   }
 
   try {
-    const data = await apiGet("/api/cluster/data");
-    ClusterApp.album = data.album;
-    ClusterApp.names = data.names || [];
-    ClusterApp.clusters = data.clusters || [];
-    ClusterApp.staged.clear();
-    ClusterApp.page = 1;
+    const data = await apiGet("/api/faces/data");
+    FacesApp.album = data.album;
+    FacesApp.names = data.names || [];
+    FacesApp.clusters = data.clusters || [];
+    FacesApp.staged.clear();
+    FacesApp.page = 1;
 
-    $("#clusterAlbumName").text(ClusterApp.album.name);
-    $("#clusterAlbumSrc").text(ClusterApp.album.srcDir ? "Source: " + ClusterApp.album.srcDir : "");
-    $("#clusterReady").show();
-    $("#clusterStatus").text("");
+    $("#facesAlbumName").text(FacesApp.album.name);
+    $("#facesAlbumSrc").text(FacesApp.album.srcDir ? "Source: " + FacesApp.album.srcDir : "");
+    $("#facesReady").show();
+    $("#facesStatus").text("");
     renderBands();
     renderPagination();
     refreshDirty();
   } catch (err) {
-    $("#clusterStatus").text("Failed to load clusters: " + err.message);
+    $("#facesStatus").text("Failed to load clusters: " + err.message);
   }
 }
 
@@ -104,20 +104,20 @@ async function initCluster() {
 // ------------------------------------------------------------------ //
 function buildFlatFaceList() {
   const flat = [];
-  ClusterApp.clusters.forEach((cluster) => {
+  FacesApp.clusters.forEach((cluster) => {
     cluster.faces.forEach((face) => flat.push({ cluster, face }));
   });
   return flat;
 }
 
 function totalPageCount() {
-  return Math.max(1, Math.ceil(buildFlatFaceList().length / ClusterApp.pageSize));
+  return Math.max(1, Math.ceil(buildFlatFaceList().length / FacesApp.pageSize));
 }
 
 function currentPageItems() {
   const flat = buildFlatFaceList();
-  const start = (ClusterApp.page - 1) * ClusterApp.pageSize;
-  return { flat, start, items: flat.slice(start, start + ClusterApp.pageSize) };
+  const start = (FacesApp.page - 1) * FacesApp.pageSize;
+  return { flat, start, items: flat.slice(start, start + FacesApp.pageSize) };
 }
 
 // Groups the page's flat (cluster, face) pairs back into per-cluster runs,
@@ -138,11 +138,11 @@ function groupItemsByCluster(items) {
 function goToPage(n) {
   const total = totalPageCount();
   n = Math.min(Math.max(1, Math.trunc(n) || 1), total);
-  if (n === ClusterApp.page) {
+  if (n === FacesApp.page) {
     renderPagination();
     return;
   }
-  ClusterApp.page = n;
+  FacesApp.page = n;
   selectedBand = null;
   renderBands();
   renderPagination();
@@ -152,11 +152,11 @@ function goToPage(n) {
 function renderPagination() {
   const total = totalPageCount();
   const { flat, start, items } = currentPageItems();
-  $(".cluster-page-input").val(ClusterApp.page).attr("max", total);
-  $(".cluster-page-total").text(total);
-  $(".cluster-first-page-btn, .cluster-prev-page-btn").prop("disabled", ClusterApp.page <= 1);
-  $(".cluster-next-page-btn, .cluster-last-page-btn").prop("disabled", ClusterApp.page >= total);
-  $(".cluster-page-range").text(
+  $(".faces-page-input").val(FacesApp.page).attr("max", total);
+  $(".faces-page-total").text(total);
+  $(".faces-first-page-btn, .faces-prev-page-btn").prop("disabled", FacesApp.page <= 1);
+  $(".faces-next-page-btn, .faces-last-page-btn").prop("disabled", FacesApp.page >= total);
+  $(".faces-page-range").text(
     flat.length ? "Faces " + (start + 1) + "\u2013" + (start + items.length) + " of " + flat.length : ""
   );
 }
@@ -165,9 +165,9 @@ function renderPagination() {
 // Rendering
 // ------------------------------------------------------------------ //
 function renderBands() {
-  const container = $("#clusterBands").empty();
+  const container = $("#facesBands").empty();
   lastClickedThumb = null;
-  if (ClusterApp.clusters.length === 0) {
+  if (FacesApp.clusters.length === 0) {
     container.append($("<p class='muted'>").text("No face clusters found in this album."));
     return;
   }
@@ -206,7 +206,7 @@ function renderBand(cluster, faces, isContinuation) {
   });
   const nameInput = $("<input type='text' placeholder='Player name\u2026'>");
   nameInput.autocomplete({
-    source: ClusterApp.names,
+    source: FacesApp.names,
     minLength: 0,
     delay: 0,
     select: function (event, ui) {
@@ -262,7 +262,7 @@ function renderBand(cluster, faces, isContinuation) {
 }
 
 function renderThumb(cluster, face) {
-  const st = ClusterApp.staged.get(ckey(cluster.id, face.crop)) || {};
+  const st = FacesApp.staged.get(ckey(cluster.id, face.crop)) || {};
   const wrap = $("<div class='thumb'>")
     .attr("data-crop", face.crop)
     .toggleClass("pending-delete", !!st.pendingDelete);
@@ -272,7 +272,7 @@ function renderThumb(cluster, face) {
     wrap.toggleClass("checked", this.checked);
   });
 
-  const thumbUrl = "/api/cluster/thumb/" + encodeURIComponent(cluster.id) + "/" + encodeURIComponent(face.crop);
+  const thumbUrl = "/api/faces/thumb/" + encodeURIComponent(cluster.id) + "/" + encodeURIComponent(face.crop);
   const originalUrl = "/api/original/" + encodeURIComponent(face.origFilename);
 
   const img = $("<img>").attr("data-src", thumbUrl).attr("title", face.origFilename)
@@ -364,7 +364,7 @@ function activateBand(band) {
   if (!alreadyChecked) {
     thumbs.each(function () {
       const thumb = $(this);
-      const st = ClusterApp.staged.get(ckey(clusterId, thumb.attr("data-crop"))) || {};
+      const st = FacesApp.staged.get(ckey(clusterId, thumb.attr("data-crop"))) || {};
       if (st.assignedName || st.pendingDelete) return;
       thumb.find(".thumb-check").prop("checked", true).trigger("change");
     });
@@ -389,7 +389,7 @@ function selectBand(band) {
 // edge where the previous band's top edge used to be on screen (a "conveyor
 // belt" effect), clamped so it never scrolls past the bottom of the page.
 function focusNextBand(band) {
-  const bands = $("#clusterBands > .band");
+  const bands = $("#facesBands > .band");
   const idx = bands.index(band[0]);
   if (idx === -1) return;
   const next = bands.eq(idx + 1);
@@ -453,9 +453,9 @@ $(document).on("keydown", function (e) {
 // ------------------------------------------------------------------ //
 // Save
 // ------------------------------------------------------------------ //
-async function saveCluster() {
+async function saveFaces() {
   const operations = [];
-  for (const [k, st] of ClusterApp.staged.entries()) {
+  for (const [k, st] of FacesApp.staged.entries()) {
     const sep = k.indexOf("::");
     const clusterId = k.slice(0, sep);
     const crop = k.slice(sep + 2);
@@ -467,19 +467,19 @@ async function saveCluster() {
   }
   if (operations.length === 0) return;
 
-  $("#clusterSaveBtn").prop("disabled", true).text("Saving\u2026");
+  $("#facesSaveBtn").prop("disabled", true).text("Saving\u2026");
   try {
-    const res = await apiPost("/api/cluster/commit", { operations });
-    ClusterApp.clusters = res.clusters || [];
-    ClusterApp.staged.clear();
+    const res = await apiPost("/api/faces/commit", { operations });
+    FacesApp.clusters = res.clusters || [];
+    FacesApp.staged.clear();
     selectedBand = null;
-    ClusterApp.page = Math.min(ClusterApp.page, totalPageCount());
+    FacesApp.page = Math.min(FacesApp.page, totalPageCount());
     renderBands();
     renderPagination();
   } catch (err) {
     alert("Save failed: " + err.message);
   } finally {
-    $("#clusterSaveBtn").text("Save");
+    $("#facesSaveBtn").text("Save");
     refreshDirty();
   }
 }
@@ -488,14 +488,14 @@ async function saveCluster() {
 // Boot
 // ------------------------------------------------------------------ //
 $(function () {
-  $("#clusterSaveBtn").on("click", saveCluster);
+  $("#facesSaveBtn").on("click", saveFaces);
 
-  $(".cluster-first-page-btn").on("click", () => goToPage(1));
-  $(".cluster-prev-page-btn").on("click", () => goToPage(ClusterApp.page - 1));
-  $(".cluster-next-page-btn").on("click", () => goToPage(ClusterApp.page + 1));
-  $(".cluster-last-page-btn").on("click", () => goToPage(totalPageCount()));
-  $(".cluster-page-input").on("change", function () { goToPage(parseInt($(this).val(), 10)); });
-  $(".cluster-page-input").on("keydown", function (e) {
+  $(".faces-first-page-btn").on("click", () => goToPage(1));
+  $(".faces-prev-page-btn").on("click", () => goToPage(FacesApp.page - 1));
+  $(".faces-next-page-btn").on("click", () => goToPage(FacesApp.page + 1));
+  $(".faces-last-page-btn").on("click", () => goToPage(totalPageCount()));
+  $(".faces-page-input").on("change", function () { goToPage(parseInt($(this).val(), 10)); });
+  $(".faces-page-input").on("keydown", function (e) {
     if (e.key === "Enter") { goToPage(parseInt($(this).val(), 10)); $(this).trigger("blur"); }
   });
 
@@ -503,8 +503,8 @@ $(function () {
     if (isDirty()) { e.preventDefault(); e.returnValue = ""; }
   });
 
-  initCluster();
+  initFaces();
 });
 
 
-$(initCluster);
+$(initFaces);

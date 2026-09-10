@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Face Clustering — Photo Culling{% endblock %}
+{% macro faces_pagination() %}
+  <div class="panel faces-pagination">
+    <button class="btn btn-sm faces-first-page-btn" title="First page">&laquo; First</button>
+    <button class="btn btn-sm faces-prev-page-btn" title="Previous page">&lsaquo; Prev</button>
+    <span class="faces-pagination-current">
+      Page <input class="faces-page-input" type="number" min="1" step="1"> of <span class="faces-page-total">1</span>
+    </span>
+    <button class="btn btn-sm faces-next-page-btn" title="Next page">Next &rsaquo;</button>
+    <button class="btn btn-sm faces-last-page-btn" title="Last page">Last &raquo;</button>
+    <span class="muted faces-pagination-range"></span>
+  </div>
+{% endmacro %}
+{% block content %}
+<h2>Face Clustering</h2>
+<div id="facesEmpty" class="panel" style="display:none">
+  <p class="muted">
+    No processed album selected yet. Run <a href="/select-album">Select Album</a>,
+    or pick a previously processed album from the <a href="/team">Team</a> page.
+  </p>
+</div>
+<div id="facesReady" style="display:none">
+  <div class="panel faces-toolbar">
+    <div>
+      <h3 id="facesAlbumName"></h3>
+      <p class="muted" id="facesAlbumSrc" style="margin:0"></p>
+    </div>
+    <div class="row" style="margin-top:0">
+      <span id="facesDirtyBadge" class="badge" style="display:none">Unsaved changes</span>
+      <button id="facesSaveBtn" class="btn btn-primary" disabled>Save</button>
+    </div>
+  </div>
+  {{ faces_pagination() }}
+  <div id="facesBands"></div>
+  {{ faces_pagination() }}
+</div>
+<p id="facesStatus" class="muted"></p>
+{% endblock %}
+{% block extra_scripts %}
+<script src="{{ static_url('js/faces.js') }}"></script>
+{% endblock %}
+

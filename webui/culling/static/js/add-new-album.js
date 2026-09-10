@@ -228,7 +228,7 @@ function finishProcessingDialog(returnCode) {
   // success, whether the dialog is dismissed by the user or auto-closes.
   $dialog.off("dialogclose.processing").on("dialogclose.processing", () => {
     if (dismissTimer) { clearTimeout(dismissTimer); dismissTimer = null; }
-    if (success) window.location.href = "/review";
+    if (success) window.location.href = "/culling";
   });
 
   if (success) {

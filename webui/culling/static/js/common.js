@@ -1,6 +1,6 @@
 "use strict";
 
-// Shared helpers used by every page's own JS file (team.js, import.js, ...).
+// Shared helpers used by every page's own JS file (team.js, select-album.js, ...).
 
 async function apiGet(url) {
   const r = await fetch(url);

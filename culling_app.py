@@ -9,13 +9,13 @@ natural code isolation instead of one giant single-page app:
   2. Select album     — resume a previously processed album, or create a new
                          one (source folder, blur sensitivity, face
                          recognition) and run the detection pipeline.
-  3. Image review      — sort blur / sharp / skipped.
-  4. Face clustering    — group and label face clusters.
-  5. Apply changes      — move files / write face-reco info, with progress.
+  3. Culling          — sort blur / sharp / skipped.
+  4. Faces            — group and label face clusters.
+  5. Album Tools      — move files / write face-reco info, with progress.
 
 This module currently implements the server-side pieces for pages 1 and 2
 (team persistence + import-folder selection with "remember last" support).
-Later iterations will add the processing/review/clustering/apply endpoints.
+Later iterations will add the processing/culling/faces/album-tools endpoints.
 
 Usage::
 
@@ -179,10 +179,10 @@ class AlbumDeleteRequest(BaseModel):
     id: str  # album directory name, e.g. "20260719-030120-TestImages" — not a path
 
 
-class ReviewApplyRequest(BaseModel):
+class CullingApplyRequest(BaseModel):
     # {original filename: stars} for every image the user star-rated (hotkeys
     # 1-5, or the space-bar quick keep/drop toggle) this session, across all
-    # 3 review tabs at once. Anything not present here keeps its current
+    # 3 culling tabs at once. Anything not present here keeps its current
     # effective (explicit-or-default) star rating. "keep" is always derived
     # server-side from the final star rating (3+ = keep) — there is no
     # separate keep/drop flag to track.
@@ -291,7 +291,7 @@ ai_edit_state = AiEditState()
 
 
 # --------------------------------------------------------------------------- #
-# Export (page 5 — Apply) — copy "keep" images and merge tagged-player faces
+# Export (page 5 — Album Tools) — copy "keep" images and merge tagged-player faces
 # into a .FaceReco database at a destination folder, run in a background
 # thread with the same buffered-lines-for-polling pattern as ProcessingState.
 # --------------------------------------------------------------------------- #
@@ -1038,13 +1038,13 @@ def _has_active_album() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Review (page 3) — sort blur / sharp / skipped images into keep / drop,
+# Culling (page 3) — sort blur / sharp / skipped images into keep / drop,
 # grouped into time-based "bursts". Decisions are staged client-side and only
 # committed to album.json (as an explicit "keep" boolean per entry) when the
-# user hits Apply — see api_review_apply().
+# user hits Apply — see api_culling_apply().
 # --------------------------------------------------------------------------- #
-REVIEW_CATEGORIES = ("blur", "sharp", "skipped")
-_REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
+CULLING_CATEGORIES = ("blur", "sharp", "skipped")
+_CULLING_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
 # Where autoedit.py's output for a photo is kept — see api_ai_edit()/
 # _run_ai_edit() below. Sibling of previews/ under the album directory.
 _EDITEDIMAGES_SUBDIR = EDITEDIMAGES_SUBDIR
@@ -1058,13 +1058,13 @@ _WEB_DISPLAYABLE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif
 # or entries the user hasn't touched this session): sharp images default to
 # keep, blur/skipped default to drop — matching the pre-existing behaviour of
 # manually deleting anno_* previews to "reject" an image.
-_REVIEW_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
+_CULLING_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
 
 # Effective star rating when album.json has no explicit "stars" value yet
 # (older albums, or the LLM culling stage never ran) — same true/false split
 # as _REVIEW_DEFAULT_KEEP, expressed on the 1-5 scale (3 = baseline keep,
 # 1 = baseline discard).
-_REVIEW_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _REVIEW_DEFAULT_KEEP.items()}
+_CULLING_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _CULLING_DEFAULT_KEEP.items()}
 
 # Consecutive photos within this many seconds of each other are treated as
 # the same "burst" for the nav-pane grouping.
@@ -1101,21 +1101,21 @@ def _image_timestamp(path: Path) -> float:
         return 0.0
 
 
-def _review_images(album_path: Path, category: str) -> list[dict]:
+def _culling_images(album_path: Path, category: str) -> list[dict]:
     """Per-image metadata for one review category: album key, source path,
     effective star rating, effective keep state (derived from the star
     rating — 3+ = keep — so it can never drift out of sync with the
     star-driven color scheme), and best-effort capture timestamp. Preview
     and thumbnail images are fetched by key (see /api/anno_img and
-    /api/review/thumb), so no filenames are sent to the client."""
+    /api/culling/thumb), so no filenames are sent to the client."""
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
     src_dir = Path(info.get("SrcDir", ""))
     album_images = album_for(album_path).images
-    default_stars = _REVIEW_DEFAULT_STARS[category]
+    default_stars = _CULLING_DEFAULT_STARS[category]
 
     images = []
-    for item in info.get(_REVIEW_INFO_KEY[category], []):
+    for item in info.get(_CULLING_INFO_KEY[category], []):
         src_name = item.get("src")
         if not src_name:
             continue
@@ -1147,12 +1147,12 @@ def _review_images(album_path: Path, category: str) -> list[dict]:
 
 def _kept_image_basenames(album_path: Path, min_stars: int = 3) -> set[str]:
     """Basenames of every image at or above *min_stars* — the same effective
-    (explicit-or-default) star rating the Review page shows. Used by the
-    Apply/export step to decide which original photos (and which face crops)
+    (explicit-or-default) star rating the Culling page shows. Used by the
+    Album Tools/export step to decide which original photos (and which face crops)
     to copy to the destination."""
     kept: set[str] = set()
-    for category in REVIEW_CATEGORIES:
-        for image in _review_images(album_path, category):
+    for category in CULLING_CATEGORIES:
+        for image in _culling_images(album_path, category):
             if image["stars"] >= min_stars:
                 kept.add(image["file"])
     return kept
@@ -1319,7 +1319,7 @@ class ClusterOperation(BaseModel):
     name: Optional[str] = None
 
 
-class ClusterCommitRequest(BaseModel):
+class FacesCommitRequest(BaseModel):
     operations: list[ClusterOperation]
 
 
@@ -1441,7 +1441,7 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
         album.save()
 
 
-def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> dict:
+def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dict:
     fr = _facereco_dir(album_path)
     if fr is None:
         raise HTTPException(status_code=400, detail="Album has no .FaceReco folder")
@@ -1536,8 +1536,8 @@ def _commit_cluster_operations(album_path: Path, req: ClusterCommitRequest) -> d
 
 
 # --------------------------------------------------------------------------- #
-# Export (page 5 — Apply). Three steps, run in a background thread while the
-# browser polls /api/apply/export-status the same way it polls processing
+# Export (page 5 — Album Tools). Three steps, run in a background thread while the
+# browser polls /api/album-tools/export-status the same way it polls processing
 # output:
 #
 #   1. Sync every recognized/tagged player's face crops (from kept images
@@ -1757,7 +1757,7 @@ def _static_url(path: str) -> str:
 templates.env.globals["static_url"] = _static_url
 templates.env.globals["has_active_album"] = _has_active_album
 
-PAGE_STEPS: tuple[str, ...] = ("team", "import", "review", "cluster", "apply")
+PAGE_STEPS: tuple[str, ...] = ("team", "select-album", "culling", "faces", "album-tools")
 
 
 @app.get("/")
@@ -1768,7 +1768,7 @@ def root() -> RedirectResponse:
     teams_file = _load_teams_file()
     if not teams_file.Teams:
         return RedirectResponse(url="/team")
-    return RedirectResponse(url="/import")
+    return RedirectResponse(url="/select-album")
 
 
 @app.post("/api/heartbeat")
@@ -1790,11 +1790,11 @@ for _step in PAGE_STEPS:
     app.add_api_route(f"/{_step}", _make_route(_step), methods=["GET"], response_class=HTMLResponse)
 
 
-@app.get("/add-album")
-def add_album_page(request: Request) -> HTMLResponse:
+@app.get("/add-new-album")
+def add_new_album_page(request: Request) -> HTMLResponse:
     # Sub-page of "Select Album" (reached via the "+" polaroid card there),
     # not a numbered step of its own — highlight the "Select Album" step.
-    return templates.TemplateResponse(request, "add_album.html", {"active_step": "import"})
+    return templates.TemplateResponse(request, "add-new-album.html", {"active_step": "select-album"})
 
 
 @app.post("/api/team")
@@ -1872,8 +1872,8 @@ def api_current_album() -> dict:
     return {"album": _read_album_summary(Path(album_path))}
 
 
-@app.get("/api/review/summary")
-def api_review_summary() -> dict:
+@app.get("/api/culling/summary")
+def api_culling_summary() -> dict:
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
@@ -1884,12 +1884,12 @@ def api_review_summary() -> dict:
     }
 
 
-@app.get("/api/review/data")
-def api_review_data(category: str = Query(...), sort: str = Query("size")) -> dict:
-    if category not in REVIEW_CATEGORIES:
+@app.get("/api/culling/data")
+def api_culling_data(category: str = Query(...), sort: str = Query("size")) -> dict:
+    if category not in CULLING_CATEGORIES:
         raise HTTPException(status_code=400, detail="Invalid category")
     album_path = _current_album_path()
-    images = _review_images(album_path, category)
+    images = _culling_images(album_path, category)
     if sort == "rating":
         groups = _rating_groups(images)
     else:
@@ -1906,9 +1906,9 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
     }
 
 
-@app.get("/api/review/thumb/{file:path}")
-def api_review_thumb(file: str) -> FileResponse:
-    """Small square thumbnail of *file*'s annotated preview, for the review
+@app.get("/api/culling/thumb/{file:path}")
+def api_culling_thumb(file: str) -> FileResponse:
+    """Small square thumbnail of *file*'s annotated preview, for the culling
     page's nav strip."""
     image = album_for(_current_album_path()).image(file)
     thumb_fp = image.ensure_thumbnail() if image else None
@@ -1919,7 +1919,7 @@ def api_review_thumb(file: str) -> FileResponse:
 
 @app.get("/api/anno_img/{file:path}")
 def api_anno_img(file: str) -> FileResponse:
-    """Full-resolution annotated preview image — shared by the review page's
+    """Full-resolution annotated preview image — shared by the culling page's
     main pane (toggle-able against /api/original) and any other consumer
     that wants the annotated (not cropped/resized) version of a photo."""
     image = album_for(_current_album_path()).image(file)
@@ -1929,10 +1929,10 @@ def api_anno_img(file: str) -> FileResponse:
     return FileResponse(fp)
 
 
-@app.post("/api/review/apply")
-def api_review_apply(req: ReviewApplyRequest) -> dict:
+@app.post("/api/culling/apply")
+def api_culling_apply(req: CullingApplyRequest) -> dict:
     """Commit pending star-rating decisions (staged client-side, across all 3
-    review tabs at once) into album.json. Every reviewable entry gets an
+    culling tabs at once) into album.json. Every reviewable entry gets an
     explicit "stars" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
     with "keep" always derived from the final star rating (3+ = keep) so it
@@ -1945,9 +1945,9 @@ def api_review_apply(req: ReviewApplyRequest) -> dict:
     album = album_for(album_path)
     results_by_name = album.entries
 
-    for category in REVIEW_CATEGORIES:
-        default_stars = _REVIEW_DEFAULT_STARS[category]
-        for item in info.get(_REVIEW_INFO_KEY[category], []):
+    for category in CULLING_CATEGORIES:
+        default_stars = _CULLING_DEFAULT_STARS[category]
+        for item in info.get(_CULLING_INFO_KEY[category], []):
             src_name = item.get("src")
             result = results_by_name.get(src_name)
             if result is None:
@@ -2103,9 +2103,9 @@ def api_import_more(req: ImportMoreRequest) -> dict:
     return {"ok": True}
 
 
-@app.post("/api/apply/rerun-facereco")
+@app.post("/api/album-tools/rerun-facereco")
 def api_rerun_facereco() -> dict:
-    """Re-run face detection/clustering for the current album (Summary
+    """Re-run face detection/clustering for the current album (Album Tools
     page's "Re-run Face Detection" button). Reuses the same
     processing_state/polling machinery as /api/start-processing and
     /api/import-more — only one processing job can run at a time."""
@@ -2232,8 +2232,8 @@ def api_processing_output(since: int = 0) -> dict:
         }
 
 
-@app.get("/api/cluster/data")
-def api_cluster_data() -> dict:
+@app.get("/api/faces/data")
+def api_faces_data() -> dict:
     album_path = _current_album_path()
     return {
         "album": _read_album_summary(album_path),
@@ -2242,8 +2242,8 @@ def api_cluster_data() -> dict:
     }
 
 
-@app.get("/api/cluster/thumb/{cluster}/{crop}")
-def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
+@app.get("/api/faces/thumb/{cluster}/{crop}")
+def api_faces_thumb(cluster: str, crop: str) -> FileResponse:
     album_path = _current_album_path()
     fr = _facereco_dir(album_path)
     if fr is None:
@@ -2256,8 +2256,8 @@ def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
 
 @app.get("/api/original/{file:path}")
 def api_original(file: str) -> FileResponse:
-    """Unmodified source photo for *file* — shared by the cluster page's
-    face-crop context view and the review page's anno/original toggle (see
+    """Unmodified source photo for *file* — shared by the faces page's
+    face-crop context view and the culling page's anno/original toggle (see
     /api/anno_img for the annotated counterpart). An accepted AI edit always
     wins over the original, so the user sees the current state of the photo."""
     album_path = _current_album_path()
@@ -2277,14 +2277,14 @@ def api_original(file: str) -> FileResponse:
     return FileResponse(fp)
 
 
-@app.post("/api/cluster/commit")
-def api_cluster_commit(req: ClusterCommitRequest) -> dict:
+@app.post("/api/faces/commit")
+def api_faces_commit(req: FacesCommitRequest) -> dict:
     album_path = _current_album_path()
     return _commit_cluster_operations(album_path, req)
 
 
-@app.get("/api/apply/summary")
-def api_apply_summary() -> dict:
+@app.get("/api/album-tools/summary")
+def api_album_tools_summary() -> dict:
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
@@ -2330,7 +2330,7 @@ def api_apply_summary() -> dict:
     }
 
 
-@app.post("/api/apply/regrade-sensitivity")
+@app.post("/api/album-tools/regrade-sensitivity")
 def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     """Re-grade the current album's Blur/Sharp verdicts at a NEW sensitivity.
 
@@ -2389,7 +2389,7 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     }
 
 
-@app.get("/api/apply/jersey-options")
+@app.get("/api/album-tools/jersey-options")
 def api_jersey_options() -> dict:
     """Colours offerable as a manual team-colour pin for the current album:
     the album team's own registered jersey colours, minus the forced ones
@@ -2407,7 +2407,7 @@ def api_jersey_options() -> dict:
     }
 
 
-@app.post("/api/apply/jersey-color")
+@app.post("/api/album-tools/jersey-color")
 def api_set_jersey_color(req: JerseyColorRequest) -> dict:
     """Pin (or un-pin) the album's team jersey colour and propagate it.
 
@@ -2473,7 +2473,7 @@ def api_set_jersey_color(req: JerseyColorRequest) -> dict:
     }
 
 
-@app.post("/api/apply/export")
+@app.post("/api/album-tools/export")
 def api_start_export(req: ExportRequest) -> dict:
     album_path = _current_album_path()
     destination = req.destination.strip()
@@ -2499,7 +2499,7 @@ def api_start_export(req: ExportRequest) -> dict:
     return {"ok": True}
 
 
-@app.get("/api/apply/export-status")
+@app.get("/api/album-tools/export-status")
 def api_export_status(since: int = 0) -> dict:
     with export_state.lock:
         new_lines = export_state.lines[since:]
@@ -2517,7 +2517,7 @@ def api_export_status(since: int = 0) -> dict:
         }
 
 
-@app.post("/api/apply/open-destination")
+@app.post("/api/album-tools/open-destination")
 def api_open_export_destination() -> dict:
     """Open the just-exported destination folder in the OS's native file
     explorer (Windows Explorer / macOS Finder / Linux file manager)."""

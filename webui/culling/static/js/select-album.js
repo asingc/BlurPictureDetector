@@ -22,7 +22,7 @@ function buildAddAlbumCard() {
   caption.append($("<div>", { class: "polaroid-name" }).text("New Album"));
 
   card.append(photo, caption);
-  card.on("click", () => { window.location.href = "/add-album"; });
+  card.on("click", () => { window.location.href = "/add-new-album"; });
   return card;
 }
 
@@ -95,7 +95,7 @@ function buildPolaroidCard(album) {
   card.on("click", async () => {
     try {
       await apiPost("/api/albums/select", { id: album.name });
-      window.location.href = "/review";
+      window.location.href = "/culling";
     } catch (err) {
       alert("Failed to resume: " + err.message);
     }

@@ -1,6 +1,6 @@
 "use strict";
 
-// Page 3 — Review: sort blur / sharp / skipped photos into keep / drop,
+// Page 3 — Culling: sort blur / sharp / skipped photos into keep / drop,
 // grouped into time-based "bursts". Decisions are staged here in memory
 // (across all 3 tabs) and only written to album.json when Apply is hit.
 
@@ -16,7 +16,7 @@ let previewCount = 1;
 // image/group navigation until reset (Esc).
 const previewZoomCtl = Viewport.createZoomController({ min: 1, max: 6, step: 0.25 });
 function previewImgs() {
-  return $("#reviewPreview .review-preview-cell img");
+  return $("#cullingPreview .culling-preview-cell img");
 }
 
 // categoryData[category] = { groups: [{images:[{file,keep,stars}, ...]}, ...], activeGroup, activeImage }
@@ -29,8 +29,8 @@ const pendingStarOverrides = {};
 
 // Every image endpoint is addressed by the album key (im.file) — the server
 // resolves which file to serve (see algo/album.py::AlbumImage).
-function reviewThumbUrl(file) {
-  return `/api/review/thumb/${encodeURIComponent(file)}`;
+function cullingThumbUrl(file) {
+  return `/api/culling/thumb/${encodeURIComponent(file)}`;
 }
 
 // Full-resolution images for the large main preview pane, toggled between
@@ -47,7 +47,7 @@ function originalImgUrl(file) {
 // hotkey (see the keydown handler below) and persisted across reloads.
 // Only changes which URL renderMain() uses — the other version is never
 // pre-fetched/pre-loaded until the user actually switches to it.
-const VIEW_MODE_STORAGE_KEY = "review.viewMode";
+const VIEW_MODE_STORAGE_KEY = "culling.viewMode";
 let viewMode = localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "original" ? "original" : "anno";
 function mainImgUrl(im) {
   return viewMode === "original" ? originalImgUrl(im.file) : annoImgUrl(im.file);
@@ -88,31 +88,31 @@ function bestIndex(group) {
 // ------------------------------------------------------------------ //
 // Load
 // ------------------------------------------------------------------ //
-async function initReview() {
-  $("#reviewEmpty").hide();
-  $("#reviewApp").hide();
+async function initCulling() {
+  $("#cullingEmpty").hide();
+  $("#cullingApp").hide();
 
   let current;
   try {
     current = await apiGet("/api/current-album");
   } catch (err) {
-    $("#reviewStatus").text("Failed to load current album: " + err.message).show();
+    $("#cullingStatus").text("Failed to load current album: " + err.message).show();
     return;
   }
 
   if (!current.album) {
-    $("#reviewEmpty").show();
+    $("#cullingEmpty").show();
     return;
   }
-  $("#reviewApp").show();
+  $("#cullingApp").show();
 
   try {
-    const summary = await apiGet("/api/review/summary");
+    const summary = await apiGet("/api/culling/summary");
     $("#countBlur").text(summary.blurCount);
     $("#countSharp").text(summary.sharpCount);
     $("#countSkipped").text(summary.skippedCount);
   } catch (err) {
-    $("#reviewStatus").text("Failed to load review summary: " + err.message).show();
+    $("#cullingStatus").text("Failed to load culling summary: " + err.message).show();
   }
 
   try {
@@ -120,12 +120,12 @@ async function initReview() {
     renderNav();
     renderMain();
   } catch (err) {
-    $("#reviewStatus").text("Failed to load review data: " + err.message).show();
+    $("#cullingStatus").text("Failed to load culling data: " + err.message).show();
   }
 }
 
 async function fetchCategory(category) {
-  const url = `/api/review/data?category=${encodeURIComponent(category)}&sort=${encodeURIComponent(sortMode)}`;
+  const url = `/api/culling/data?category=${encodeURIComponent(category)}&sort=${encodeURIComponent(sortMode)}`;
   const data = await apiGet(url);
   // Re-apply any pending (not-yet-applied) star overrides on top of the
   // persisted state the server just handed back, then derive "keep" from
@@ -157,13 +157,13 @@ async function ensureCategory(category) {
 // ------------------------------------------------------------------ //
 function renderNav() {
   const data = categoryData[currentCategory];
-  const $nav = $("#reviewNav").empty();
+  const $nav = $("#cullingNav").empty();
   if (!data) return;
 
   data.groups.forEach((group, gi) => {
-    const $row = $("<div>", { class: "review-nav-row" }).toggleClass("active", gi === data.activeGroup);
+    const $row = $("<div>", { class: "culling-nav-row" }).toggleClass("active", gi === data.activeGroup);
     group.images.forEach((im) => {
-      $row.append($("<span>", { class: `review-dot star-${im.stars || 3}` }));
+      $row.append($("<span>", { class: `culling-dot star-${im.stars || 3}` }));
     });
     $row.on("click", () => {
       data.activeGroup = gi;
@@ -174,7 +174,7 @@ function renderNav() {
     $nav.append($row);
   });
 
-  const $active = $nav.find(".review-nav-row.active");
+  const $active = $nav.find(".culling-nav-row.active");
   if ($active.length) {
     $active[0].scrollIntoView({ block: "nearest" });
   }
@@ -195,7 +195,7 @@ function computeWindow(count, activeIndex, n) {
 // currently rendered preview image if the pointer isn't directly over one
 // (e.g. over a cell's letterboxed padding).
 function previewImgAt(e) {
-  const $fromTarget = $(e.target).closest(".review-preview-cell").find("img");
+  const $fromTarget = $(e.target).closest(".culling-preview-cell").find("img");
   return $fromTarget.length ? $fromTarget : previewImgs().first();
 }
 
@@ -210,23 +210,23 @@ function previewImgAt(e) {
 let draggingPreview = false;
 let previewDragMoved = false;
 
-$("#reviewPreview").on("mousedown", ".review-preview-cell img", function (e) {
+$("#cullingPreview").on("mousedown", ".culling-preview-cell img", function (e) {
   e.preventDefault(); // suppress the browser's native image-ghost drag
   previewDragMoved = false;
   draggingPreview = previewZoomCtl.dragStart(this, e.clientX, e.clientY);
 });
 
-$(document).on("mousemove.reviewPreviewDrag", function (e) {
+$(document).on("mousemove.cullingPreviewDrag", function (e) {
   if (!draggingPreview) return;
   previewDragMoved = true;
   previewZoomCtl.dragMove(previewImgs(), e.clientX, e.clientY);
 });
 
-$(document).on("mouseup.reviewPreviewDrag", function () {
+$(document).on("mouseup.cullingPreviewDrag", function () {
   draggingPreview = false;
 });
 
-$("#reviewPreview").on("wheel", function (e) {
+$("#cullingPreview").on("wheel", function (e) {
   const $img = previewImgAt(e);
   if (!$img.length) return;
   e.preventDefault();
@@ -237,7 +237,7 @@ $("#reviewPreview").on("wheel", function (e) {
 
 // Clicking a preview image (without dragging) toggles it between "fit" and
 // 100% (actual pixel size), centered on the click point.
-$("#reviewPreview").on("click", ".review-preview-cell img", function (e) {
+$("#cullingPreview").on("click", ".culling-preview-cell img", function (e) {
   if (previewDragMoved) {
     previewDragMoved = false;
     return;
@@ -247,7 +247,7 @@ $("#reviewPreview").on("click", ".review-preview-cell img", function (e) {
 
 
 // Give a preview viewport the image's intrinsic aspect ratio so pure CSS
-// (max-width/max-height: 100% of the cell, see .review-preview-viewport)
+// (max-width/max-height: 100% of the cell, see .culling-preview-viewport)
 // sizes it as an object-fit: contain box — no JS pixel measurement of the
 // cell involved, so there's no stale-measurement race with layout changes
 // elsewhere on the page (e.g. the rank-info bar showing/hiding) and no
@@ -266,12 +266,12 @@ function applyPreviewAspectRatio($viewport, imgEl) {
 // reasonably wide box to read/copy the path from — capped to the preview
 // pane's own width so it never overflows.
 function syncFilePathWidth($viewport) {
-  const paneWidth = $("#reviewPreview").width();
+  const paneWidth = $("#cullingPreview").width();
   const imgSize = Math.max($viewport.width(), $viewport.height());
-  $("#reviewFilePath").css("width", Math.min(paneWidth, imgSize) + "px");
+  $("#cullingFilePath").css("width", Math.min(paneWidth, imgSize) + "px");
 }
-$(window).on("resize.reviewFilePath", function () {
-  const $active = $("#reviewPreview .review-preview-cell.active .review-preview-viewport");
+$(window).on("resize.cullingFilePath", function () {
+  const $active = $("#cullingPreview .culling-preview-cell.active .culling-preview-viewport");
   if ($active.length) syncFilePathWidth($active);
 });
 
@@ -286,9 +286,9 @@ function llmGradeClass(grade) {
 
 function renderMain() {
   const data = categoryData[currentCategory];
-  const $preview = $("#reviewPreview").empty();
-  const $rankInfo = $("#reviewRankInfo").empty().hide();
-  const $strip = $("#reviewStrip").empty();
+  const $preview = $("#cullingPreview").empty();
+  const $rankInfo = $("#cullingRankInfo").empty().hide();
+  const $strip = $("#cullingStrip").empty();
   if (!data) return;
 
   const group = data.groups[data.activeGroup];
@@ -296,12 +296,12 @@ function renderMain() {
   const activeImage = group.images[data.activeImage];
 
   lastActiveImage = activeImage;
-  $("#reviewFilePath").val(activeImage.path || activeImage.file || "");
+  $("#cullingFilePath").val(activeImage.path || activeImage.file || "");
 
   // Populate/show the rank-info bar *before* building & measuring the
-  // preview cells below. #reviewRankInfo is a flex sibling of
-  // .review-preview inside .review-main (column flex) — showing it (or
-  // not) changes how much height .review-preview actually gets. If we
+  // preview cells below. #cullingRankInfo is a flex sibling of
+  // .culling-preview inside .culling-main (column flex) — showing it (or
+  // not) changes how much height .culling-preview actually gets. If we
   // measured/locked cell sizes first and toggled this bar afterwards,
   // already-cached images (locked synchronously off the stale, taller
   // pre-toggle layout) would end up locked to a viewport taller than the
@@ -334,8 +334,8 @@ function renderMain() {
   const cellEntries = [];
   for (let i = start; i < end; i++) {
     const im = group.images[i];
-    const $cell = $("<div>", { class: "review-preview-cell" }).toggleClass("active", i === data.activeImage);
-    const $viewport = $("<div>", { class: `review-preview-viewport star-${im.stars || 3}` });
+    const $cell = $("<div>", { class: "culling-preview-cell" }).toggleClass("active", i === data.activeImage);
+    const $viewport = $("<div>", { class: `culling-preview-viewport star-${im.stars || 3}` });
     const $img = $("<img>", { src: mainImgUrl(im), alt: im.file });
     $viewport.append($img);
     if (im.burstRanking) {
@@ -356,16 +356,16 @@ function renderMain() {
   previewZoomCtl.apply(previewImgs());
 
   group.images.forEach((im, i) => {
-    const $thumb = $("<div>", { class: "review-strip-thumb" }).toggleClass("active", i === data.activeImage);
-    const $imgWrap = $("<div>", { class: "review-strip-img-wrap" });
-    $imgWrap.append($("<img>", { src: reviewThumbUrl(im.file), alt: im.file }));
+    const $thumb = $("<div>", { class: "culling-strip-thumb" }).toggleClass("active", i === data.activeImage);
+    const $imgWrap = $("<div>", { class: "culling-strip-img-wrap" });
+    $imgWrap.append($("<img>", { src: cullingThumbUrl(im.file), alt: im.file }));
     if (im.burstRanking) {
       $imgWrap.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
       $thumb.attr("title", "#" + im.burstRanking.rank + ": " + (im.burstRanking.reason || ""));
     }
     $thumb.append($imgWrap);
     const stars = im.stars || 3;
-    $thumb.append($("<div>", { class: "review-strip-stars" }).text("★".repeat(stars) + "☆".repeat(5 - stars)));
+    $thumb.append($("<div>", { class: "culling-strip-stars" }).text("★".repeat(stars) + "☆".repeat(5 - stars)));
     $thumb.on("click", () => {
       data.activeImage = i;
       renderMain();
@@ -373,7 +373,7 @@ function renderMain() {
     $strip.append($thumb);
   });
 
-  const $activeThumb = $strip.find(".review-strip-thumb.active");
+  const $activeThumb = $strip.find(".culling-strip-thumb.active");
   if ($activeThumb.length) {
     $activeThumb[0].scrollIntoView({ inline: "nearest", block: "nearest" });
   }
@@ -418,7 +418,7 @@ const ARROW_KEY_ALIASES = { ArrowUp: "w", ArrowDown: "s", ArrowLeft: "a", ArrowR
 $(document).on("keydown", (e) => {
   const activeTag = (document.activeElement && document.activeElement.tagName || "").toLowerCase();
   if (activeTag === "select" || activeTag === "input" || activeTag === "textarea") return;
-  if (!$("#reviewApp").is(":visible")) return;
+  if (!$("#cullingApp").is(":visible")) return;
 
   const data = categoryData[currentCategory];
   if (!data) return;
@@ -490,23 +490,23 @@ $(document).on("keydown", (e) => {
 // ------------------------------------------------------------------ //
 // Toolbar controls
 // ------------------------------------------------------------------ //
-$("#reviewTabs").on("click", ".review-tab", async function () {
+$("#cullingTabs").on("click", ".culling-tab", async function () {
   const category = $(this).data("category");
   if (category === currentCategory) return;
   currentCategory = category;
-  $(".review-tab").removeClass("active");
+  $(".culling-tab").removeClass("active");
   $(this).addClass("active");
   await ensureCategory(category);
   renderNav();
   renderMain();
 });
 
-$("#reviewPreviewCount").on("change", function () {
+$("#cullingPreviewCount").on("change", function () {
   previewCount = parseInt($(this).val(), 10) || 1;
   renderMain();
 });
 
-$("#reviewSort").on("change", async function () {
+$("#cullingSort").on("change", async function () {
   sortMode = $(this).val();
   Object.keys(categoryData).forEach((c) => delete categoryData[c]);
   await fetchCategory(currentCategory);
@@ -514,29 +514,29 @@ $("#reviewSort").on("change", async function () {
   renderMain();
 });
 
-$("#reviewApplyBtn").on("click", async function () {
+$("#cullingApplyBtn").on("click", async function () {
   const starOverrides = Object.assign({}, pendingStarOverrides);
   if (Object.keys(starOverrides).length === 0) {
-    $("#reviewStatus").text("No changes to apply.").show();
+    $("#cullingStatus").text("No changes to apply.").show();
     return;
   }
   $(this).prop("disabled", true);
   try {
-    await apiPost("/api/review/apply", { starOverrides });
+    await apiPost("/api/culling/apply", { starOverrides });
     Object.keys(pendingStarOverrides).forEach((k) => delete pendingStarOverrides[k]);
-    $("#reviewStatus").text("Changes applied.").show();
+    $("#cullingStatus").text("Changes applied.").show();
   } catch (err) {
-    $("#reviewStatus").text("Failed to apply changes: " + err.message).show();
+    $("#cullingStatus").text("Failed to apply changes: " + err.message).show();
   } finally {
     $(this).prop("disabled", false);
   }
 });
 
-$("#reviewAiEditBtn").on("click", function () {
+$("#cullingAiEditBtn").on("click", function () {
   if (!lastActiveImage) return;
   AiEdit.run(lastActiveImage.file);
 });
 
 $(function () {
-  initReview();
+  initCulling();
 });

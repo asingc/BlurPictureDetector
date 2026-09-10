@@ -18,7 +18,7 @@
   --shadow-md: 0 4px 16px rgba(20, 20, 30, 0.06);
   --radius: 10px;
   /* Star-rating scale (1 = white, ramping up to deep blue at 5) shared by
-     the Apply-page breakdown and the Review page's dots/preview border. */
+     the Album Tools-page breakdown and the Culling page's dots/preview border. */
   --star-1: #ffffff;
   --star-2: #c6dbef;
   --star-3: #6baed6;
@@ -572,9 +572,9 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 /* ------------------------------------------------------------------ *
  * Face clustering — native cluster/thumbnail review UI
  * ------------------------------------------------------------------ */
-.page-cluster #content { max-width: 1100px; }
+.page-faces #content { max-width: 1100px; }
 
-.cluster-toolbar {
+.faces-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -586,17 +586,17 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
   top: var(--topbar-h, 64px);
   z-index: 15;
 }
-.cluster-toolbar h3 { margin-bottom: 2px; }
+.faces-toolbar h3 { margin-bottom: 2px; }
 
-.cluster-pagination {
+.faces-pagination {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
-.cluster-pagination-current { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.cluster-page-input { width: 56px; text-align: center; padding: 6px 4px; }
-.cluster-pagination-range { margin-left: auto; font-size: 12px; }
+.faces-pagination-current { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.faces-page-input { width: 56px; text-align: center; padding: 6px 4px; }
+.faces-pagination-range { margin-left: auto; font-size: 12px; }
 
 .badge {
   background: #fdf3d9;
@@ -717,17 +717,17 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
 }
 
 /* ------------------------------------------------------------------ *
- * Review — native culling UI (blur / sharp / skipped tabs)
+ * Culling — native culling UI (blur / sharp / skipped tabs)
  * Full-height app-style layout instead of the usual scrolling column.
  * ------------------------------------------------------------------ */
-body.page-review {
+body.page-culling {
   display: flex;
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
 }
-body.page-review #topbar { flex: 0 0 auto; position: static; }
-body.page-review #content {
+body.page-culling #topbar { flex: 0 0 auto; position: static; }
+body.page-culling #content {
   flex: 1 1 auto;
   min-height: 0;
   max-width: none;
@@ -736,14 +736,14 @@ body.page-review #content {
   display: flex;
   flex-direction: column;
 }
-#reviewApp {
+#cullingApp {
   display: flex;
   flex-direction: column;
   min-height: 0;
   flex: 1 1 auto;
 }
 
-.review-toolbar {
+.culling-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -751,8 +751,8 @@ body.page-review #content {
   flex-wrap: wrap;
   flex: 0 0 auto;
 }
-.review-tabs { display: flex; gap: 6px; }
-.review-tab {
+.culling-tabs { display: flex; gap: 6px; }
+.culling-tab {
   background: var(--surface);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -762,20 +762,20 @@ body.page-review #content {
   font-size: 13.5px;
   font-weight: 500;
 }
-.review-tab .tab-count { color: var(--muted); margin-left: 4px; font-size: 12px; }
-.review-tab.active { color: #fff; background: var(--accent); border-color: var(--accent); }
-.review-tab.active .tab-count { color: rgba(255, 255, 255, 0.85); }
-.review-controls { display: flex; align-items: center; gap: 14px; }
-.review-controls select {
+.culling-tab .tab-count { color: var(--muted); margin-left: 4px; font-size: 12px; }
+.culling-tab.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.culling-tab.active .tab-count { color: rgba(255, 255, 255, 0.85); }
+.culling-controls { display: flex; align-items: center; gap: 14px; }
+.culling-controls select {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 5px 8px;
   font-size: 13px;
 }
-.review-hotkeys { flex: 0 0 auto; margin: 8px 0 0; font-size: 12px; }
+.culling-hotkeys { flex: 0 0 auto; margin: 8px 0 0; font-size: 12px; }
 
-.review-body {
+.culling-body {
   display: flex;
   gap: 16px;
   margin-top: 12px;
@@ -784,7 +784,7 @@ body.page-review #content {
 }
 
 /* Nav pane — burst groups as rows of small keep/drop dots (~1/8 width). */
-.review-nav {
+.culling-nav {
   flex: 0 0 12.5%;
   min-width: 90px;
   overflow-y: auto;
@@ -796,7 +796,7 @@ body.page-review #content {
   flex-direction: column;
   gap: 4px;
 }
-.review-nav-row {
+.culling-nav-row {
   display: flex;
   flex-wrap: wrap;
   align-content: flex-start;
@@ -805,37 +805,37 @@ body.page-review #content {
   border-radius: 6px;
   cursor: pointer;
   min-height: 14px;
-  /* Rows are flex children of a column flex container (.review-nav); without
+  /* Rows are flex children of a column flex container (.culling-nav); without
      this, the default flex-shrink:1 lets big-cluster rows (many wrapped
      dot-lines) get squeezed down toward min-height instead of keeping their
      full wrapped height, clipping/overlapping dots. flex: 0 0 auto locks
-     each row's height to its actual content so .review-nav scrolls instead
+     each row's height to its actual content so .culling-nav scrolls instead
      of squishing rows. */
   flex: 0 0 auto;
 }
-.review-nav-row:hover { background: var(--surface-2); }
-.review-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
-.review-dot {
+.culling-nav-row:hover { background: var(--surface-2); }
+.culling-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
+.culling-dot {
   width: 8px;
   height: 8px;
   border-radius: 4px;
   flex: 0 0 auto;
 }
-.review-dot.star-5 { background: var(--star-5); }
-.review-dot.star-4 { background: var(--star-4); }
-.review-dot.star-3 { background: var(--star-3); }
-.review-dot.star-2 { background: var(--star-2); }
-.review-dot.star-1 { background: var(--star-1); box-shadow: 0 0 0 1px var(--border) inset; }
+.culling-dot.star-5 { background: var(--star-5); }
+.culling-dot.star-4 { background: var(--star-4); }
+.culling-dot.star-3 { background: var(--star-3); }
+.culling-dot.star-2 { background: var(--star-2); }
+.culling-dot.star-1 { background: var(--star-1); box-shadow: 0 0 0 1px var(--border) inset; }
 
 /* Main pane — multi-image preview + in-group thumbnail strip (~7/8 width). */
-.review-main {
+.culling-main {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-.review-preview {
+.culling-preview {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -846,7 +846,7 @@ body.page-review #content {
   background: var(--surface-2);
   padding: 10px;
 }
-.review-preview-cell {
+.culling-preview-cell {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
@@ -856,7 +856,7 @@ body.page-review #content {
   justify-content: center;
 }
 /* "Fit" viewport — sized purely via CSS: JS sets aspect-ratio to the
-   image's natural ratio (see applyPreviewAspectRatio in review.js), and
+   image's natural ratio (see applyPreviewAspectRatio in culling.js), and
    max-width/max-height: 100% (of this cell) does the rest, mimicking
    object-fit: contain without ever needing to read the cell's pixel size.
    This guarantees the viewport can never exceed the cell, no matter what
@@ -864,7 +864,7 @@ body.page-review #content {
    needs no re-computation on window resize — the browser keeps it
    correctly fitted on every reflow automatically. Only the <img> inside
    is scaled/clipped when the user zooms in. */
-.review-preview-viewport {
+.culling-preview-viewport {
   position: relative;
   overflow: hidden;
   border: 4px solid transparent;
@@ -872,34 +872,34 @@ body.page-review #content {
   max-width: 100%;
   max-height: 100%;
 }
-.review-preview-viewport.star-5 { border-color: var(--star-5); }
-.review-preview-viewport.star-4 { border-color: var(--star-4); }
-.review-preview-viewport.star-3 { border-color: var(--star-3); }
-.review-preview-viewport.star-2 { border-color: var(--star-2); }
-.review-preview-viewport.star-1 { border-color: var(--star-1); box-shadow: 0 0 0 1px var(--border); }
-.review-preview-viewport img {
+.culling-preview-viewport.star-5 { border-color: var(--star-5); }
+.culling-preview-viewport.star-4 { border-color: var(--star-4); }
+.culling-preview-viewport.star-3 { border-color: var(--star-3); }
+.culling-preview-viewport.star-2 { border-color: var(--star-2); }
+.culling-preview-viewport.star-1 { border-color: var(--star-1); box-shadow: 0 0 0 1px var(--border); }
+.culling-preview-viewport img {
   width: 100%;
   height: 100%;
   object-fit: contain;
   display: block;
   cursor: zoom-in;
 }
-.review-preview-viewport img.zoomed { cursor: grab; }
-.review-preview-viewport img.zoomed:active { cursor: grabbing; }
+.culling-preview-viewport img.zoomed { cursor: grab; }
+.culling-preview-viewport img.zoomed:active { cursor: grabbing; }
 
 /* Read-only original-file path shown below the preview, for copy/paste,
    plus the "AI edit" button beside it. Width is set inline by
-   syncFilePathWidth() in review.js (min of the preview pane's width and
+   syncFilePathWidth() in culling.js (min of the preview pane's width and
    the rendered image's larger dimension); the row itself is centered
    under the preview instead. */
-.review-file-row {
+.culling-file-row {
   display: flex;
   align-items: center;
   gap: 8px;
   align-self: center;
   max-width: 100%;
 }
-input.review-file-path {
+input.culling-file-path {
   flex: 0 0 auto;
   max-width: 100%;
   padding: 3px 8px;
@@ -911,7 +911,7 @@ input.review-file-path {
   border-radius: 6px;
   cursor: text;
 }
-input.review-file-path:focus {
+input.culling-file-path:focus {
   outline: none;
   border-color: var(--accent);
 }
@@ -938,10 +938,10 @@ input.review-file-path:focus {
 .rank-badge.rank-1 { background: #d4a017; }
 .rank-badge.rank-2 { background: #8a8f98; }
 .rank-badge.rank-3 { background: #a86a3d; }
-.review-strip-thumb { position: relative; }
-.review-strip-thumb .rank-badge { top: 2px; left: 2px; }
+.culling-strip-thumb { position: relative; }
+.culling-strip-thumb .rank-badge { top: 2px; left: 2px; }
 
-.review-rank-info {
+.culling-rank-info {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -950,7 +950,7 @@ input.review-file-path:focus {
   background: var(--surface-2);
   font-size: 13px;
 }
-.review-rank-info .rank-reason { color: var(--muted); }
+.culling-rank-info .rank-reason { color: var(--muted); }
 
 /* LLM composition/framing quality grade (0.0-1.0, higher = better) — a
    color-coded pill shown alongside the burst-ranking badge/reason. */
@@ -969,7 +969,7 @@ input.review-file-path:focus {
 .llm-grade-badge.llm-grade-low { background: #b33a3a; }
 
 /* Shown in the main-pane rank-info bar only while viewMode === "original"
-   (see review.js toggleViewMode) — the default annotated view has no badge. */
+   (see culling.js toggleViewMode) — the default annotated view has no badge. */
 .view-mode-badge {
   display: inline-block;
   padding: 2px 8px;
@@ -982,14 +982,14 @@ input.review-file-path:focus {
   background: #3b6ea5;
 }
 
-.review-strip {
+.culling-strip {
   flex: 0 0 auto;
   display: flex;
   gap: 8px;
   overflow-x: auto;
   padding: 4px 2px;
 }
-.review-strip-thumb {
+.culling-strip-thumb {
   flex: 0 0 auto;
   width: 64px;
   border-radius: 6px;
@@ -1002,13 +1002,13 @@ input.review-file-path:focus {
   align-items: center;
   gap: 2px;
 }
-.review-strip-thumb.active { border-color: var(--accent); }
-.review-strip-img-wrap {
+.culling-strip-thumb.active { border-color: var(--accent); }
+.culling-strip-img-wrap {
   position: relative;
   width: 64px;
   height: 64px;
 }
-.review-strip-img-wrap img {
+.culling-strip-img-wrap img {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -1017,7 +1017,7 @@ input.review-file-path:focus {
 }
 /* Small star-rating icon row shown under each in-group strip thumbnail,
    centered beneath the picture. */
-.review-strip-stars {
+.culling-strip-stars {
   width: 100%;
   text-align: center;
   font-size: 9px;
@@ -1028,7 +1028,7 @@ input.review-file-path:focus {
 
 /* ------------------------------------------------------------------ *
  * Shared image-window widget (frame + viewport) — a full-page modal
- * used by the cluster page to preview an original photo with zoom/pan,
+ * used by the faces page to preview an original photo with zoom/pan,
  * built on the shared Viewport zoom controller (static/js/viewport.js).
  * ------------------------------------------------------------------ */
 body.image-window-open { overflow: hidden; }
@@ -1076,7 +1076,7 @@ body.image-window-open { overflow: hidden; }
 .image-window-close:hover { background: rgba(255, 255, 255, 0.3); }
 
 /* jQuery UI stacks its modals at z-index 100 by default, which is *below*
- * the image window above — the AI-edit dialog opened from the cluster
+ * the image window above — the AI-edit dialog opened from the faces
  * page's preview would render behind it. Lift the whole jQuery UI layer
  * (overlay < dialog < autocomplete) above the image window instead. */
 .ui-widget-overlay.ui-front { z-index: 1100; }

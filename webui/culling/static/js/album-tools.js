@@ -1,6 +1,6 @@
 "use strict";
 
-// Page 5 — Apply: show a quick album summary, then let the user pick a
+// Page 5 — Album Tools: show a quick album summary, then let the user pick a
 // destination folder and export kept photos (+ players.csv) — syncing
 // tagged face crops into the system-wide .FaceReco database and rebuilding
 // it first — with progress polling.
@@ -48,7 +48,7 @@ function setRerunFacerecoUIEnabled(enabled) {
 
 // ------------------------------------------------------------------ //
 // Adjust Blur Sensitivity — re-bucket Blur/Sharp using already-measured
-// sharpness scores (see /api/apply/regrade-sensitivity), no re-import.
+// sharpness scores (see /api/album-tools/regrade-sensitivity), no re-import.
 // ------------------------------------------------------------------ //
 function applyRegradeSensitivityToUI(mode, customValue) {
   $(`input[name="regradeSensMode"][value="${mode || "medium"}"]`).prop("checked", true);
@@ -128,7 +128,7 @@ async function pollDeepRegradeOutput() {
 
 async function openExportDestination() {
   try {
-    await apiPost("/api/apply/open-destination", {});
+    await apiPost("/api/album-tools/open-destination", {});
   } catch (err) {
     $("#exportStatus").text("Could not open folder: " + err.message);
   }
@@ -144,7 +144,7 @@ function appendExportLines(lines) {
 
 // ------------------------------------------------------------------ //
 // Export progress dialog — a non-closable jQuery UI modal while the
-// export is running (mirrors add_album.js's processing dialog), becoming
+// export is running (mirrors add-new-album.js's processing dialog), becoming
 // closable once it finishes.
 // ------------------------------------------------------------------ //
 function initExportDialog() {
@@ -175,7 +175,7 @@ function finishExportDialog(success) {
 
 // ------------------------------------------------------------------ //
 // Import-more progress dialog — same non-closable-while-running pattern
-// as the export dialog above / add_album.js's processing dialog.
+// as the export dialog above / add-new-album.js's processing dialog.
 // ------------------------------------------------------------------ //
 function initImportMoreDialog() {
   $("#importMoreDialog").dialog({
@@ -318,7 +318,7 @@ function renderStarBreakdown(breakdown, unrated) {
 
 async function loadSummary() {
   try {
-    const data = await apiGet("/api/apply/summary");
+    const data = await apiGet("/api/album-tools/summary");
     $("#summaryAlbumName").text(data.name || "Album");
     lastStarBreakdown = data.starBreakdown || {};
     renderStarBreakdown(data.starBreakdown, data.unrated);
@@ -332,7 +332,7 @@ async function loadSummary() {
 }
 
 // ------------------------------------------------------------------ //
-// Team Jersey Colour override — see /api/apply/jersey-color. Rendered as
+// Team Jersey Colour override — see /api/album-tools/jersey-color. Rendered as
 // round chip buttons ( "Auto" + each registered colour), same interaction
 // pattern as the team/jersey-colour pickers on the Add Album page.
 // ------------------------------------------------------------------ //
@@ -357,7 +357,7 @@ function renderJerseyColorChips() {
 
 async function loadJerseyOptions() {
   try {
-    const data = await apiGet("/api/apply/jersey-options");
+    const data = await apiGet("/api/album-tools/jersey-options");
     jerseyColorOptions = data.options || [];
     selectedJerseyColor = data.current || "";
     jerseyColorControlsDisabled = !!data.noTeam;
@@ -413,7 +413,7 @@ function updateExportCount() {
 async function pollExportStatus() {
   let data;
   try {
-    data = await apiGet(`/api/apply/export-status?since=${exportPollSince}`);
+    data = await apiGet(`/api/album-tools/export-status?since=${exportPollSince}`);
   } catch (err) {
     return; // transient — try again on the next tick
   }
@@ -462,7 +462,7 @@ $(function () {
     $("#regradeStatus").text("Regrading…");
     const { mode, customValue } = readRegradeSensitivityFromUI();
     try {
-      const res = await apiPost("/api/apply/regrade-sensitivity", {
+      const res = await apiPost("/api/album-tools/regrade-sensitivity", {
         sensitivityMode: mode,
         sensitivityCustomValue: customValue,
         mode: "shallow",
@@ -492,7 +492,7 @@ $(function () {
     deepRegradePollSince = 0;
     const { mode, customValue } = readRegradeSensitivityFromUI();
     try {
-      await apiPost("/api/apply/regrade-sensitivity", {
+      await apiPost("/api/album-tools/regrade-sensitivity", {
         sensitivityMode: mode,
         sensitivityCustomValue: customValue,
         mode: "deep",
@@ -515,7 +515,7 @@ $(function () {
     setRegradeUIEnabled(false);
     $("#jerseyColorStatus").text("Applying…");
     try {
-      const res = await apiPost("/api/apply/jersey-color", { teamColor, rerunLlmCulling });
+      const res = await apiPost("/api/album-tools/jersey-color", { teamColor, rerunLlmCulling });
       const parts = [];
       if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
       if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
@@ -581,7 +581,7 @@ $(function () {
     openRerunFacerecoDialog();
     $("#rerunFacerecoStatus").text("Re-running face detection…");
     try {
-      await apiPost("/api/apply/rerun-facereco", {});
+      await apiPost("/api/album-tools/rerun-facereco", {});
       rerunFacerecoPollTimer = setInterval(pollRerunFacerecoOutput, 500);
     } catch (err) {
       $("#rerunFacerecoStatus").text("Failed: " + err.message);
@@ -619,7 +619,7 @@ $(function () {
     exportPollSince = 0;
     openExportDialog();
     try {
-      await apiPost("/api/apply/export", { destination: res.path, exportFaceTagging, minStars });
+      await apiPost("/api/album-tools/export", { destination: res.path, exportFaceTagging, minStars });
       exportPollTimer = setInterval(pollExportStatus, 500);
     } catch (err) {
       $("#exportDialogStatus").text("Failed: " + err.message);

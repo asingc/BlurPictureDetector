@@ -15,8 +15,8 @@
       <h1 id="title">Photo Culling</h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("team", "Team"), ("import", "Select Album"), ("review", "Culling"), ("cluster", "Faces"), ("apply", "Summary")] %}
-      {% set gated_steps = ("review", "cluster", "apply") %}
+      {% set step_labels = [("team", "Team"), ("select-album", "Select Album"), ("culling", "Culling"), ("faces", "Faces"), ("album-tools", "Album Tools")] %}
+      {% set gated_steps = ("culling", "faces", "album-tools") %}
       {% for key, label in step_labels %}
       {% set is_disabled = key in gated_steps and not has_active_album() %}
       <a class="step {{ 'active' if active_step == key else '' }} {{ 'disabled' if is_disabled else '' }}"

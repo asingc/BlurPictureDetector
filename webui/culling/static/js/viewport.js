@@ -1,9 +1,9 @@
 "use strict";
 
 // Shared "viewport" zoom/pan math + a reusable "frame" (modal image window)
-// built on top of it. Used by the review page (viewport embedded directly
-// in the page, no frame) and the cluster page (viewport hosted inside a
-// modal frame). See static/js/review.js and static/js/cluster.js.
+// built on top of it. Used by the culling page (viewport embedded directly
+// in the page, no frame) and the faces page (viewport hosted inside a
+// modal frame). See static/js/culling.js and static/js/faces.js.
 const Viewport = (function () {
   // Given an image's natural size and the available space to display it
   // in, compute the classic object-fit: contain box (the "zoom-to-fit"
@@ -17,11 +17,11 @@ const Viewport = (function () {
   // A zoom/pan controller: holds the current zoom level + pan offset and
   // applies them (via a CSS transform) to whatever set of <img> elements is
   // passed in at call time. Callers own which images are "live" (e.g. the
-  // review page re-queries its currently displayed preview cells so up to 4
+  // culling page re-queries its currently displayed preview cells so up to 4
   // images can share one zoom/pan state), so the same controller instance
-  // can be reused across image/group navigation (and, on the review page,
+  // can be reused across image/group navigation (and, on the culling page,
   // across the annotated/original toggle — see toggleViewMode/renderMain in
-  // review.js) without resetting.
+  // culling.js) without resetting.
   //
   // Pan is tracked as a `translate(tx, ty) scale(zoom)` transform (in that
   // order) with transform-origin pinned to the image's top-left corner, so
@@ -161,7 +161,7 @@ const Viewport = (function () {
   // zoom to actual). Clicking anywhere outside the image, the close button,
   // or any other key (including Esc) closes the window immediately.
   //
-  // `opts.originalPath` / `opts.aiEditKey` (both optional, cluster.js is
+  // `opts.originalPath` / `opts.aiEditKey` (both optional, faces.js is
   // the only caller that passes them) add a toolbar below the image: a
   // readonly path box plus an "AI edit" button (see static/js/ai-edit.js).
   // Clicks/keystrokes inside that toolbar are excluded from the "anything

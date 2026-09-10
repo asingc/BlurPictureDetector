@@ -1,11 +1,11 @@
 "use strict";
 
-// Shared "AI edit" action (autoedit.py) — triggered from both the Review
-// page (next to the file-path box) and the Faces/cluster page (in the
+// Shared "AI edit" action (autoedit.py) — triggered from both the Culling
+// page (next to the file-path box) and the Faces page (in the
 // original-image preview window, see viewport.js). Streams the script's
 // combined stdout/stderr into a non-closable jQuery UI modal, reusing the
 // same processing_state/`/api/processing-output` polling plumbing as
-// import-more/rerun-facereco/deep-regrade (see static/js/apply.js) — only
+// import-more/rerun-facereco/deep-regrade (see static/js/album-tools.js) — only
 // one such background job can run at a time. The dialog's DOM is built
 // once, lazily, so this file has zero footprint on pages that never use it.
 //
