@@ -462,7 +462,7 @@ class FaceDb:
 
 
 # ---------------------------------------------------------------------------
-# Manual-override persistence (face_tag_ui.py delete/assign actions surviving
+# Manual-override persistence (cluster-tagging UI delete/assign actions surviving
 # a full re-cluster on incremental "import more images" runs -- see
 # 1_prep_review.py's merge-into-existing-album support). FaceRecoPipeline.run
 # reclusters the WHOLE album's qualified bodies on every run (simplest,
@@ -485,7 +485,7 @@ def _bbox_key(box: dict | None) -> tuple[float, float, float, float] | None:
 
 def load_manual_overrides(out_root: Path) -> dict:
     """Load ``<out_root>/manual_overrides.json`` (deleted/assigned face
-    identities recorded by face_tag_ui.py), defaulting to an empty payload
+    identities recorded by the cluster-tagging UI), defaulting to an empty payload
     when absent or unreadable."""
     path = out_root / MANUAL_OVERRIDES_FILENAME
     if not path.is_file():
@@ -504,7 +504,7 @@ def load_manual_overrides(out_root: Path) -> dict:
 
 def record_manual_override(out_root: Path, *, deleted: dict | None = None, assigned: dict | None = None) -> None:
     """Append one deletion and/or one assignment record to
-    ``<out_root>/manual_overrides.json``. Called by face_tag_ui.py whenever a
+    ``<out_root>/manual_overrides.json``. Called by the cluster-tagging UI whenever a
     commit deletes or (re-)assigns a face, so a future FaceRecoPipeline.run
     (triggered by importing more images) preserves that human decision
     instead of reverting it via fresh automatic clustering/matching.
@@ -630,7 +630,7 @@ class FaceRecoPipeline:
         # Every run reclusters the WHOLE album's qualified bodies from
         # scratch (simplest strategy, chosen so "import more images" doesn't
         # need incremental-clustering logic) -- these previously-recorded
-        # human decisions (face_tag_ui.py delete/assign) are replayed on top
+        # human decisions (cluster-tagging UI delete/assign) are replayed on top
         # of that fresh clustering so they're never silently undone.
         overrides = load_manual_overrides(out_root)
         deleted_keys = {
@@ -734,7 +734,7 @@ class FaceRecoPipeline:
         self._effective_face_db_match_margin = effective_match_margin
 
         # Feed the album's OWN already-tagged (named) clusters back into
-        # matching -- this is what lets manual face_tag_ui.py tagging survive
+        # matching -- this is what lets manual cluster-tagging UI tagging survive
         # a full recluster even when no external --face-db is configured, by
         # re-matching those faces to the same name (and therefore the same
         # output folder) via ordinary similarity matching.
@@ -1244,7 +1244,7 @@ class FaceRecoPipeline:
         cluster_name_map: dict[int, FaceDbEntry],
         assigned: dict[tuple, dict],
     ) -> tuple[list[Cluster], dict[int, FaceDbEntry]]:
-        """Force any face_tag_ui.py-assigned face into its pinned person's
+        """Force any cluster-tagging-UI-assigned face into its pinned person's
         cluster, regardless of what this run's automatic matching/clustering
         decided -- see the ``manual_overrides.json`` design notes above
         :data:`MANUAL_OVERRIDES_FILENAME`.

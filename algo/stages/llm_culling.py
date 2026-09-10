@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 
+from algo.album import Album, AlbumImage, entry_key
 from algo.config import AppConfig
 from algo.frame import Frame
 from algo.llm.culling_provider import BurstFrameInput, BurstRankingResult, CullingProvider
@@ -197,19 +198,20 @@ class LLMCullingStage(ProcessStage):
         # default) disables this filter so a fresh, non-merge run still
         # ranks every qualifying sequence as before.
         self.new_keys = new_keys
+        self._album: Album | None = None  # set for the duration of process()
 
     @staticmethod
     def _entry_key(entry: dict) -> str:
-        return entry.get("key") or Path(entry.get("file", "")).name
+        return entry_key(entry)
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
-        results_path = self.output_dir / "album.json"
-        if not results_path.exists():
-            log.warning("[LLMCullingStage] album.json not found at %s — skipping", results_path)
+        album = Album(self.output_dir)
+        if not album.exists:
+            log.warning("[LLMCullingStage] album.json not found at %s — skipping", album.album_json)
             return frames
 
-        with open(results_path, encoding="utf-8") as fh:
-            payload = json.load(fh)
+        self._album = album
+        payload = album.payload
 
         sharp_entries = _sorted_sharp_entries(payload)
         bursts = _group_bursts(sharp_entries, self.burst_gap_seconds)
@@ -309,8 +311,8 @@ class LLMCullingStage(ProcessStage):
             cost_summary.total_output_tokens, cost_summary.total_cost_usd,
         )
 
-        atomic_save_and_backup(json.dumps(payload, indent=2), results_path)
-        log.info("[LLMCullingStage] album.json updated: %s", results_path)
+        album.save()
+        log.info("[LLMCullingStage] album.json updated: %s", album.album_json)
 
         return frames
 
@@ -518,8 +520,8 @@ class LLMCullingStage(ProcessStage):
         )
 
     def _build_frame_input(self, entry: dict) -> BurstFrameInput | None:
-        file_path = Path(entry["file"])
-        image = _read_image(file_path)
+        file_path = AlbumImage(self._album, entry).original_path
+        image = _read_image(file_path) if file_path else None
         if image is None:
             log.warning("[LLMCullingStage] could not read %s — excluding from burst", file_path)
             return None

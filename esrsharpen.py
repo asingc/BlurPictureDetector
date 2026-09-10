@@ -131,9 +131,12 @@ def sharpen_image(
     tile: int = 0,
     cpu_only: bool = False,
     face_enhance: bool = True,
+    outscale: int = 1,
 ) -> np.ndarray:
     """Run Real-ESRGAN (+ optional GFPGAN) on *image*, returning a BGR uint8
-    array at the SAME resolution as the input."""
+    array. outscale=1 (default) restores the input's own resolution
+    (denoise/detail-restoration only); outscale=4 keeps Real-ESRGAN's native
+    4x super-resolution output."""
     import torch
 
     if cpu_only:
@@ -156,7 +159,7 @@ def sharpen_image(
     )
 
     if not face_enhance:
-        output, _ = upsampler.enhance(image, outscale=1)
+        output, _ = upsampler.enhance(image, outscale=outscale)
         return output
 
     from gfpgan import GFPGANer
@@ -164,7 +167,7 @@ def sharpen_image(
     gfpgan_model_path = _ensure_model(_GFPGAN_MODEL_NAME, _GFPGAN_MODEL_URL)
     face_enhancer = GFPGANer(
         model_path=gfpgan_model_path,
-        upscale=1,
+        upscale=outscale,
         arch="clean",
         channel_multiplier=2,
         bg_upsampler=upsampler,
@@ -196,6 +199,10 @@ def main() -> None:
     )
     parser.add_argument("--cpu-only", action="store_true", help="Force CPU inference even if a GPU is available.")
     parser.add_argument("--quality", type=int, default=95, metavar="1-100", help="Output JPEG quality (default: 95).")
+    parser.add_argument(
+        "--outscale", type=int, default=1, metavar="N",
+        help="Output scale factor (default: 1 = restore input resolution). Use 4 for a real 4x upscale.",
+    )
     args = parser.parse_args()
 
     if not args.input.is_file():
@@ -215,11 +222,14 @@ def main() -> None:
         tile=args.tile,
         cpu_only=args.cpu_only,
         face_enhance=not args.disable_face_enhance,
+        outscale=args.outscale,
     )
-    if output.shape[:2] != image.shape[:2]:
-        # outscale=1 should already guarantee this; resize defensively so a
-        # library-version quirk can never silently change output dimensions.
-        output = cv2.resize(output, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    expected_h, expected_w = image.shape[0] * args.outscale, image.shape[1] * args.outscale
+    if output.shape[:2] != (expected_h, expected_w):
+        # Real-ESRGAN's enhance() should already guarantee this; resize
+        # defensively so a library-version quirk can never silently change
+        # output dimensions.
+        output = cv2.resize(output, (expected_w, expected_h), interpolation=cv2.INTER_LANCZOS4)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ok, buf = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, args.quality])

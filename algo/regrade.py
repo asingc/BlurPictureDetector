@@ -58,6 +58,7 @@ from algo.stages.jersey_counting import (
     _lightness_class,
     classify_body_jersey,
 )
+from algo.album import Album, AlbumImage, entry_key
 from algo.utils import _color_from_label, atomic_save_and_backup
 
 log = logging.getLogger("BlurPictureDetector")
@@ -165,7 +166,7 @@ def _full_body_from_dict(b: dict) -> Body:
     )
 
 
-def _regenerate_preview(entry: dict, bodies: list[dict], album_path: Path) -> bool:
+def _regenerate_preview(entry: dict, bodies: list[dict], album: Album) -> bool:
     """Redraw <album>/previews/<key>.jpg (+ thumbnail) from the entry's
     just-updated per-body verdicts, so the pass/fail badges and rejection-
     reason labels baked into the preview stay in sync with the new overall
@@ -176,8 +177,7 @@ def _regenerate_preview(entry: dict, bodies: list[dict], album_path: Path) -> bo
     if image is None:
         return False
 
-    preview_path = entry.get("preview_path")
-    output_key = Path(preview_path).stem if preview_path else (entry.get("key") or Path(file_path).stem)
+    output_key = AlbumImage(album, entry).preview_stem
     auto_adj = entry.get("auto_adjustment")
 
     frame = Frame(
@@ -187,7 +187,7 @@ def _regenerate_preview(entry: dict, bodies: list[dict], album_path: Path) -> bo
         auto_adjustment=AutoAdjustment(ev=float(auto_adj["ev"])) if auto_adj else None,
         output_key=output_key,
     )
-    _annotate_frame(frame, album_path, app_config)
+    _annotate_frame(frame, album.path, app_config)
     return True
 
 
@@ -295,12 +295,11 @@ def regrade_sensitivity(
     label instead of polling it from the photos; None restores auto-polling.
     """
     info_path = album_path / "info.json"
-    results_path = album_path / "album.json"
 
     with open(info_path, encoding="utf-8") as fh:
         info = json.load(fh)
-    with open(results_path, encoding="utf-8") as fh:
-        payload = json.load(fh)
+    album = Album(album_path)
+    payload = album.payload
 
     results: list[dict] = payload.get("results", [])
     run_settings: dict = payload.get("run_settings") or {}
@@ -444,7 +443,7 @@ def regrade_sensitivity(
                 summary.recovered += 1
             else:
                 summary.demoted += 1
-            key = entry.get("key") or Path(entry.get("file", "")).name
+            key = entry_key(entry)
             item = info_items_by_key.get(key)
             if item is not None:
                 old_list = info.get(_REVIEW_INFO_KEY[old_status], [])
@@ -461,7 +460,7 @@ def regrade_sensitivity(
                 entry["keep"] = entry["stars"] >= 3
                 summary.stars_rebaselined += 1
 
-            if _regenerate_preview(entry, bodies, album_path):
+            if _regenerate_preview(entry, bodies, album):
                 summary.previews_regenerated += 1
             else:
                 summary.previews_regen_failed += 1
@@ -482,7 +481,7 @@ def regrade_sensitivity(
     payload.setdefault("run_settings", {})["sensitivity"] = str(new_threshold)
     payload["run_settings"]["team_color_override"] = pinned or ""
 
-    atomic_save_and_backup(json.dumps(payload, indent=2), results_path)
+    album.save()
     atomic_save_and_backup(json.dumps(info, indent=4), info_path)
     log.info(
         "[regrade] threshold=%.2f team_colour=%s(%s) — recovered=%d demoted=%d stars_rebaselined=%d "

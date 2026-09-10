@@ -50,8 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
-from algo.album import album_for
-from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR
+from algo.album import EDITEDIMAGES_SUBDIR, album_for
 
 try:
     from PIL import Image as _PILImage
@@ -78,7 +77,7 @@ OUTPUT_DIR = REPO_ROOT / "albums"
 # Must stay in sync with 1_prep_review.py's SENSITIVITY_THRESHOLDS.
 SENSITIVITY_PRESETS: dict[str, float] = {"low": 0.40, "medium": 0.50, "high": 0.62}
 
-# Folder-name candidates for a face-DB dir, mirroring 1_prep_review.py / face_tag_ui.py.
+# Folder-name candidates for a face-DB dir, mirroring 1_prep_review.py.
 FACE_DB_DIR_CANDIDATES: tuple[str, ...] = (".FaceReco", ".facereco", ".Facereco")
 
 
@@ -321,9 +320,7 @@ export_state = ExportState()
 # every page (common.js); if none arrives within the timeout, the watchdog
 # prints a reminder (with the relaunch link) instead of shutting the server
 # down, since a closed/idle tab shouldn't kill an otherwise-healthy local
-# server out from under a still-running job. Mirrors face_tag_ui.py's
-# watchdog, which still auto-exits (it's often launched hidden/headless with
-# no console to show this message in).
+# server out from under a still-running job.
 # --------------------------------------------------------------------------- #
 class HeartbeatState:
     def __init__(self, timeout: float = 180.0) -> None:
@@ -421,7 +418,6 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
         path,
         "--sensitivity", _sensitivity_arg(sensitivity_mode, sensitivity_custom_value),
         "--output", str(output_dir),
-        "--no-tag-ui",
     ]
     if not recognize_faces:
         cmd += ["--skip-facereco"]
@@ -497,7 +493,6 @@ def _run_import_more(path: str, album_dir: Path) -> None:
         str(REPO_ROOT / "1_prep_review.py"),
         path,
         "--output", str(album_dir),
-        "--no-tag-ui",
     ]
     if not _album_has_facereco(album_dir):
         cmd += ["--skip-facereco"]
@@ -543,7 +538,6 @@ def _run_rerun_facereco(album_dir: Path) -> None:
         str(REPO_ROOT / "1_prep_review.py"),
         "--output", str(album_dir),
         "--rerun-facereco-only",
-        "--no-tag-ui",
     ]
 
     log.info("Starting face-detection re-run: %s", " ".join(cmd))
@@ -585,8 +579,8 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
     Raises HTTPException if neither the entry nor a readable source is found.
     """
     album = album_for(album_dir)
-    entry = album.entry(key)
-    if entry is None:
+    image = album.image(key)
+    if image is None:
         raise HTTPException(status_code=404, detail="Image not found in album")
 
     stem = Path(key).stem
@@ -594,16 +588,14 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
     final = edited_dir / f"{stem}.jpg"
     pending = edited_dir / _AI_EDIT_PENDING_SUBDIR / f"{stem}.jpg"
 
-    existing_edited = entry.get("edited_image")
-    if existing_edited:
-        candidate = album_dir / existing_edited
-        if candidate.is_file():
-            return candidate, pending, final
+    edited = image.edited_path
+    if edited is not None:
+        return edited, pending, final
 
-    src = album.source_index.get(key) or entry.get("file")
-    if not src or not Path(src).is_file():
+    src = image.original_path
+    if src is None or not src.is_file():
         raise HTTPException(status_code=404, detail="Source image not found on disk")
-    return Path(src), pending, final
+    return src, pending, final
 
 
 def _prepare_before_image(source_path: Path, pending_dir: Path) -> Path:
@@ -711,7 +703,6 @@ def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
         "--output", str(album_dir),
         "--regrade-only",
         "--sensitivity", sensitivity,
-        "--no-tag-ui",
     ]
 
     log.info("Starting deep regrade: %s", " ".join(cmd))
@@ -978,13 +969,12 @@ def _read_album_summary(path: Path) -> dict:
         summary["sharpCount"] = len(sharp)
         summary["blurCount"] = len(info.get("Anno_Blur", []))
         summary["skippedCount"] = len(info.get("Anno_Skipped", []))
-        results_by_name = album_for(path).entries
+        album_images = album_for(path).images
         sharp_previews = []
         for item in sharp:
-            result = results_by_name.get(item.get("src"))
-            preview_path = result.get("preview_path") if result else None
-            if preview_path:
-                sharp_previews.append(Path(preview_path).name)
+            image = album_images.get(item.get("src"))
+            if image and image.preview_path:
+                sharp_previews.append(image.key)
         summary["previewImages"] = random.sample(sharp_previews, min(len(sharp_previews), PREVIEW_IMAGE_SAMPLE))
     except (json.JSONDecodeError, OSError):
         pass
@@ -1004,10 +994,8 @@ def _list_albums() -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# Face clustering — ported directly from face_tag_ui.py so the Face
-# Clustering page (4) is a native page of this workflow (own template + own
-# JS, styled like every other step) instead of embedding a separate server
-# via an iframe.
+# Face clustering — assign/delete review of the current album's .FaceReco
+# clusters, native to this workflow (own template + own JS).
 # --------------------------------------------------------------------------- #
 FACE_SUBDIR = "Face"
 FACE_ANNOTATED_SUBDIR = "Face.annotated"
@@ -1057,18 +1045,9 @@ def _has_active_album() -> bool:
 # --------------------------------------------------------------------------- #
 REVIEW_CATEGORIES = ("blur", "sharp", "skipped")
 _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
-# All annotated previews (blur/sharp/skipped alike) live in one shared folder
-# — see algo/stages/annotation.py::AnnotationStage.
-_PREVIEWS_SUBDIR = "previews"
-# Cached, small "cover crop" square thumbnails used by the review nav strip —
-# generated eagerly during processing (algo/stages/annotation.py) alongside
-# the preview; regenerated lazily here (see _ensure_review_thumbnail()) as a
-# fallback for albums processed before that, or if the cache goes stale.
-_THUMBNAILS_SUBDIR = THUMBNAILS_SUBDIR
-_THUMBNAIL_SIZE = THUMBNAIL_SIZE
 # Where autoedit.py's output for a photo is kept — see api_ai_edit()/
 # _run_ai_edit() below. Sibling of previews/ under the album directory.
-_EDITEDIMAGES_SUBDIR = "editedimages"
+_EDITEDIMAGES_SUBDIR = EDITEDIMAGES_SUBDIR
 # Freshly generated edits land here first and are only promoted into
 # _EDITEDIMAGES_SUBDIR once the user accepts them in the compare view.
 _AI_EDIT_PENDING_SUBDIR = ".pending"
@@ -1123,40 +1102,40 @@ def _image_timestamp(path: Path) -> float:
 
 
 def _review_images(album_path: Path, category: str) -> list[dict]:
-    """Per-image metadata for one review category: filename, annotated-preview
-    filename, effective star rating, effective keep state (derived from the
-    star rating — 3+ = keep — so it can never drift out of sync with the
-    star-driven color scheme), and best-effort capture timestamp."""
+    """Per-image metadata for one review category: album key, source path,
+    effective star rating, effective keep state (derived from the star
+    rating — 3+ = keep — so it can never drift out of sync with the
+    star-driven color scheme), and best-effort capture timestamp. Preview
+    and thumbnail images are fetched by key (see /api/anno_img and
+    /api/review/thumb), so no filenames are sent to the client."""
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
     src_dir = Path(info.get("SrcDir", ""))
-    results_by_name = album_for(album_path).entries
+    album_images = album_for(album_path).images
     default_stars = _REVIEW_DEFAULT_STARS[category]
-    previews_dir = album_path / _PREVIEWS_SUBDIR
 
     images = []
     for item in info.get(_REVIEW_INFO_KEY[category], []):
         src_name = item.get("src")
         if not src_name:
             continue
-        result = results_by_name.get(src_name)
-        preview_path = result.get("preview_path") if result else None
-        if not preview_path:
+        image = album_images.get(src_name)
+        preview = image.preview_path if image else None
+        if preview is None:
             continue
-        anno_name = Path(preview_path).name
-        stars = result.get("stars") if result else None
-        stars = int(stars) if stars is not None else default_stars
+        result = image.entry
+        stars = image.stars
+        stars = stars if stars is not None else default_stars
         keep = stars >= 3
-        burst_ranking = result.get("burst_ranking") if result else None
-        llm_grade = result.get("llm_grade") if result else None
+        burst_ranking = result.get("burst_ranking")
+        llm_grade = result.get("llm_grade")
         # Prefer the per-entry absolute source path (multi-source-directory
         # imports) over joining the album's single legacy SrcDir.
         src_path = Path(item["srcPath"]) if item.get("srcPath") else src_dir / src_name
-        ts_path = src_path if src_path.is_file() else previews_dir / anno_name
+        ts_path = src_path if src_path.is_file() else preview
         images.append({
             "file": src_name,
             "path": str(src_path),
-            "anno": anno_name,
             "keep": keep,
             "stars": stars,
             "burstRanking": burst_ranking,
@@ -1862,9 +1841,12 @@ def api_select_album(req: AlbumSelectRequest) -> dict:
 
 @app.get("/api/albums/thumb")
 def api_album_thumb(id: str = Query(...), file: str = Query(...)) -> FileResponse:
+    """Annotated preview of one photo in *any* album (not just the current
+    one) — the rotating sample images on the album-picker cards."""
     album_path = _album_dir_by_id(id)
-    fp = album_path / _PREVIEWS_SUBDIR / _safe_component(file)
-    if not fp.is_file():
+    image = album_for(album_path).image(file)
+    fp = image.preview_path if image else None
+    if fp is None or not fp.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
 
@@ -1916,7 +1898,7 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
         "category": category,
         "groups": [
             {"images": [
-                {"file": im["file"], "path": im["path"], "anno": im["anno"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
+                {"file": im["file"], "path": im["path"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
                 for im in group
             ]}
             for group in groups
@@ -1924,68 +1906,25 @@ def api_review_data(category: str = Query(...), sort: str = Query("size")) -> di
     }
 
 
-def _ensure_review_thumbnail(src_fp: Path, thumb_fp: Path) -> Path:
-    """Return a cached _THUMBNAIL_SIZE x _THUMBNAIL_SIZE "cover crop" JPEG
-    thumbnail of *src_fp* at *thumb_fp*, generating (or regenerating, if
-    *src_fp* was modified more recently) it first if needed.
-
-    Cover-crop: scale down so the shorter edge exactly fills the square, then
-    center-crop the longer edge's excess — equivalent to CSS object-fit:
-    cover. Falls back to returning *src_fp* unchanged if Pillow isn't
-    available or thumbnail generation fails for any reason.
-    """
-    if _PILImage is None:
-        return src_fp
-    try:
-        if thumb_fp.is_file() and thumb_fp.stat().st_mtime >= src_fp.stat().st_mtime:
-            return thumb_fp
-        with _PILImage.open(src_fp) as img:
-            # JPEG-only fast path: lets libjpeg decode at a reduced DCT scale
-            # instead of full resolution, since we're about to shrink to
-            # _THUMBNAIL_SIZE anyway — cuts decode time dramatically for the
-            # ~1800px-long-edge previews this reads from. No-op for non-JPEGs.
-            img.draft("RGB", (_THUMBNAIL_SIZE, _THUMBNAIL_SIZE))
-            img = img.convert("RGB")
-            w, h = img.size
-            size = _THUMBNAIL_SIZE
-            scale = size / min(w, h)
-            new_w, new_h = max(size, round(w * scale)), max(size, round(h * scale))
-            img = img.resize((new_w, new_h), _PILImage.LANCZOS)
-            left = (new_w - size) // 2
-            top = (new_h - size) // 2
-            img = img.crop((left, top, left + size, top + size))
-            thumb_fp.parent.mkdir(parents=True, exist_ok=True)
-            # Unique per-call tmp name — concurrent requests (or a running
-            # 1_prep_review.py) can be writing this same thumbnail, and a
-            # shared "<name>.tmp" lets one writer's os.replace() race out
-            # from under the other.
-            tmp_fp = thumb_fp.with_name(f"{thumb_fp.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-            img.save(tmp_fp, "JPEG", quality=85)
-            os.replace(tmp_fp, thumb_fp)
-        return thumb_fp
-    except Exception:
-        log.warning("Thumbnail generation failed for %s — serving full image", src_fp, exc_info=True)
-        return src_fp
-
-
 @app.get("/api/review/thumb/{file:path}")
 def api_review_thumb(file: str) -> FileResponse:
-    album_path = _current_album_path()
-    safe_file = _safe_component(file)
-    fp = album_path / _PREVIEWS_SUBDIR / safe_file
-    if not fp.is_file():
+    """Small square thumbnail of *file*'s annotated preview, for the review
+    page's nav strip."""
+    image = album_for(_current_album_path()).image(file)
+    thumb_fp = image.ensure_thumbnail() if image else None
+    if thumb_fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
-    thumb_fp = album_path / _THUMBNAILS_SUBDIR / safe_file
-    return FileResponse(_ensure_review_thumbnail(fp, thumb_fp))
+    return FileResponse(thumb_fp)
 
-@app.get("/api/anno_img")
-def api_anno_img(file: str = Query(...)) -> FileResponse:
+
+@app.get("/api/anno_img/{file:path}")
+def api_anno_img(file: str) -> FileResponse:
     """Full-resolution annotated preview image — shared by the review page's
     main pane (toggle-able against /api/original) and any other consumer
     that wants the annotated (not cropped/resized) version of a photo."""
-    album_path = _current_album_path()
-    fp = album_path / _PREVIEWS_SUBDIR / _safe_component(file)
-    if not fp.is_file():
+    image = album_for(_current_album_path()).image(file)
+    fp = image.preview_path if image else None
+    if fp is None or not fp.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
 
@@ -2260,9 +2199,9 @@ def api_ai_edit_accept() -> dict:
     os.replace(pending["pending_path"], final_path)
     try:
         album = album_for(album_dir)
-        entry = album.entry(key)
-        if entry is not None:
-            entry["edited_image"] = f"{_EDITEDIMAGES_SUBDIR}/{final_path.name}"
+        image = album.image(key)
+        if image is not None:
+            image.set_edited_image(final_path)
             album.save()
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("AI edit accepted but failed to record edited_image for %s: %s", key, exc)
@@ -2317,14 +2256,15 @@ def api_cluster_thumb(cluster: str, crop: str) -> FileResponse:
 
 @app.get("/api/original/{file:path}")
 def api_original(file: str) -> FileResponse:
-    """Original, unmodified source photo for *file* — shared by the cluster
-    page's face-crop context view and the review page's anno/original
-    toggle (see /api/anno_img for the annotated counterpart)."""
+    """Unmodified source photo for *file* — shared by the cluster page's
+    face-crop context view and the review page's anno/original toggle (see
+    /api/anno_img for the annotated counterpart). An accepted AI edit always
+    wins over the original, so the user sees the current state of the photo."""
     album_path = _current_album_path()
-    src_path = album_for(album_path).source_index.get(file)
-    if src_path:
-        fp = Path(src_path)
-        if fp.is_file():
+    image = album_for(album_path).image(file)
+    if image is not None:
+        fp = image.image_path
+        if fp is not None and fp.is_file():
             return FileResponse(fp)
     # Fall back to the legacy single-SrcDir + basename join for albums
     # written before multi-source-directory import support existed.

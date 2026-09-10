@@ -1507,67 +1507,6 @@ def _run_facereco(
         log.error("Face recognition failed: %s", exc, exc_info=True)
 
 
-def _find_free_port(start: int = 8000, limit: int = 1000) -> int:
-    """Return the first available localhost TCP port at or after ``start``.
-
-    Scans sequentially with a plain bind/release probe per port — pure
-    socket-module behaviour, identical on every platform — rather than
-    asking the OS to hand back a random ephemeral port.
-    """
-    for port in range(start, start + limit):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError(f"No free port found in range {start}-{start + limit - 1}")
-
-
-def _launch_face_tag_ui(output_dir: Path) -> None:
-    """Launch the face-tagging web UI as a hidden background process, scoped
-    to this run's ``output_dir`` album, on the first free port from 8000.
-
-    Waits (polling) for the process to exit on its own — e.g. its own
-    heartbeat watchdog firing once the browser tab is closed — so the
-    reviewer has a natural checkpoint before moving on. Pressing "C" skips
-    the wait without terminating the background process.
-    """
-    script = Path(__file__).resolve().parent / "face_tag_ui.py"
-    if not script.is_file():
-        log.warning("face_tag_ui.py not found — skipping face tagging UI launch.")
-        return
-
-    port = _find_free_port()
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, str(script), "--album", str(output_dir), "--port", str(port)],
-            creationflags=creationflags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as exc:
-        log.warning("Could not launch face tagging UI: %s", exc)
-        return
-
-    log.info("")
-    log.info('Tagging faces, close the browser when you are done.  Press "C" to skip waiting...')
-    try:
-        while proc.poll() is None:
-            if msvcrt is not None and msvcrt.kbhit():
-                ch = msvcrt.getch()
-                if ch.lower() == b"c":
-                    log.info("Skipping wait — face tagging UI keeps running in the background.")
-                    return
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        log.info("Interrupted — face tagging UI keeps running in the background.")
-        return
-
-    log.info("Face tagging UI closed.")
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1637,16 +1576,6 @@ def main() -> None:
             "Skip face recognition clustering. By default, .FaceReco/ is generated "
             "under the output directory after preview generation completes. "
             "Use this flag to disable it (e.g. if dlib is not installed)."
-        ),
-    )
-    parser.add_argument(
-        "--no-tag-ui",
-        action="store_true",
-        help=(
-            "Do not launch the interactive face-tagging web UI (face_tag_ui.py) "
-            "after face recognition completes, and don't wait for it. Useful for "
-            "headless/automated invocations (e.g. from another web UI) where no "
-            "one will open the browser tab."
         ),
     )
     parser.add_argument(
@@ -2012,8 +1941,6 @@ def main() -> None:
             engine=run_settings.get("engine", args.engine),
             sensitivity_threshold=sensitivity_threshold,
         ).process([], app_config)
-        if not args.no_tag_ui:
-            _launch_face_tag_ui(output_dir)
         log.info("Face detection re-run complete.")
         return
 
@@ -2216,8 +2143,6 @@ def main() -> None:
                 engine=args.engine,
                 sensitivity_threshold=sensitivity_threshold,
             ).process(frames, app_config)
-            if not args.no_tag_ui:
-                _launch_face_tag_ui(output_dir)
 
     openai_api_key = args.openaikey or os.environ.get("OPENAI_API_KEY")
     if frames and not args.skip_llm_cull and openai_api_key:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -20,6 +21,8 @@ try:
 except ImportError:  # Pillow not installed — EXIF timestamps just won't be available.
     _PILImage = None
     _PILExifTags = None
+
+log = logging.getLogger(__name__)
 
 
 # COCO 17-keypoint head indices: nose, left-eye, right-eye, left-ear, right-ear.
@@ -224,6 +227,48 @@ def write_cover_thumbnail(image: np.ndarray, out_path: Path, size: int = THUMBNA
     if not cv2.imwrite(str(tmp_fp), cropped, [cv2.IMWRITE_JPEG_QUALITY, quality]):
         raise OSError(f"cv2.imwrite failed to write thumbnail: {tmp_fp}")
     os.replace(tmp_fp, out_path)
+
+
+def ensure_cover_thumbnail(src_path: Path, out_path: Path, size: int = THUMBNAIL_SIZE, quality: int = 85) -> Path:
+    """Return a cached *size* x *size* cover-crop thumbnail of *src_path* at
+    *out_path*, generating (or regenerating, if *src_path* is newer) it
+    first if needed.
+
+    The lazy counterpart of `write_cover_thumbnail` — for albums imported
+    before thumbnails were written eagerly, or when the cache goes stale.
+    Reads from disk via Pillow rather than cv2 for its JPEG draft mode,
+    which lets libjpeg decode at a reduced DCT scale instead of full
+    resolution. Falls back to returning *src_path* unchanged if Pillow is
+    unavailable or generation fails for any reason, so a caller can always
+    serve *something*.
+    """
+    if _PILImage is None:
+        return src_path
+    try:
+        if out_path.is_file() and out_path.stat().st_mtime >= src_path.stat().st_mtime:
+            return out_path
+        with _PILImage.open(src_path) as img:
+            img.draft("RGB", (size, size))
+            img = img.convert("RGB")
+            w, h = img.size
+            scale = size / min(w, h)
+            new_w, new_h = max(size, round(w * scale)), max(size, round(h * scale))
+            img = img.resize((new_w, new_h), _PILImage.LANCZOS)
+            left = (new_w - size) // 2
+            top = (new_h - size) // 2
+            img = img.crop((left, top, left + size, top + size))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            # Unique per-call tmp name — concurrent requests (or a running
+            # 1_prep_review.py) can be writing this same thumbnail, and a
+            # shared "<name>.tmp" lets one writer's os.replace() race out
+            # from under the other.
+            tmp_fp = out_path.with_name(f"{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            img.save(tmp_fp, "JPEG", quality=quality)
+            os.replace(tmp_fp, out_path)
+        return out_path
+    except Exception:
+        log.warning("Thumbnail generation failed for %s — serving full image", src_path, exc_info=True)
+        return src_path
 
 
 def cap_long_edge(image: np.ndarray, max_long_edge: float) -> np.ndarray:

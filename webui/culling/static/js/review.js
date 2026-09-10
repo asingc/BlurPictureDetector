@@ -19,7 +19,7 @@ function previewImgs() {
   return $("#reviewPreview .review-preview-cell img");
 }
 
-// categoryData[category] = { groups: [{images:[{file,anno,keep,stars}, ...]}, ...], activeGroup, activeImage }
+// categoryData[category] = { groups: [{images:[{file,keep,stars}, ...]}, ...], activeGroup, activeImage }
 const categoryData = {};
 // Pending client-side star-rating overrides (hotkeys 1-5, or the space-bar
 // quick keep/drop toggle), shared across all 3 tabs: {filename: stars (1-5)}.
@@ -27,15 +27,17 @@ const categoryData = {};
 // keep/drop map to track.
 const pendingStarOverrides = {};
 
-function reviewThumbUrl(anno) {
-  return `/api/review/thumb/${encodeURIComponent(anno)}`;
+// Every image endpoint is addressed by the album key (im.file) — the server
+// resolves which file to serve (see algo/album.py::AlbumImage).
+function reviewThumbUrl(file) {
+  return `/api/review/thumb/${encodeURIComponent(file)}`;
 }
 
 // Full-resolution images for the large main preview pane, toggled between
 // via the 'x' hotkey (see viewMode below) — the small cached-thumbnail
 // endpoint above is always used for the nav/strip thumbnails, regardless.
-function annoImgUrl(anno) {
-  return `/api/anno_img?file=${encodeURIComponent(anno)}`;
+function annoImgUrl(file) {
+  return `/api/anno_img/${encodeURIComponent(file)}`;
 }
 function originalImgUrl(file) {
   return `/api/original/${encodeURIComponent(file)}`;
@@ -48,7 +50,7 @@ function originalImgUrl(file) {
 const VIEW_MODE_STORAGE_KEY = "review.viewMode";
 let viewMode = localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "original" ? "original" : "anno";
 function mainImgUrl(im) {
-  return viewMode === "original" ? originalImgUrl(im.file) : annoImgUrl(im.anno);
+  return viewMode === "original" ? originalImgUrl(im.file) : annoImgUrl(im.file);
 }
 function toggleViewMode() {
   viewMode = viewMode === "original" ? "anno" : "original";
@@ -356,7 +358,7 @@ function renderMain() {
   group.images.forEach((im, i) => {
     const $thumb = $("<div>", { class: "review-strip-thumb" }).toggleClass("active", i === data.activeImage);
     const $imgWrap = $("<div>", { class: "review-strip-img-wrap" });
-    $imgWrap.append($("<img>", { src: reviewThumbUrl(im.anno), alt: im.file }));
+    $imgWrap.append($("<img>", { src: reviewThumbUrl(im.file), alt: im.file }));
     if (im.burstRanking) {
       $imgWrap.append($("<span>", { class: "rank-badge rank-" + im.burstRanking.rank }).text("#" + im.burstRanking.rank));
       $thumb.attr("title", "#" + im.burstRanking.rank + ": " + (im.burstRanking.reason || ""));

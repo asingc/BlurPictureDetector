@@ -37,8 +37,8 @@ dlib>=19.24.0
 # Optional but required when using the facenet face-recognition provider
 facenet-pytorch>=2.6.0
 
-# Web UI for face-reco cluster tagging (face_tag_ui.py) and the end-to-end
-# photo culling UI (culling_app.py). Permissive licenses (FastAPI MIT,
+# Web UI for the end-to-end photo culling UI (culling_app.py), including its
+# face-reco cluster tagging page. Permissive licenses (FastAPI MIT,
 # uvicorn/starlette BSD-3-Clause, Jinja2 BSD-3-Clause).
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0

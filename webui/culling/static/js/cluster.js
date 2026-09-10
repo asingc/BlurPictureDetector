@@ -1,9 +1,7 @@
 "use strict";
 
 // Page 4 — Face clustering: native review UI (thumbnails / assign / delete)
-// for the current album's .FaceReco clusters, ported from the standalone
-// face_tag_ui.py tool so it looks and feels like every other step instead of
-// being embedded from a separate server.
+// for the current album's .FaceReco clusters.
 
 const ClusterApp = {
   album: null,
