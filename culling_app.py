@@ -181,8 +181,8 @@ class AlbumDeleteRequest(BaseModel):
 
 class CullingApplyRequest(BaseModel):
     # {original filename: stars} for every image the user star-rated (hotkeys
-    # 1-5, or the space-bar quick keep/drop toggle) this session, across all
-    # 3 culling tabs at once. Anything not present here keeps its current
+    # 1-5, or the space-bar quick keep/drop toggle) this session, across every
+    # star-filter view visited. Anything not present here keeps its current
     # effective (explicit-or-default) star rating. "keep" is always derived
     # server-side from the final star rating (3+ = keep) — there is no
     # separate keep/drop flag to track.
@@ -1038,10 +1038,11 @@ def _has_active_album() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Culling (page 3) — sort blur / sharp / skipped images into keep / drop,
-# grouped into time-based "bursts". Decisions are staged client-side and only
-# committed to album.json (as an explicit "keep" boolean per entry) when the
-# user hits Apply — see api_culling_apply().
+# Culling (page 3) — filter images by effective star rating (0 = skipped,
+# 1-5 = graded; independently selectable, not a threshold), grouped into
+# time-based "bursts". Decisions are staged client-side and only committed
+# to album.json (as an explicit "keep" boolean per entry) when the user hits
+# Apply — see api_culling_apply().
 # --------------------------------------------------------------------------- #
 CULLING_CATEGORIES = ("blur", "sharp", "skipped")
 _CULLING_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
@@ -1054,17 +1055,13 @@ _AI_EDIT_PENDING_SUBDIR = ".pending"
 # Formats a browser can render directly; anything else (RAW, TIFF) has to be
 # rasterized before it can be shown in the before/after compare view.
 _WEB_DISPLAYABLE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"})
-# Effective "keep" when album.json has no explicit value yet (older albums,
-# or entries the user hasn't touched this session): sharp images default to
-# keep, blur/skipped default to drop — matching the pre-existing behaviour of
-# manually deleting anno_* previews to "reject" an image.
-_CULLING_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
-
 # Effective star rating when album.json has no explicit "stars" value yet
-# (older albums, or the LLM culling stage never ran) — same true/false split
-# as _REVIEW_DEFAULT_KEEP, expressed on the 1-5 scale (3 = baseline keep,
-# 1 = baseline discard).
-_CULLING_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _CULLING_DEFAULT_KEEP.items()}
+# (older albums, or the LLM culling stage never ran): sharp images default to
+# a baseline "keep" of 3, blur images to 1 (the worst tier a genuinely-graded
+# photo can land on). Skipped images (no person detected — never graded at
+# all) default to a distinct 0, so they're never conflated with a photo that
+# WAS scored and simply came out blurry.
+_CULLING_DEFAULT_STARS = {"blur": 1, "sharp": 3, "skipped": 0}
 
 # Consecutive photos within this many seconds of each other are treated as
 # the same "burst" for the nav-pane grouping.
@@ -1156,6 +1153,29 @@ def _kept_image_basenames(album_path: Path, min_stars: int = 3) -> set[str]:
             if image["stars"] >= min_stars:
                 kept.add(image["file"])
     return kept
+
+
+def _all_culling_images(album_path: Path) -> list[dict]:
+    """Every reviewable image (blur + sharp + skipped combined) with its
+    effective star rating — the single pool the Culling page's star filter
+    is applied against."""
+    images = []
+    for category in CULLING_CATEGORIES:
+        images.extend(_culling_images(album_path, category))
+    return images
+
+
+def _parse_star_filter(raw: str) -> set[int]:
+    """Parses the Culling page's star-filter query param: a comma-separated
+    list of star levels (0-5, independently selectable — not a >=/<=
+    threshold). Raises 400 on anything empty or out of range."""
+    try:
+        stars = {int(s) for s in raw.split(",") if s.strip() != ""}
+    except ValueError:
+        stars = set()
+    if not stars or not stars.issubset(set(range(6))):
+        raise HTTPException(status_code=400, detail="Invalid stars filter")
+    return stars
 
 
 def _group_bursts(images: list[dict]) -> list[list[dict]]:
@@ -1874,28 +1894,30 @@ def api_current_album() -> dict:
 
 @app.get("/api/culling/summary")
 def api_culling_summary() -> dict:
+    """Count of reviewable images at each effective star level (0 = skipped,
+    1-5 = graded), for the star-filter checkboxes' live counts."""
     album_path = _current_album_path()
-    with open(album_path / "info.json", encoding="utf-8") as fh:
-        info = json.load(fh)
-    return {
-        "blurCount": len(info.get("Anno_Blur", [])),
-        "sharpCount": len(info.get("Anno_Sharp", [])),
-        "skippedCount": len(info.get("Anno_Skipped", [])),
-    }
+    star_counts = {str(n): 0 for n in range(6)}
+    for image in _all_culling_images(album_path):
+        star_counts[str(image["stars"])] += 1
+    return {"starCounts": star_counts}
 
 
 @app.get("/api/culling/data")
-def api_culling_data(category: str = Query(...), sort: str = Query("size")) -> dict:
-    if category not in CULLING_CATEGORIES:
-        raise HTTPException(status_code=400, detail="Invalid category")
+def api_culling_data(stars: str = Query(...), sort: str = Query("size")) -> dict:
+    """Images whose effective star rating is one of the independently
+    selected *stars* levels (comma-separated, e.g. "1,3,5"), grouped into
+    bursts (or rating-sorted chunks) exactly like the un-filtered page did —
+    grouping only ever sees the already-filtered pool."""
+    star_set = _parse_star_filter(stars)
     album_path = _current_album_path()
-    images = _culling_images(album_path, category)
+    images = [im for im in _all_culling_images(album_path) if im["stars"] in star_set]
     if sort == "rating":
         groups = _rating_groups(images)
     else:
         groups = _sort_groups(_group_bursts(images), sort)
     return {
-        "category": category,
+        "stars": sorted(star_set),
         "groups": [
             {"images": [
                 {"file": im["file"], "path": im["path"], "keep": im["keep"], "stars": im["stars"], "burstRanking": im["burstRanking"], "llmGrade": im["llmGrade"]}
@@ -1931,8 +1953,8 @@ def api_anno_img(file: str) -> FileResponse:
 
 @app.post("/api/culling/apply")
 def api_culling_apply(req: CullingApplyRequest) -> dict:
-    """Commit pending star-rating decisions (staged client-side, across all 3
-    culling tabs at once) into album.json. Every reviewable entry gets an
+    """Commit pending star-rating decisions (staged client-side, across every
+    star-filter view) into album.json. Every reviewable entry gets an
     explicit "stars" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
     with "keep" always derived from the final star rating (3+ = keep) so it

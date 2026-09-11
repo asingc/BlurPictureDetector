@@ -10,12 +10,30 @@
 
 <div id="cullingApp" style="display:none">
   <div class="culling-toolbar">
-    <div class="culling-tabs" id="cullingTabs">
-      <button type="button" class="culling-tab active" data-category="sharp">Sharp <span class="tab-count" id="countSharp">0</span></button>
-      <button type="button" class="culling-tab" data-category="blur">Blur <span class="tab-count" id="countBlur">0</span></button>
-      <button type="button" class="culling-tab" data-category="skipped">Skipped <span class="tab-count" id="countSkipped">0</span></button>
+    <div class="culling-star-filter" id="cullingStarFilter">
+      <label class="star-filter-chip star-filter-0">
+        <input type="checkbox" value="0" />Skipped <span class="tab-count" id="countStar0">0</span>
+      </label>
+      <label class="star-filter-chip star-filter-1">
+        <input type="checkbox" value="1" />1★ <span class="tab-count" id="countStar1">0</span>
+      </label>
+      <label class="star-filter-chip star-filter-2">
+        <input type="checkbox" value="2" />2★ <span class="tab-count" id="countStar2">0</span>
+      </label>
+      <label class="star-filter-chip star-filter-3 checked">
+        <input type="checkbox" value="3" checked />3★ <span class="tab-count" id="countStar3">0</span>
+      </label>
+      <label class="star-filter-chip star-filter-4 checked">
+        <input type="checkbox" value="4" checked />4★ <span class="tab-count" id="countStar4">0</span>
+      </label>
+      <label class="star-filter-chip star-filter-5 checked">
+        <input type="checkbox" value="5" checked />5★ <span class="tab-count" id="countStar5">0</span>
+      </label>
     </div>
     <div class="culling-controls">
+      <label class="inline-check culling-anno-toggle">Show Annotation
+        <input type="checkbox" id="cullingShowAnnotation" checked />
+      </label>
       <label class="inline-check">Sort
         <select id="cullingSort">
           <option value="size">Largest group first</option>

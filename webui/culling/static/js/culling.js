@@ -1,14 +1,23 @@
 "use strict";
 
-// Page 3 — Culling: sort blur / sharp / skipped photos into keep / drop,
-// grouped into time-based "bursts". Decisions are staged here in memory
-// (across all 3 tabs) and only written to album.json when Apply is hit.
+// Page 3 — Culling: filter photos by effective star rating (0 = skipped,
+// 1-5 = graded; independently checked/unchecked, not a threshold), then
+// group the filtered pool into time-based "bursts". Decisions are staged
+// here in memory and only written to album.json when Apply is hit.
 
-const CATEGORIES = ["blur", "sharp", "skipped"];
-
-let currentCategory = "sharp";
+// Star levels currently checked in the filter row — defaults to the old
+// "Sharp tab" equivalent (3/4/5 = keep). A Set so toggling one checkbox
+// never touches the others.
+let selectedStars = new Set([3, 4, 5]);
 let sortMode = "size";
 let previewCount = 1;
+
+// `im.stars` can legitimately be 0 (skipped), so every place that used to
+// fall back with `im.stars || 3` needs this instead — `|| 3` would silently
+// turn a real 0 into 3.
+function effStars(im) {
+  return typeof im.stars === "number" ? im.stars : 3;
+}
 
 // Zoom/pan controller for the preview pane (see static/js/viewport.js),
 // shared across all currently previewed image cells (up to 4 at once) so
@@ -19,12 +28,15 @@ function previewImgs() {
   return $("#cullingPreview .culling-preview-cell img");
 }
 
-// categoryData[category] = { groups: [{images:[{file,keep,stars}, ...]}, ...], activeGroup, activeImage }
-const categoryData = {};
+// The currently-loaded filtered/grouped view: { groups: [{images:[{file,keep,stars}, ...]}, ...], activeGroup, activeImage }.
+// Re-fetched whenever the star filter or sort mode changes; a star hotkey
+// edit mutates it in place instead (see setActiveStars) so re-rating a
+// photo never makes it vanish out from under the user mid-session.
+let currentData = null;
 // Pending client-side star-rating overrides (hotkeys 1-5, or the space-bar
-// quick keep/drop toggle), shared across all 3 tabs: {filename: stars (1-5)}.
-// "keep" is always derived from stars (3+ = keep) — there is no separate
-// keep/drop map to track.
+// quick keep/drop toggle), across every filter view visited this session:
+// {filename: stars (0-5)}. "keep" is always derived from stars (3+ = keep)
+// — there is no separate keep/drop map to track.
 const pendingStarOverrides = {};
 
 // Every image endpoint is addressed by the album key (im.file) — the server
@@ -43,19 +55,24 @@ function originalImgUrl(file) {
   return `/api/original/${encodeURIComponent(file)}`;
 }
 
-// Main-pane view mode ("anno" | "original"), toggled page-wide by the 'x'
-// hotkey (see the keydown handler below) and persisted across reloads.
-// Only changes which URL renderMain() uses — the other version is never
-// pre-fetched/pre-loaded until the user actually switches to it.
+// Main-pane view mode ("anno" | "original"), toggled either by the "Show
+// Annotation" checkbox in the preview area or the 'x' hotkey (see the
+// keydown handler below), and persisted across reloads. Only changes which
+// URL renderMain() uses — the other version is never pre-fetched/pre-loaded
+// until the user actually switches to it.
 const VIEW_MODE_STORAGE_KEY = "culling.viewMode";
 let viewMode = localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "original" ? "original" : "anno";
 function mainImgUrl(im) {
   return viewMode === "original" ? originalImgUrl(im.file) : annoImgUrl(im.file);
 }
-function toggleViewMode() {
-  viewMode = viewMode === "original" ? "anno" : "original";
+function setViewMode(mode) {
+  viewMode = mode;
   localStorage.setItem(VIEW_MODE_STORAGE_KEY, viewMode);
+  $("#cullingShowAnnotation").prop("checked", viewMode === "anno");
   renderMain();
+}
+function toggleViewMode() {
+  setViewMode(viewMode === "original" ? "anno" : "original");
 }
 
 // The image currently shown in the main preview pane, kept in sync by
@@ -76,8 +93,8 @@ function bestIndex(group) {
   let best = 0;
   group.images.forEach((im, i) => {
     const bestIm = group.images[best];
-    const stars = im.stars || 3;
-    const bestStars = bestIm.stars || 3;
+    const stars = effStars(im);
+    const bestStars = effStars(bestIm);
     if (stars > bestStars || (stars === bestStars && grade(im) > grade(bestIm))) {
       best = i;
     }
@@ -106,17 +123,10 @@ async function initCulling() {
   }
   $("#cullingApp").show();
 
-  try {
-    const summary = await apiGet("/api/culling/summary");
-    $("#countBlur").text(summary.blurCount);
-    $("#countSharp").text(summary.sharpCount);
-    $("#countSkipped").text(summary.skippedCount);
-  } catch (err) {
-    $("#cullingStatus").text("Failed to load culling summary: " + err.message).show();
-  }
+  await loadSummary();
 
   try {
-    await fetchCategory(currentCategory);
+    await fetchFiltered();
     renderNav();
     renderMain();
   } catch (err) {
@@ -124,8 +134,29 @@ async function initCulling() {
   }
 }
 
-async function fetchCategory(category) {
-  const url = `/api/culling/data?category=${encodeURIComponent(category)}&sort=${encodeURIComponent(sortMode)}`;
+async function loadSummary() {
+  try {
+    const summary = await apiGet("/api/culling/summary");
+    for (let n = 0; n <= 5; n++) {
+      $("#countStar" + n).text(summary.starCounts[String(n)] || 0);
+    }
+  } catch (err) {
+    $("#cullingStatus").text("Failed to load culling summary: " + err.message).show();
+  }
+}
+
+// Re-fetches the currently filtered/grouped view from the server. Called
+// on initial load and whenever the star filter or sort mode changes —
+// NEVER as a side effect of re-rating a photo (see setActiveStars), so a
+// photo the user just re-rated out of the current filter stays visible
+// until the next real refresh (filter/sort change, or a page reload).
+async function fetchFiltered() {
+  if (selectedStars.size === 0) {
+    currentData = null;
+    return;
+  }
+  const starsParam = Array.from(selectedStars).sort().join(",");
+  const url = `/api/culling/data?stars=${encodeURIComponent(starsParam)}&sort=${encodeURIComponent(sortMode)}`;
   const data = await apiGet(url);
   // Re-apply any pending (not-yet-applied) star overrides on top of the
   // persisted state the server just handed back, then derive "keep" from
@@ -136,34 +167,28 @@ async function fetchCategory(category) {
       if (Object.prototype.hasOwnProperty.call(pendingStarOverrides, im.file)) {
         im.stars = pendingStarOverrides[im.file];
       }
-      im.keep = (im.stars || 3) >= 3;
+      im.keep = effStars(im) >= 3;
     });
   });
-  categoryData[category] = {
+  currentData = {
     groups: data.groups,
     activeGroup: 0,
     activeImage: bestIndex(data.groups[0]),
   };
 }
 
-async function ensureCategory(category) {
-  if (!categoryData[category]) {
-    await fetchCategory(category);
-  }
-}
-
 // ------------------------------------------------------------------ //
 // Nav pane (burst groups as rows of small star-colored dots)
 // ------------------------------------------------------------------ //
 function renderNav() {
-  const data = categoryData[currentCategory];
+  const data = currentData;
   const $nav = $("#cullingNav").empty();
   if (!data) return;
 
   data.groups.forEach((group, gi) => {
     const $row = $("<div>", { class: "culling-nav-row" }).toggleClass("active", gi === data.activeGroup);
     group.images.forEach((im) => {
-      $row.append($("<span>", { class: `culling-dot star-${im.stars || 3}` }));
+      $row.append($("<span>", { class: `culling-dot star-${effStars(im)}` }));
     });
     $row.on("click", () => {
       data.activeGroup = gi;
@@ -285,7 +310,7 @@ function llmGradeClass(grade) {
 }
 
 function renderMain() {
-  const data = categoryData[currentCategory];
+  const data = currentData;
   const $preview = $("#cullingPreview").empty();
   const $rankInfo = $("#cullingRankInfo").empty().hide();
   const $strip = $("#cullingStrip").empty();
@@ -335,7 +360,7 @@ function renderMain() {
   for (let i = start; i < end; i++) {
     const im = group.images[i];
     const $cell = $("<div>", { class: "culling-preview-cell" }).toggleClass("active", i === data.activeImage);
-    const $viewport = $("<div>", { class: `culling-preview-viewport star-${im.stars || 3}` });
+    const $viewport = $("<div>", { class: `culling-preview-viewport star-${effStars(im)}` });
     const $img = $("<img>", { src: mainImgUrl(im), alt: im.file });
     $viewport.append($img);
     if (im.burstRanking) {
@@ -364,7 +389,7 @@ function renderMain() {
       $thumb.attr("title", "#" + im.burstRanking.rank + ": " + (im.burstRanking.reason || ""));
     }
     $thumb.append($imgWrap);
-    const stars = im.stars || 3;
+    const stars = effStars(im);
     $thumb.append($("<div>", { class: "culling-strip-stars" }).text("★".repeat(stars) + "☆".repeat(5 - stars)));
     $thumb.on("click", () => {
       data.activeImage = i;
@@ -384,19 +409,19 @@ function renderMain() {
 // the border/dot colors always stay in sync with whatever set the star
 // rating last (never a separate, driftable "keep" flag).
 function toggleActiveKeep() {
-  const data = categoryData[currentCategory];
+  const data = currentData;
   if (!data) return;
   const group = data.groups[data.activeGroup];
   if (!group) return;
   const im = group.images[data.activeImage];
-  setActiveStars((im.stars || 3) >= 3 ? 1 : 3);
+  setActiveStars(effStars(im) >= 3 ? 1 : 3);
 }
 
 // Star-rating hotkeys (1-5): sets the active image's star tier and derives
 // keep from it (3+ = keep, 1-2 = drop), consistent with the LLM-assigned
 // star scale (see algo/stages/llm_culling.py::_assign_star_ratings).
 function setActiveStars(stars) {
-  const data = categoryData[currentCategory];
+  const data = currentData;
   if (!data) return;
   const group = data.groups[data.activeGroup];
   if (!group) return;
@@ -420,7 +445,7 @@ $(document).on("keydown", (e) => {
   if (activeTag === "select" || activeTag === "input" || activeTag === "textarea") return;
   if (!$("#cullingApp").is(":visible")) return;
 
-  const data = categoryData[currentCategory];
+  const data = currentData;
   if (!data) return;
   const group = data.groups[data.activeGroup];
 
@@ -490,15 +515,28 @@ $(document).on("keydown", (e) => {
 // ------------------------------------------------------------------ //
 // Toolbar controls
 // ------------------------------------------------------------------ //
-$("#cullingTabs").on("click", ".culling-tab", async function () {
-  const category = $(this).data("category");
-  if (category === currentCategory) return;
-  currentCategory = category;
-  $(".culling-tab").removeClass("active");
-  $(this).addClass("active");
-  await ensureCategory(category);
+async function refreshFilteredView() {
+  if (selectedStars.size === 0) {
+    currentData = null;
+    $("#cullingNav").empty();
+    $("#cullingPreview, #cullingStrip").empty();
+    $("#cullingRankInfo").hide();
+    $("#cullingFilePath").val("");
+    $("#cullingStatus").text("Select at least one star rating to show photos.").show();
+    return;
+  }
+  $("#cullingStatus").hide();
+  await fetchFiltered();
   renderNav();
   renderMain();
+}
+
+$("#cullingStarFilter").on("change", "input[type=checkbox]", async function () {
+  const n = parseInt($(this).val(), 10);
+  if (this.checked) selectedStars.add(n);
+  else selectedStars.delete(n);
+  $(this).closest(".star-filter-chip").toggleClass("checked", this.checked);
+  await refreshFilteredView();
 });
 
 $("#cullingPreviewCount").on("change", function () {
@@ -508,10 +546,7 @@ $("#cullingPreviewCount").on("change", function () {
 
 $("#cullingSort").on("change", async function () {
   sortMode = $(this).val();
-  Object.keys(categoryData).forEach((c) => delete categoryData[c]);
-  await fetchCategory(currentCategory);
-  renderNav();
-  renderMain();
+  await refreshFilteredView();
 });
 
 $("#cullingApplyBtn").on("click", async function () {
@@ -525,6 +560,7 @@ $("#cullingApplyBtn").on("click", async function () {
     await apiPost("/api/culling/apply", { starOverrides });
     Object.keys(pendingStarOverrides).forEach((k) => delete pendingStarOverrides[k]);
     $("#cullingStatus").text("Changes applied.").show();
+    await loadSummary();
   } catch (err) {
     $("#cullingStatus").text("Failed to apply changes: " + err.message).show();
   } finally {
@@ -537,6 +573,18 @@ $("#cullingAiEditBtn").on("click", function () {
   AiEdit.run(lastActiveImage.file);
 });
 
+$("#cullingShowAnnotation").on("change", function () {
+  setViewMode(this.checked ? "anno" : "original");
+});
+
 $(function () {
+  // Keep the checkboxes' checked state (and chip styling) in sync with
+  // selectedStars, in case the two defaults (here and in culling.html)
+  // ever drift apart.
+  $("#cullingStarFilter input[type=checkbox]").each(function () {
+    this.checked = selectedStars.has(parseInt(this.value, 10));
+    $(this).closest(".star-filter-chip").toggleClass("checked", this.checked);
+  });
+  $("#cullingShowAnnotation").prop("checked", viewMode === "anno");
   initCulling();
 });
