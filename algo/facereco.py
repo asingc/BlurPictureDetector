@@ -14,6 +14,7 @@ from sklearn.cluster import AgglomerativeClustering
 from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model, make_alignment_debug_image
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 from algo.album import Album, PersonRecord
+from algo.album_info import AlbumInfo
 from algo.models import Box as ModelBox
 
 log = logging.getLogger("BlurPictureDetector")
@@ -605,7 +606,6 @@ class FaceRecoPipeline:
     def run(self, prep_output_dir: Path) -> Path:
         prep_output_dir = prep_output_dir.resolve()
         album = Album(prep_output_dir)
-        info_path = prep_output_dir / "info.json"
 
         log.info("FaceReco: starting  prep_dir=%s", prep_output_dir)
         log.info("FaceReco: face alignment %s", "ENABLED" if self.config.align_faces else "disabled")
@@ -620,8 +620,8 @@ class FaceRecoPipeline:
             self.config.output_dir_name,
         )
 
-        info = self._load_json(info_path)
-        src_dir = Path(info.get("SrcDir", "")).resolve() if info.get("SrcDir") else prep_output_dir
+        info = AlbumInfo(prep_output_dir)
+        src_dir = Path(info.src_dir).resolve() if info.src_dir else prep_output_dir
         log.debug("FaceReco: src_dir=%s", src_dir)
 
         out_root = prep_output_dir / self.config.output_dir_name
@@ -792,12 +792,6 @@ class FaceRecoPipeline:
                  len(samples), len(clusters), out_root)
         return out_root
 
-    def _load_json(self, path: Path) -> dict:
-        if not path.exists():
-            raise FileNotFoundError(f"Required file not found: {path}")
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-
     def _collect_qualified_bodies(
         self,
         album: Album,
@@ -867,7 +861,6 @@ class FaceRecoPipeline:
             face_bbox=_box(record.face_bbox),
             narrow_face_bbox=_box(record.narrow_face_bbox),
             cloth_color=record.cloth_color,
-            qualified_for_sharpness=record.qualified_for_sharpness,
             is_blurry=record.is_blurry,
             confidence=record.face_confidence,
             # The album's own dict, passed through rather than rebuilt: it is

@@ -45,6 +45,7 @@ except ImportError:  # optional — star-rating metadata is skipped without it
     _PIEXIF_AVAILABLE = False
 
 from algo.album import Album, AlbumImage
+from algo.album_info import CATEGORIES, AlbumInfo
 
 log = logging.getLogger("apply_export")
 
@@ -100,21 +101,20 @@ def _setup_logging() -> None:
     log.addHandler(handler)
 
 
-def _kept_image_basenames(info: dict, images_by_key: dict[str, AlbumImage], min_stars: int = 3) -> set[str]:
+def _kept_image_basenames(info: AlbumInfo, images_by_key: dict[str, AlbumImage], min_stars: int = 3) -> set[str]:
     """Basenames of every image at or above *min_stars* — the explicit "stars"
     value written by the Review page's Apply step if present, else the
     per-category default. Matches culling_app.py's _kept_image_basenames()."""
     kept: set[str] = set()
-    for category, info_key in _REVIEW_INFO_KEY.items():
+    for category in CATEGORIES:
         default_stars = _REVIEW_DEFAULT_STARS[category]
-        for item in info.get(info_key, []):
-            src_name = item.get("src")
-            if not src_name:
+        for entry in info.entries(category):
+            if not entry.key:
                 continue
-            image = images_by_key.get(src_name)
+            image = images_by_key.get(entry.key)
             stars = image.stars if image else None
             if (stars if stars is not None else default_stars) >= min_stars:
-                kept.add(src_name)
+                kept.add(entry.key)
     return kept
 
 
@@ -132,13 +132,13 @@ def _apply_edits(src_file: Path, dest_file: Path) -> None:
     shutil.copy2(str(src_file), str(dest_file))
 
 
-def _export_photos(info: dict, kept: set[str], dest_dir: Path, source_index: dict[str, str]) -> int:
+def _export_photos(info: AlbumInfo, kept: set[str], dest_dir: Path, source_index: dict[str, str]) -> int:
     # Prefer the per-key absolute source path recorded on the Album (see
     # algo/album.py::Album.source_index) -- required once an album has
     # been imported from more than one source directory, since two
     # directories can share a plain filename. Falls back to the single
     # legacy SrcDir join for older albums / keys missing from the index.
-    src_dir = Path(info.get("SrcDir", ""))
+    src_dir = Path(info.src_dir)
     log.info("Copying %d kept photo(s) to %s", len(kept), dest_dir)
 
     copied = 0
@@ -268,14 +268,11 @@ def main() -> None:
     album_dir = Path(args.album_dir).resolve()
     dest_dir = Path(args.destination_dir).resolve()
 
-    info_path = album_dir / "info.json"
     album = Album(album_dir)
-    if not info_path.is_file() or not album.exists:
+    info = AlbumInfo(album_dir)
+    if not info.exists or not album.exists:
         log.error("Not a valid album directory (missing info.json/Album): %s", album_dir)
         sys.exit(1)
-
-    with open(info_path, encoding="utf-8") as fh:
-        info = json.load(fh)
 
     images_by_key = album.images
     kept = _kept_image_basenames(info, images_by_key, args.min_stars)

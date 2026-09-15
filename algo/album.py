@@ -27,6 +27,7 @@ from typing import Optional, Sequence, Union
 
 import numpy as np
 
+from algo.album_info import AlbumInfo
 from algo.models import (
     AutoAdjustment,
     Body,
@@ -176,18 +177,6 @@ class PersonRecord:
     @rejection_reason.setter
     def rejection_reason(self, value: str) -> None:
         self._d["rejection_reason"] = value
-
-    @property
-    def qualified_for_sharpness(self) -> bool:
-        """Whether this body cleared every gate before sharpness scoring.
-
-        Only ever written by the legacy ``1_prep_review.py::analyse_image``
-        path, not by the serializer the live pipeline uses, so it is absent
-        (and therefore False) in every album the current code writes. Kept
-        because algo/facereco.py reads it; see `cleared_grading_gates` for
-        the check that actually works today.
-        """
-        return bool(self._d.get("qualified_for_sharpness", False))
 
     @property
     def cleared_grading_gates(self) -> bool:
@@ -645,6 +634,7 @@ class ImportSummary:
     renamed: int = 0
     facereco_clusters_added: int = 0
     facereco_clusters_merged: int = 0
+    info_entries_renamed: int = 0
 
 
 class Album:
@@ -960,6 +950,12 @@ class Album:
         only on collision with an entry already in THIS album), and folds
         its ``.FaceReco`` clusters into this album's own. *other* is left
         untouched on disk; the caller deletes its directory afterward.
+
+        A rename has to reach info.json too, which indexes the same photos
+        by the same key -- see `algo/album_info.py::AlbumInfo.rename_keys`.
+        That fixup lives here rather than in the caller because the two
+        files are only correct relative to each other: leaving it to
+        whoever calls this is exactly how they fell out of step before.
         """
         with self._lock:
             used_keys: dict[str, Path] = {
@@ -967,6 +963,7 @@ class Album:
                 for key, entry in self.entries.items() if entry.get("file")
             }
             key_renames: dict[str, str] = {}
+            info_renames: list[tuple[str, str, Path]] = []
             merged_entries: list[dict] = []
             for entry in other.results:
                 new_entry = dict(entry)
@@ -979,6 +976,8 @@ class Album:
                 if new_key != old_key:
                     new_entry["key"] = new_key
                     key_renames[old_key] = new_key
+                    if file_path:
+                        info_renames.append((old_key, new_key, Path(file_path)))
                 self._copy_entry_files(other, new_entry, old_key, new_key)
                 merged_entries.append(new_entry)
 
@@ -991,9 +990,20 @@ class Album:
             self._source_index = None
             self.save()
 
+        info_renamed = 0
+        if info_renames:
+            info = AlbumInfo(self.path)
+            if info.exists:
+                for old_key, new_key, source_path in info_renames:
+                    if info.rename_key(old_key, new_key, source_path):
+                        info_renamed += 1
+                if info_renamed:
+                    info.save()
+
         return ImportSummary(
             added=len(merged_entries), renamed=len(key_renames),
             facereco_clusters_added=facereco_added, facereco_clusters_merged=facereco_merged,
+            info_entries_renamed=info_renamed,
         )
 
     def _copy_entry_files(self, other: "Album", entry: dict, old_key: str, new_key: str) -> None:

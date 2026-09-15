@@ -51,6 +51,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
 from algo.album import EDITEDIMAGES_SUBDIR, album_for
+from algo.album_info import CATEGORIES as CULLING_CATEGORIES
+from algo.album_info import AlbumInfo
 from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, summarize_bursts
 
 try:
@@ -985,26 +987,23 @@ def _read_album_summary(path: Path) -> dict:
         "hasFaceReco": _album_has_facereco(path),
         "previewImages": [],
     }
-    try:
-        with open(path / "info.json", encoding="utf-8") as fh:
-            info = json.load(fh)
-        summary["srcDir"] = info.get("SrcDir", "")
-        summary["timestamp"] = info.get("Timestamp", "")
-        summary["createdDisplay"] = _format_created(info.get("Timestamp", ""))
-        summary["ourJerseyColor"] = info.get("OurJerseyColor")
-        sharp = info.get("Anno_Sharp", [])
-        summary["sharpCount"] = len(sharp)
-        summary["blurCount"] = len(info.get("Anno_Blur", []))
-        summary["skippedCount"] = len(info.get("Anno_Skipped", []))
-        album_images = album_for(path).images
-        sharp_previews = []
-        for item in sharp:
-            image = album_images.get(item.get("src"))
-            if image and image.preview_path:
-                sharp_previews.append(image.key)
-        summary["previewImages"] = random.sample(sharp_previews, min(len(sharp_previews), PREVIEW_IMAGE_SAMPLE))
-    except (json.JSONDecodeError, OSError):
-        pass
+    info = AlbumInfo(path)
+    if not info.exists:
+        return summary
+    summary["srcDir"] = info.src_dir
+    summary["timestamp"] = info.timestamp
+    summary["createdDisplay"] = _format_created(info.timestamp)
+    summary["ourJerseyColor"] = info.our_jersey_color
+    summary["sharpCount"] = info.count("sharp")
+    summary["blurCount"] = info.count("blur")
+    summary["skippedCount"] = info.count("skipped")
+    album_images = album_for(path).images
+    sharp_previews = []
+    for entry in info.entries("sharp"):
+        image = album_images.get(entry.key)
+        if image and image.preview_path:
+            sharp_previews.append(image.key)
+    summary["previewImages"] = random.sample(sharp_previews, min(len(sharp_previews), PREVIEW_IMAGE_SAMPLE))
     return summary
 
 
@@ -1071,8 +1070,8 @@ def _has_active_album() -> bool:
 # to the Album (as an explicit "keep" boolean per entry) when the user hits
 # Apply — see api_culling_apply().
 # --------------------------------------------------------------------------- #
-CULLING_CATEGORIES = ("blur", "sharp", "skipped")
-_CULLING_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
+# Categories and the info.json buckets behind them now live in
+# algo/album_info.py (imported above as CULLING_CATEGORIES).
 # Where autoedit.py's output for a photo is kept — see api_ai_edit()/
 # _run_ai_edit() below. Sibling of previews/ under the album directory.
 _EDITEDIMAGES_SUBDIR = EDITEDIMAGES_SUBDIR
@@ -1132,15 +1131,14 @@ def _culling_images(album_path: Path, category: str) -> list[dict]:
     star-driven color scheme), and best-effort capture timestamp. Preview
     and thumbnail images are fetched by key (see /api/anno_img and
     /api/culling/thumb), so no filenames are sent to the client."""
-    with open(album_path / "info.json", encoding="utf-8") as fh:
-        info = json.load(fh)
-    src_dir = Path(info.get("SrcDir", ""))
+    info = AlbumInfo(album_path)
+    src_dir = Path(info.src_dir)
     album_images = album_for(album_path).images
     default_stars = _CULLING_DEFAULT_STARS[category]
 
     images = []
-    for item in info.get(_CULLING_INFO_KEY[category], []):
-        src_name = item.get("src")
+    for entry in info.entries(category):
+        src_name = entry.key
         if not src_name:
             continue
         image = album_images.get(src_name)
@@ -1154,7 +1152,7 @@ def _culling_images(album_path: Path, category: str) -> list[dict]:
         llm_grade = image.llm_grade
         # Prefer the per-entry absolute source path (multi-source-directory
         # imports) over joining the album's single legacy SrcDir.
-        src_path = Path(item["srcPath"]) if item.get("srcPath") else src_dir / src_name
+        src_path = entry.source_path or src_dir / src_name
         ts_path = src_path if src_path.is_file() else preview
         images.append({
             "file": src_name,
@@ -2004,15 +2002,14 @@ def api_culling_apply(req: CullingApplyRequest) -> dict:
     atomically (temp file + os.replace, with the previous contents backed
     up) so a crash mid-write can never corrupt the Album."""
     album_path = _current_album_path()
-    with open(album_path / "info.json", encoding="utf-8") as fh:
-        info = json.load(fh)
+    info = AlbumInfo(album_path)
     album = album_for(album_path)
     album_images = album.images
 
     for category in CULLING_CATEGORIES:
         default_stars = _CULLING_DEFAULT_STARS[category]
-        for item in info.get(_CULLING_INFO_KEY[category], []):
-            src_name = item.get("src")
+        for entry in info.entries(category):
+            src_name = entry.key
             image = album_images.get(src_name)
             if image is None:
                 continue
@@ -2350,11 +2347,8 @@ def api_faces_commit(req: FacesCommitRequest) -> dict:
 @app.get("/api/album-tools/summary")
 def api_album_tools_summary() -> dict:
     album_path = _current_album_path()
-    with open(album_path / "info.json", encoding="utf-8") as fh:
-        info = json.load(fh)
-    total_images = (
-        len(info.get("Anno_Sharp", [])) + len(info.get("Anno_Blur", [])) + len(info.get("Anno_Skipped", []))
-    )
+    info = AlbumInfo(album_path)
+    total_images = info.total
     kept = len(_kept_image_basenames(album_path))
     clusters = _build_clusters(album_path)
 
@@ -2381,8 +2375,8 @@ def api_album_tools_summary() -> dict:
         "name": album_path.name,
         "imagesKept": kept,
         "imagesDropped": max(0, total_images - kept),
-        "blurCount": len(info.get("Anno_Blur", [])),
-        "sharpCount": len(info.get("Anno_Sharp", [])),
+        "blurCount": info.count("blur"),
+        "sharpCount": info.count("sharp"),
         "facesDetected": sum(len(c["faces"]) for c in clusters),
         "playersDetected": sum(1 for c in clusters if not c["pending"]),
         "starBreakdown": star_breakdown,

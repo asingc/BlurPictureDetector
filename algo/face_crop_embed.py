@@ -263,7 +263,6 @@ def make_crop_body(fr_face: FRBox, fr_narrow: FRBox | None) -> BodyRecord:
         face_bbox=fr_face,
         narrow_face_bbox=fr_narrow,
         cloth_color="N/A",
-        qualified_for_sharpness=True,
         is_blurry=False,
         confidence=None,
         raw_body={},

@@ -39,7 +39,6 @@ regrade once to populate it).
 
 from __future__ import annotations
 
-import json
 import logging
 import statistics
 from dataclasses import dataclass
@@ -58,11 +57,10 @@ from algo.stages.jersey_counting import (
     classify_body_jersey,
 )
 from algo.album import Album, AlbumImage, PersonRecord
-from algo.utils import _color_from_label, atomic_save_and_backup
+from algo.album_info import AlbumInfo, category_for_status
+from algo.utils import _color_from_label
 
 log = logging.getLogger("BlurPictureDetector")
-
-_REVIEW_INFO_KEY = {"blurry": "Anno_Blur", "sharp": "Anno_Sharp"}
 
 
 @dataclass
@@ -221,10 +219,7 @@ def regrade_sensitivity(
     *team_color_override* pins the team's jersey colour to a "Hue:Shade"
     label instead of polling it from the photos; None restores auto-polling.
     """
-    info_path = album_path / "info.json"
-
-    with open(info_path, encoding="utf-8") as fh:
-        info = json.load(fh)
+    info = AlbumInfo(album_path)
     album = Album(album_path)
     payload = album.payload
 
@@ -306,15 +301,6 @@ def regrade_sensitivity(
     apply_jersey_filter = our_color is not None
 
     # ---- Pass 3: final verdicts, info.json bookkeeping, previews ----
-    # key -> the info.json Anno_Blur/Anno_Sharp item, so a status flip can
-    # move it between the two lists without disturbing its "src"/"srcPath".
-    info_items_by_key: dict[str, dict] = {}
-    for status, info_key in _REVIEW_INFO_KEY.items():
-        for item in info.get(info_key, []):
-            src = item.get("src")
-            if src:
-                info_items_by_key[src] = item
-
     for image, bodies, cleared, eligible in gradable:
         old_status = image.status
 
@@ -359,13 +345,9 @@ def regrade_sensitivity(
                 summary.recovered += 1
             else:
                 summary.demoted += 1
-            item = info_items_by_key.get(image.key)
-            if item is not None:
-                old_list = info.get(_REVIEW_INFO_KEY[old_status], [])
-                if item in old_list:
-                    old_list.remove(item)
-                info.setdefault(_REVIEW_INFO_KEY[new_status], []).append(item)
-
+            new_category = category_for_status(new_status)
+            if new_category:
+                info.move(image.key, new_category)
             # A photo that changed side of the keep line carries a star
             # rating that no longer reflects it (LLM culling rated it under
             # the old verdict). Reset to the baseline unless the user rated
@@ -386,7 +368,7 @@ def regrade_sensitivity(
     # the verdicts it just produced.
     if summary.team_color is not None:
         payload["our_jersey_color"] = summary.team_color
-        info["OurJerseyColor"] = summary.team_color
+        info.our_jersey_color = summary.team_color
 
     # Lock the new threshold in as this album's sensitivity going forward,
     # so a later "Import more images" merge (which reuses run_settings)
@@ -397,7 +379,7 @@ def regrade_sensitivity(
     payload["run_settings"]["team_color_override"] = pinned or ""
 
     album.save()
-    atomic_save_and_backup(json.dumps(info, indent=4), info_path)
+    info.save()
     log.info(
         "[regrade] threshold=%.2f team_colour=%s(%s) — recovered=%d demoted=%d stars_rebaselined=%d "
         "cloth_colours_measured=%d (unreadable=%d) previews_regenerated=%d (failed=%d) of %d image(s)",

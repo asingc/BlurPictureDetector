@@ -50,7 +50,6 @@ class BodyRecord:
     face_bbox: Box | None
     narrow_face_bbox: Box | None
     cloth_color: str
-    qualified_for_sharpness: bool
     is_blurry: bool
     confidence: float | None
     raw_body: dict
