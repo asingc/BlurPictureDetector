@@ -19,6 +19,10 @@ let rerunFacerecoRunning = false;
 
 let regrading = false;
 
+let burstVideoPollTimer = null;
+let burstVideoPollSince = 0;
+let burstVideoRunning = false;
+
 function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #minStarsInput, #exportBtn").prop("disabled", !enabled);
   // Importing more images, re-running face detection, and exporting all
@@ -443,6 +447,87 @@ async function pollExportStatus() {
   }
 }
 
+// ------------------------------------------------------------------ //
+// Burst → MP4 (experimental) — render each detected photo burst (incl.
+// blur/skipped shots) into its own MP4 via /api/album-tools/burst-video/*.
+// Same background-job/poll pattern as the Export dialog above.
+// ------------------------------------------------------------------ //
+function initBurstVideoDialog() {
+  $("#burstVideoDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openBurstVideoDialog() {
+  const $dialog = $("#burstVideoDialog");
+  $dialog.dialog("option", "title", "Rendering bursts\u2026");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function finishBurstVideoDialog(success) {
+  const $dialog = $("#burstVideoDialog");
+  $dialog.dialog("option", "title", success ? "Rendering complete" : "Rendering failed");
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+}
+
+function appendBurstVideoLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("burstVideoOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function readBurstMinFrames() {
+  return Math.max(2, parseInt($("#burstMinFramesInput").val(), 10) || 3);
+}
+
+async function refreshBurstSummary() {
+  try {
+    const data = await apiGet(`/api/album-tools/burst-video/summary?minFrames=${readBurstMinFrames()}`);
+    const ffmpegNote = data.ffmpegAvailable ? "" : " (ffmpeg not found \u2014 using fallback encoder)";
+    $("#burstSummaryLabel").text(
+      `${data.qualifyingBursts} of ${data.totalBursts} burst(s) qualify (${data.qualifyingFrames} photo(s))${ffmpegNote}`
+    );
+  } catch (err) {
+    $("#burstSummaryLabel").text("");
+  }
+}
+
+async function pollBurstVideoStatus() {
+  let data;
+  try {
+    data = await apiGet(`/api/album-tools/burst-video/status?since=${burstVideoPollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendBurstVideoLines(data.lines);
+  burstVideoPollSince = data.next;
+  if (data.running) return;
+
+  clearInterval(burstVideoPollTimer);
+  burstVideoPollTimer = null;
+  burstVideoRunning = false;
+  $("#renderBurstsBtn").prop("disabled", false);
+  const success = !data.error;
+  finishBurstVideoDialog(success);
+  if (success) {
+    $("#burstVideoStatus").text(data.result ? `Rendered ${data.result.rendered} video(s).` : "Done.");
+    $("#openBurstsFolderBtn").show();
+  } else {
+    $("#burstVideoStatus").text("Failed: " + data.error);
+  }
+  refreshBurstSummary();
+}
+
 $(function () {
   loadSummary();
   loadJerseyOptions();
@@ -450,8 +535,45 @@ $(function () {
   initImportMoreDialog();
   initRerunFacerecoDialog();
   initDeepRegradeDialog();
+  initBurstVideoDialog();
+  refreshBurstSummary();
 
   $("#minStarsInput").on("change", updateExportCount);
+
+  $("#burstMinFramesInput").on("change", refreshBurstSummary);
+
+  $('input[name="burstTimingMode"]').on("change", function () {
+    $("#burstFpsInput").prop("disabled", $('input[name="burstTimingMode"]:checked').val() !== "fps");
+  });
+
+  $("#openBurstsFolderBtn").on("click", async () => {
+    try {
+      await apiPost("/api/album-tools/burst-video/open-folder", {});
+    } catch (err) {
+      $("#burstVideoStatus").text("Could not open folder: " + err.message);
+    }
+  });
+
+  $("#renderBurstsBtn").on("click", async () => {
+    burstVideoRunning = true;
+    $("#renderBurstsBtn").prop("disabled", true);
+    $("#burstVideoStatus").text("");
+    $("#burstVideoOutput").val("");
+    burstVideoPollSince = 0;
+    openBurstVideoDialog();
+    const mode = $('input[name="burstTimingMode"]:checked').val() || "fps";
+    const fps = parseFloat($("#burstFpsInput").val()) || 6;
+    const minFrames = readBurstMinFrames();
+    try {
+      await apiPost("/api/album-tools/burst-video/render", { minFrames, mode, fps });
+      burstVideoPollTimer = setInterval(pollBurstVideoStatus, 500);
+    } catch (err) {
+      $("#burstVideoStatus").text("Failed to start: " + err.message);
+      $("#renderBurstsBtn").prop("disabled", false);
+      burstVideoRunning = false;
+      $("#burstVideoDialog").dialog("close");
+    }
+  });
 
   $("#regradeSensitivitySlider").on("input", function () {
     $("#regradeSensitivityValue").text(Number($(this).val()).toFixed(2));

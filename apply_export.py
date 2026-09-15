@@ -17,8 +17,8 @@ touches it beyond reading it.
 Usage:
     python apply_export.py <album_dir> <destination_dir> [--export-face-tagging]
 
-<album_dir>       : output directory produced by 1_prep_review.py (contains
-                     info.json + album.json).
+<album_dir>       : output directory produced by 1_prep_review.py (a valid
+                     `Album` directory, see algo/album.py, plus info.json).
 <destination_dir> : where the final, edited photos + players.csv go.
 --export-face-tagging : also populate players.csv rows (Player Name, Player
                      Number, Image Path) for every tagged player found in a
@@ -44,7 +44,7 @@ except ImportError:  # optional — star-rating metadata is skipped without it
     piexif = None
     _PIEXIF_AVAILABLE = False
 
-from algo.utils import load_album_source_index
+from algo.album import Album
 
 log = logging.getLogger("apply_export")
 
@@ -52,7 +52,7 @@ _FMT = "%(asctime)s [%(levelname)-8s] %(message)s"
 
 # Mirrors culling_app.py's REVIEW_CATEGORIES / _kept_image_basenames: which
 # info.json list backs each review category, and the effective star rating
-# when album.json has no explicit "stars" value yet.
+# when the Album has no explicit "stars" value yet.
 _REVIEW_INFO_KEY = {"blur": "Anno_Blur", "sharp": "Anno_Sharp", "skipped": "Anno_Skipped"}
 _REVIEW_DEFAULT_KEEP = {"blur": False, "sharp": True, "skipped": False}
 _REVIEW_DEFAULT_STARS = {category: 3 if keep else 1 for category, keep in _REVIEW_DEFAULT_KEEP.items()}
@@ -134,8 +134,8 @@ def _apply_edits(src_file: Path, dest_file: Path) -> None:
 
 
 def _export_photos(info: dict, kept: set[str], dest_dir: Path, source_index: dict[str, str]) -> int:
-    # Prefer the per-key absolute source path recorded in album.json (see
-    # algo/utils.py::load_album_source_index) -- required once an album has
+    # Prefer the per-key absolute source path recorded on the Album (see
+    # algo/album.py::Album.source_index) -- required once an album has
     # been imported from more than one source directory, since two
     # directories can share a plain filename. Falls back to the single
     # legacy SrcDir join for older albums / keys missing from the index.
@@ -206,8 +206,8 @@ def _collect_player_rows(album_dir: Path, kept: set[str]) -> list[list[str]]:
     Each named (non-pending) cluster's face.json lists every face crop
     belonging to that person together with the original image it came
     from -- this is the authoritative source of "who's in which photo".
-    album.json's player_name/player_number fields are NOT used here: they
-    are only ever populated for faces explicitly touched by a Face
+    The Album's player_name/player_number entry fields are NOT used here:
+    they are only ever populated for faces explicitly touched by a Face
     Clustering "commit" action, so faces the recognition pipeline
     auto-matched straight to a named person would otherwise be silently
     missing from players.csv (this previously caused players.csv to contain
@@ -250,7 +250,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export a culled album's kept photos + players.csv to a destination folder."
     )
-    parser.add_argument("album_dir", help="Album output directory (contains info.json + album.json).")
+    parser.add_argument("album_dir", help="Album output directory (an Album, see algo/album.py, plus info.json).")
     parser.add_argument("destination_dir", help="Destination folder (created if missing).")
     parser.add_argument(
         "--export-face-tagging",
@@ -270,22 +270,17 @@ def main() -> None:
     dest_dir = Path(args.destination_dir).resolve()
 
     info_path = album_dir / "info.json"
-    results_path = album_dir / "album.json"
-    if not info_path.is_file() or not results_path.is_file():
-        log.error("Not a valid album directory (missing info.json/album.json): %s", album_dir)
+    album = Album(album_dir)
+    if not info_path.is_file() or not album.exists:
+        log.error("Not a valid album directory (missing info.json/Album): %s", album_dir)
         sys.exit(1)
 
     with open(info_path, encoding="utf-8") as fh:
         info = json.load(fh)
-    with open(results_path, encoding="utf-8") as fh:
-        results = json.load(fh)
 
-    results_by_name = {
-        (r.get("key") or Path(r.get("file", "")).name): r
-        for r in results.get("results", [])
-    }
+    results_by_name = album.entries
     kept = _kept_image_basenames(info, results_by_name, args.min_stars)
-    source_index = load_album_source_index(results_path)
+    source_index = album.source_index
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 

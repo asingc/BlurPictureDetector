@@ -218,6 +218,53 @@
   <p id="exportDialogStatus" class="muted"></p>
   <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
 </div>
+
+<div class="panel" id="burstVideoPanel">
+  <h3>Burst &rarr; MP4 <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Stitches each detected photo burst (consecutive shots within 1 second of
+    each other, regardless of blur/sharp verdict) into its own MP4, saved to
+    <code>bursts/</code> inside this album. Uses ffmpeg if it's on PATH for
+    best quality, otherwise falls back to a lower-quality built-in encoder.
+  </p>
+  <div class="row">
+    <label class="inline-check">Minimum frames per burst
+      <input type="number" id="burstMinFramesInput" min="2" max="50" value="3" style="width:4em" />
+    </label>
+    <span id="burstSummaryLabel" class="muted"></span>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="radio" name="burstTimingMode" value="fps" checked />
+      Fixed FPS
+    </label>
+    <input type="number" id="burstFpsInput" min="1" max="30" value="6" style="width:4em" />
+    <label class="inline-check">
+      <input type="radio" name="burstTimingMode" value="timestamp" />
+      Match real capture timing
+    </label>
+  </div>
+  <div class="row actions">
+    <span id="burstVideoStatus" class="muted"></span>
+    <button id="openBurstsFolderBtn" class="btn btn-icon-text" title="Open bursts folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="renderBurstsBtn" class="btn btn-icon-text" title="Render all qualifying bursts to MP4">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"></polygon>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+      </svg>
+      <span>Render all qualifying bursts</span>
+    </button>
+  </div>
+</div>
+
+<div id="burstVideoDialog" title="Rendering bursts…" style="display:none">
+  <textarea id="burstVideoOutput" class="output-box" rows="16" readonly></textarea>
+</div>
 {% endblock %}
 {% block extra_scripts %}
 <script src="{{ static_url('js/album-tools.js') }}"></script>

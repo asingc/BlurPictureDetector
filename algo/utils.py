@@ -37,10 +37,9 @@ _HEAD_KP_INDICES: tuple[int, ...] = (0, 1, 2, 3, 4)
 # filenames) is keyed by plain filename for readability -- which is only
 # safe as long as filenames are unique across every source directory ever
 # imported into the album. These two helpers keep that bookkeeping key
-# ("key" in album.json result entries) collision-free without ever renaming
-# the original file on disk.
+# ("key" in the Album's result entries) collision-free without ever
+# renaming the original file on disk.
 # ---------------------------------------------------------------------------
-
 def make_unique_import_key(filename: str, used_keys: dict[str, Path], src_path: Path) -> str:
     """Return a bookkeeping key for *filename* that's unique within
     *used_keys* (a dict of already-claimed key -> absolute source path),
@@ -50,8 +49,8 @@ def make_unique_import_key(filename: str, used_keys: dict[str, Path], src_path: 
     extension only when a DIFFERENT source file already claimed that exact
     filename (e.g. two different source directories both containing an
     ``IMG_0001.JPG``). The original file on disk is never touched -- this
-    key only affects internal bookkeeping (preview filenames, album.json /
-    info.json entries, face-DB origFilename, and export destination
+    key only affects internal bookkeeping (preview filenames, the Album's
+    entries, info.json entries, face-DB origFilename, and export destination
     filenames).
     """
     src_path = Path(src_path)
@@ -71,32 +70,24 @@ def make_unique_import_key(filename: str, used_keys: dict[str, Path], src_path: 
         i += 1
 
 
-def load_album_source_index(album_json_path: Union[str, Path]) -> dict[str, str]:
-    """Map every result entry's bookkeeping ``key`` to its absolute source
-    path, as recorded in album.json's ``results[].file``/``results[].key``.
-
-    Falls back to the entry's plain basename for older albums written before
-    the "key" field existed (single-source-directory albums, where filename
-    collisions can't happen). Used by every consumer that needs to open the
-    true original file behind a filename that may not be globally unique
-    across multiple imported source directories.
-    """
-    album_json_path = Path(album_json_path)
-    if not album_json_path.is_file():
-        return {}
-    try:
-        with open(album_json_path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return {}
-    index: dict[str, str] = {}
-    for entry in payload.get("results", []):
-        file_path = entry.get("file")
-        if not file_path:
-            continue
-        key = entry.get("key") or Path(file_path).name
-        index[key] = file_path
-    return index
+def unique_path(dest_dir: Union[str, Path], filename: str) -> Path:
+    """A path for *filename* under *dest_dir* that doesn't collide with an
+    existing file -- ``name.ext``, then ``name-1.ext``, ``name-2.ext``, ...
+    (first free ``n``). Purely a filesystem safety net for physical file
+    copies (e.g. algo/album.py::Album.import_from); unrelated to the logical
+    bookkeeping ``key`` scheme above (make_unique_import_key)."""
+    dest_dir = Path(dest_dir)
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    i = 1
+    while True:
+        candidate = dest_dir / f"{stem}-{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
 
 
 def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:

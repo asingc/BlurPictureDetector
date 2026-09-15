@@ -13,13 +13,13 @@ Usage:
         (no arguments: prints usage plus known OpenAI model pricing and a
         rough per-burst cost estimate, then exits without processing anything)
 
-<output_dir> must already contain a album.json (produced by
-1_prep_review.py). Every qualifying sequence of consecutive "sharp" frames
+<output_dir> must already have a valid `Album` (see algo/album.py), produced
+by 1_prep_review.py. Every qualifying sequence of consecutive "sharp" frames
 (grouped by capture-timestamp gap, then required to span more than
 --min-sequence-seconds or have more than --min-sequence-frames frames) is
 re-ranked from scratch by an OpenAI-backed CullingProvider (see
 algo/llm/culling_provider.py) via the existing
-algo/stages/llm_culling.py::LLMCullingStage. album.json is overwritten in
+algo/stages/llm_culling.py::LLMCullingStage. The Album is overwritten in
 place: "keep" and "burst_ranking" on every frame in a qualifying sequence
 are fully replaced (not merged) with the new verdict, and llm_cost_summary
 is updated with this run's token usage/cost.
@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 from algo.config import app_config
+from algo.album import Album
 from algo.llm.culling_provider import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_RPM_LIMIT,
@@ -64,8 +65,8 @@ from algo.stages.llm_culling import (
 
 log = logging.getLogger("BlurPictureDetector")
 
-# Burst sizes shown in the no-args pricing preview (no album.json to
-# measure real bursts from yet).
+# Burst sizes shown in the no-args pricing preview (no Album to measure real
+# bursts from yet).
 _EXAMPLE_BURST_SIZES = (2, 3, 5, 10)
 
 
@@ -131,7 +132,7 @@ def main() -> None:
         description="Re-run LLM-assisted burst culling against an existing albums/<run> directory.",
     )
     parser.add_argument("output_dir", nargs="?", default=None,
-                         help="Existing albums/<run> directory containing album.json.")
+                         help="Existing albums/<run> directory containing an Album.")
     parser.add_argument(
         "--openaikey",
         default=None,
@@ -258,9 +259,8 @@ def main() -> None:
     if not output_dir.is_dir():
         log.error("Output directory does not exist: %s", output_dir)
         sys.exit(1)
-    results_path = output_dir / "album.json"
-    if not results_path.exists():
-        log.error("No album.json found in %s -- run 1_prep_review.py first.", output_dir)
+    if not Album(output_dir).exists:
+        log.error("No Album found in %s -- run 1_prep_review.py first.", output_dir)
         sys.exit(1)
 
     api_key = args.openaikey or os.environ.get("OPENAI_API_KEY")
@@ -277,7 +277,7 @@ def main() -> None:
         )
 
     bursts = load_qualifying_bursts(
-        results_path, args.burst_gap_seconds, args.min_sequence_seconds, args.min_sequence_frames,
+        output_dir, args.burst_gap_seconds, args.min_sequence_seconds, args.min_sequence_frames,
     )
     if bursts:
         total_input = total_output = 0
@@ -318,7 +318,7 @@ def main() -> None:
     )
     stage.process([], app_config)
 
-    log.info("Done. Review updated album.json at %s", output_dir / "album.json")
+    log.info("Done. Review updated Album at %s", output_dir)
 
 
 if __name__ == "__main__":

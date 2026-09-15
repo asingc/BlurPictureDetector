@@ -38,7 +38,8 @@ class Box:
 
 @dataclass
 class BodyRecord:
-    """Serializable body record loaded from album.json annotation_data."""
+    """Serializable body record loaded from the `Album`'s annotation_data
+    (see algo/album.py)."""
 
     orig_filename: str
     body_index: int

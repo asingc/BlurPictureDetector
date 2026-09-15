@@ -3,7 +3,8 @@
 // Page 3 — Culling: filter photos by effective star rating (0 = skipped,
 // 1-5 = graded; independently checked/unchecked, not a threshold), then
 // group the filtered pool into time-based "bursts". Decisions are staged
-// here in memory and only written to album.json when Apply is hit.
+// here in memory and only committed to the Album (see algo/album.py) when
+// Apply is hit.
 
 // Star levels currently checked in the filter row — defaults to the old
 // "Sharp tab" equivalent (3/4/5 = keep). A Set so toggling one checkbox

@@ -16,7 +16,7 @@ class Frame:
     image:            np.ndarray | None    = None  # original image (BGR)
     normalized_image: np.ndarray | None    = None  # normalised image (BGR)
     auto_adjustment:  AutoAdjustment | None = None  # exposure/WB correction prescription
-    # Disambiguated bookkeeping key (preview filename, album.json/info.json
+    # Disambiguated bookkeeping key (preview filename, Album/info.json
     # entries, FaceReco origFilename) -- see algo/utils.py::make_unique_import_key.
     # Empty means "use path.stem" (single-source-dir album, the common case).
     output_key:       str = ""

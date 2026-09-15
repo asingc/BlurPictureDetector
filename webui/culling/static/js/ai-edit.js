@@ -115,7 +115,7 @@ const AiEdit = (function () {
     }
   }
 
-  // Launches autoedit.py against `key` (album.json bookkeeping key / plain
+  // Launches autoedit.py against `key` (the Album's bookkeeping key / plain
   // filename — same identifier used by /api/original etc.).
   async function run(key) {
     const $d = dialog();

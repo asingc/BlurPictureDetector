@@ -51,6 +51,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
 from algo.album import EDITEDIMAGES_SUBDIR, album_for
+from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, summarize_bursts
 
 try:
     from PIL import Image as _PILImage
@@ -153,6 +154,12 @@ class ExportRequest(BaseModel):
     minStars: int = 3
 
 
+class BurstVideoRenderRequest(BaseModel):
+    minFrames: int = DEFAULT_MIN_FRAMES
+    mode: str = "fps"      # "fps" | "timestamp"
+    fps: float = DEFAULT_FPS
+
+
 class RegradeSensitivityRequest(BaseModel):
     sensitivityMode: str = "medium"       # "low" | "medium" | "high" | "custom"
     sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
@@ -199,7 +206,7 @@ class ImportMoreRequest(BaseModel):
 
 
 class AiEditRequest(BaseModel):
-    # album.json bookkeeping "key" (falls back to plain basename for older
+    # Album bookkeeping "key" (falls back to plain basename for older
     # albums) identifying which photo to edit — same identifier already used
     # by /api/original, /api/anno_img, etc.
     file: str
@@ -313,6 +320,26 @@ class ExportState:
 
 
 export_state = ExportState()
+
+
+# --------------------------------------------------------------------------- #
+# Burst → MP4 (experimental, page 5 — Album Tools) — see algo/burst_video.py.
+# Same buffered-lines-for-polling background-job pattern as ExportState.
+# --------------------------------------------------------------------------- #
+class BurstVideoState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.running = False
+        self.done = False
+        self.error: Optional[str] = None
+        self.lines: list[str] = []
+        self.result: Optional[dict] = None
+
+
+burst_video_state = BurstVideoState()
 
 
 # --------------------------------------------------------------------------- #
@@ -468,12 +495,12 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
 
 
 def _album_team_id(album_dir: Path) -> str:
-    """Best-effort read of album.json's team_id, so "import more" can look up
+    """Best-effort read of the Album's team_id, so "import more" can look up
     the same team's OpenAI key without asking the user to re-select a team
     (sensitivity/jerseycolor/engine/noteam/team_id itself are already locked
     server-side by 1_prep_review.py's merge-mode — this is only needed
-    because the API key itself is intentionally never persisted into
-    album.json/run_settings)."""
+    because the API key itself is intentionally never persisted into the
+    Album's run_settings)."""
     return album_for(album_dir).team_id
 
 
@@ -482,7 +509,7 @@ def _run_import_more(path: str, album_dir: Path) -> None:
 
     Runs 1_prep_review.py with --output pointed at the existing album
     directory (not a fresh timestamped one) — its merge-mode (see main())
-    detects the existing album.json, skips already-imported source files,
+    detects the existing Album, skips already-imported source files,
     and auto-locks sensitivity/jerseycolor/engine/noteam/team-id/autoadjust
     to whatever the album's first import used, so none of those need to be
     passed here.
@@ -529,7 +556,7 @@ def _run_import_more(path: str, album_dir: Path) -> None:
 def _run_rerun_facereco(album_dir: Path) -> None:
     """Re-run ONLY the face-recognition/clustering stage against an
     already-processed album, via 1_prep_review.py --rerun-facereco-only —
-    reuses that album's own already-written album.json (no re-detection of
+    reuses that album's own already-written Album (no re-detection of
     blur/bodies, no re-importing photos) and replays manual_overrides.json
     on top, so existing tagged players/deletions survive the recluster.
     """
@@ -626,7 +653,7 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Pat
     single photo, writing to *pending_path* (editedimages/.pending/<key
     stem>.jpg — RAW originals are rasterized to JPEG in the process).
 
-    Nothing is recorded on the album.json entry here: the result stays
+    Nothing is recorded on the Album entry here: the result stays
     parked in the pending folder until the user accepts it in the
     before/after compare view (api_ai_edit_accept) or discards it
     (api_ai_edit_reject).
@@ -1000,7 +1027,7 @@ def _list_albums() -> list[dict]:
 FACE_SUBDIR = "Face"
 FACE_ANNOTATED_SUBDIR = "Face.annotated"
 
-# Matching tolerance for body_bbox floats when writing back to album.json.
+# Matching tolerance for body_bbox floats when writing back to the Album.
 BBOX_EPS = 1e-6
 
 
@@ -1041,7 +1068,7 @@ def _has_active_album() -> bool:
 # Culling (page 3) — filter images by effective star rating (0 = skipped,
 # 1-5 = graded; independently selectable, not a threshold), grouped into
 # time-based "bursts". Decisions are staged client-side and only committed
-# to album.json (as an explicit "keep" boolean per entry) when the user hits
+# to the Album (as an explicit "keep" boolean per entry) when the user hits
 # Apply — see api_culling_apply().
 # --------------------------------------------------------------------------- #
 CULLING_CATEGORIES = ("blur", "sharp", "skipped")
@@ -1055,7 +1082,7 @@ _AI_EDIT_PENDING_SUBDIR = ".pending"
 # Formats a browser can render directly; anything else (RAW, TIFF) has to be
 # rasterized before it can be shown in the before/after compare view.
 _WEB_DISPLAYABLE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"})
-# Effective star rating when album.json has no explicit "stars" value yet
+# Effective star rating when the Album has no explicit "stars" value yet
 # (older albums, or the LLM culling stage never ran): sharp images default to
 # a baseline "keep" of 3, blur images to 1 (the worst tier a genuinely-graded
 # photo can land on). Skipped images (no person detected — never graded at
@@ -1427,7 +1454,7 @@ def _boxes_match(a: Optional[dict], b: Optional[dict]) -> bool:
 
 
 def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
-    """Write player_name / player_number onto matching album.json bodies.
+    """Write player_name / player_number onto matching Album bodies.
 
     ``assignments`` is a list of {origFilename, body_bbox, name, playernum}.
     """
@@ -1755,6 +1782,25 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool, min
             export_state.running = False
 
 
+def _run_burst_video(album_path: Path, min_frames: int, mode: str, fps: float) -> None:
+    def _on_line(line: str) -> None:
+        with burst_video_state.lock:
+            burst_video_state.lines.append(line)
+
+    try:
+        result = render_album_bursts(album_path, min_frames=min_frames, mode=mode, fps=fps, on_line=_on_line)
+        with burst_video_state.lock:
+            burst_video_state.result = result
+            burst_video_state.done = True
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        log.exception("[BurstVideo] failed")
+        with burst_video_state.lock:
+            burst_video_state.error = str(exc)
+    finally:
+        with burst_video_state.lock:
+            burst_video_state.running = False
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
@@ -1954,13 +2000,13 @@ def api_anno_img(file: str) -> FileResponse:
 @app.post("/api/culling/apply")
 def api_culling_apply(req: CullingApplyRequest) -> dict:
     """Commit pending star-rating decisions (staged client-side, across every
-    star-filter view) into album.json. Every reviewable entry gets an
+    star-filter view) into the Album. Every reviewable entry gets an
     explicit "stars" field written — the user's override if they touched it
     this session, else its current effective (explicit-or-default) value —
     with "keep" always derived from the final star rating (3+ = keep) so it
     can never drift out of sync with the star-driven color scheme. Written
     atomically (temp file + os.replace, with the previous contents backed
-    up) so a crash mid-write can never corrupt album.json."""
+    up) so a crash mid-write can never corrupt the Album."""
     album_path = _current_album_path()
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
@@ -2357,7 +2403,7 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     """Re-grade the current album's Blur/Sharp verdicts at a NEW sensitivity.
 
     ``mode="shallow"`` re-buckets from the per-body sharpness scores already
-    stored in album.json (see algo/regrade.py) and returns its result
+    stored on the Album (see algo/regrade.py) and returns its result
     synchronously — near-instant, no pixel decoding.
 
     ``mode="deep"`` re-runs the FULL analysis pipeline over the album's
@@ -2365,7 +2411,7 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     streaming progress through the shared processing_state that
     /api/processing-output already serves.
 
-    Either way this mutates album.json + info.json, so it's blocked while
+    Either way this mutates the Album + info.json, so it's blocked while
     any other operation touching the same album is running."""
     album_path = _current_album_path()
     with processing_state.lock:
@@ -2548,6 +2594,57 @@ def api_open_export_destination() -> dict:
     if not dest_dir or not Path(dest_dir).is_dir():
         raise HTTPException(status_code=400, detail="Destination folder not found.")
     _open_in_file_explorer(Path(dest_dir))
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/burst-video/summary")
+def api_burst_video_summary(minFrames: int = Query(DEFAULT_MIN_FRAMES)) -> dict:
+    album_path = _current_album_path()
+    return summarize_bursts(album_path, min_frames=max(2, minFrames))
+
+
+@app.post("/api/album-tools/burst-video/render")
+def api_burst_video_render(req: BurstVideoRenderRequest) -> dict:
+    album_path = _current_album_path()
+    if req.mode not in ("fps", "timestamp"):
+        raise HTTPException(status_code=400, detail="mode must be 'fps' or 'timestamp'")
+
+    with burst_video_state.lock:
+        if burst_video_state.running:
+            raise HTTPException(status_code=409, detail="Burst-video rendering is already running.")
+        burst_video_state.reset()
+        burst_video_state.running = True
+
+    thread = threading.Thread(
+        target=_run_burst_video,
+        args=(album_path, max(2, req.minFrames), req.mode, max(0.1, req.fps)),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/burst-video/status")
+def api_burst_video_status(since: int = 0) -> dict:
+    with burst_video_state.lock:
+        new_lines = burst_video_state.lines[since:]
+        return {
+            "lines": new_lines,
+            "next": since + len(new_lines),
+            "running": burst_video_state.running,
+            "done": burst_video_state.done,
+            "error": burst_video_state.error,
+            "result": burst_video_state.result,
+        }
+
+
+@app.post("/api/album-tools/burst-video/open-folder")
+def api_burst_video_open_folder() -> dict:
+    album_path = _current_album_path()
+    bursts_dir = album_path / "bursts"
+    if not bursts_dir.is_dir():
+        raise HTTPException(status_code=400, detail="No bursts folder yet — render at least one burst first.")
+    _open_in_file_explorer(bursts_dir)
     return {"ok": True}
 
 

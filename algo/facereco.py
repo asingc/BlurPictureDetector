@@ -13,6 +13,7 @@ from sklearn.cluster import AgglomerativeClustering
 
 from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model, make_alignment_debug_image
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
+from algo.album import Album
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -602,7 +603,7 @@ class FaceRecoPipeline:
 
     def run(self, prep_output_dir: Path) -> Path:
         prep_output_dir = prep_output_dir.resolve()
-        results_path = prep_output_dir / "album.json"
+        album = Album(prep_output_dir)
         info_path = prep_output_dir / "info.json"
 
         log.info("FaceReco: starting  prep_dir=%s", prep_output_dir)
@@ -618,7 +619,7 @@ class FaceRecoPipeline:
             self.config.output_dir_name,
         )
 
-        payload = self._load_json(results_path)
+        payload = album.payload
         info = self._load_json(info_path)
         src_dir = Path(info.get("SrcDir", "")).resolve() if info.get("SrcDir") else prep_output_dir
         log.debug("FaceReco: src_dir=%s", src_dir)
@@ -909,11 +910,30 @@ class FaceRecoPipeline:
     ) -> list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]]:
         predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]] = []
         total = len(qualified)
-        skipped_load = skipped_embedding = skipped_crop = 0
+        skipped_load = skipped_embedding = skipped_crop = skipped_oom = 0
         log.debug("FaceReco [embed]: processing %d qualified body/bodies", total)
+        # ``qualified`` groups all bodies of the same image together, so cache
+        # the last-decoded full-res image and reuse it for consecutive bodies
+        # instead of re-decoding (often 20+ times for a busy team photo) —
+        # this is both faster and much lighter on peak/fragmented memory.
+        last_path: Path | None = None
+        last_image: np.ndarray | None = None
         for index, item in enumerate(qualified, start=1):
             tag = f"{item.image_path.name} body#{item.body.body_index}"
-            image = self._load_image(item.image_path)
+            if item.image_path == last_path:
+                image = last_image
+            else:
+                try:
+                    image = self._load_image(item.image_path)
+                except (MemoryError, cv2.error) as exc:
+                    skipped_oom += 1
+                    log.warning(
+                        "FaceReco [embed]: %s — out of memory decoding image, skipped: %s",
+                        tag, exc,
+                    )
+                    last_path, last_image = item.image_path, None
+                    continue
+                last_path, last_image = item.image_path, image
             if image is None:
                 skipped_load += 1
                 log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
@@ -923,7 +943,12 @@ class FaceRecoPipeline:
             # it.  Embedding from the exact crop we save guarantees that a
             # later RebuildFaceDB run reproduces this embedding, so prediction
             # and face-DB embeddings live in the same space.
-            crop = self._crop_face_with_buffer(image, item.body)
+            try:
+                crop = self._crop_face_with_buffer(image, item.body)
+            except (MemoryError, cv2.error) as exc:
+                skipped_oom += 1
+                log.warning("FaceReco [embed]: %s — out of memory cropping face, skipped: %s", tag, exc)
+                continue
             if crop is None:
                 skipped_crop += 1
                 log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
@@ -940,14 +965,19 @@ class FaceRecoPipeline:
                     tag, short_edge, self.config.min_face_crop_px,
                 )
                 continue
-            result = embed_face_crop(
-                self.provider,
-                load_face_model(force_cpu=self.cpu_only, engine=self.config.engine),
-                crop,
-                fallback_confidence=item.body.confidence,
-                align=self.config.align_faces,
-                collect_debug=True,
-            )
+            try:
+                result = embed_face_crop(
+                    self.provider,
+                    load_face_model(force_cpu=self.cpu_only, engine=self.config.engine),
+                    crop,
+                    fallback_confidence=item.body.confidence,
+                    align=self.config.align_faces,
+                    collect_debug=True,
+                )
+            except (MemoryError, cv2.error) as exc:
+                skipped_oom += 1
+                log.warning("FaceReco [embed]: %s — out of memory embedding face, skipped: %s", tag, exc)
+                continue
             player, debug = result
             if debug_dir is not None:
                 self._write_align_debug(debug_dir, item, crop, debug)
@@ -975,8 +1005,8 @@ class FaceRecoPipeline:
                 log.info("FaceReco [embed]: %d/%d processed  embedded=%d", index, total, len(predicted))
         log.info(
             "FaceReco [embed]: done  embedded=%d  skipped_load=%d  "
-            "skipped_embedding=%d  skipped_crop=%d",
-            len(predicted), skipped_load, skipped_embedding, skipped_crop,
+            "skipped_embedding=%d  skipped_crop=%d  skipped_oom=%d",
+            len(predicted), skipped_load, skipped_embedding, skipped_crop, skipped_oom,
         )
         return predicted
 

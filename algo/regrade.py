@@ -1,6 +1,7 @@
 """Shallow regrade: re-derive an already-imported album's Blur/Sharp verdicts
 at a NEW sensitivity threshold from the per-body sharpness scores already
-stored in album.json — without re-running person/pose or face detection.
+stored on the `Album` (see algo/album.py) — without re-running person/pose
+or face detection.
 
 Used by the webui's Apply/Summary page ("Quick Regrade"). The "Deep Regrade"
 button instead re-runs the real detection pipeline via

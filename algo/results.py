@@ -1,8 +1,8 @@
-"""Serialization of processed :class:`~algo.frame.Frame` objects into
-album.json ``results`` entries.
+"""Serialization of processed :class:`~algo.frame.Frame` objects into the
+`Album`'s ``results`` entries (see algo/album.py).
 
 Lives here rather than in ``1_prep_review.py`` so every caller that needs to
-write album.json — the normal import path, the incremental "import more
+build those entries — the normal import path, the incremental "import more
 images" merge, and the deep-regrade re-analysis (see ``--regrade-only``) —
 shares one definition of the on-disk entry schema instead of each growing
 its own drifting copy.
@@ -64,7 +64,7 @@ def baseline_stars(entry: dict, status: str, threshold: float) -> int:
 
 
 def build_result_entries(frames: list[Frame]) -> list[dict]:
-    """Serialize *frames* into album.json ``results`` entries (scores,
+    """Serialize *frames* into `Album` ``results`` entries (scores,
     bboxes, keypoints)."""
     serializable = []
     for frame in frames:

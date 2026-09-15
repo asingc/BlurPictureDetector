@@ -18,12 +18,21 @@ know this cache exists.
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-from algo.utils import THUMBNAILS_SUBDIR, atomic_save_and_backup, ensure_cover_thumbnail
+from algo.results import NumpyEncoder
+from algo.utils import (
+    THUMBNAILS_SUBDIR,
+    atomic_save_and_backup,
+    ensure_cover_thumbnail,
+    make_unique_import_key,
+    unique_path,
+)
 
 ALBUM_JSON_NAME = "album.json"
 INFO_JSON_NAME = "info.json"
@@ -152,6 +161,15 @@ class AlbumImage:
         self.entry["edited_image"] = f"{EDITEDIMAGES_SUBDIR}/{Path(path).name}"
 
 
+@dataclass
+class ImportSummary:
+    """Result of one `Album.import_from` call, for logging."""
+    added: int = 0
+    renamed: int = 0
+    facereco_clusters_added: int = 0
+    facereco_clusters_merged: int = 0
+
+
 class Album:
     """One album directory's ``album.json``, parsed on demand.
 
@@ -171,6 +189,39 @@ class Album:
         self._entries: Optional[dict] = None
         self._images: Optional[dict] = None
         self._source_index: Optional[dict] = None
+
+    # -- construction ----------------------------------------------------- #
+    @classmethod
+    def create(
+        cls,
+        path: Union[str, Path],
+        *,
+        team_id: str,
+        our_jersey_color: Optional[str] = None,
+        run_settings: Optional[dict] = None,
+        import_status: str = "in_progress",
+    ) -> "Album":
+        """Factory for a brand-new album (a permanent one, or a temp staging
+        album for "import more images" -- see 1_prep_review.py): creates
+        *path* if needed and writes an initial, empty-results album.json
+        immediately, so the basic properties (team_id/run_settings/...) are
+        set and readable from the moment the caller gets the object back,
+        before any analysis pipeline stage has run.
+
+        Use plain ``Album(path)`` (or `album_for`) to load an ALREADY
+        existing album instead -- this always (re)creates one.
+        """
+        new_album = cls(path)
+        new_album.path.mkdir(parents=True, exist_ok=True)
+        new_album._payload = {
+            "team_id": team_id,
+            "our_jersey_color": our_jersey_color,
+            "import_status": import_status,
+            "run_settings": run_settings or {},
+            "results": [],
+        }
+        new_album.save()
+        return new_album
 
     # -- freshness ------------------------------------------------------ #
     def _file_stamp(self) -> Optional[tuple]:
@@ -312,13 +363,251 @@ class Album:
             if self._payload is None:
                 return
             try:
-                atomic_save_and_backup(json.dumps(self._payload, indent=2), self.album_json)
+                atomic_save_and_backup(json.dumps(self._payload, indent=2, cls=NumpyEncoder), self.album_json)
             except Exception:
                 # The file on disk and this object may now disagree; force
                 # the next reader to go back to disk.
                 self.invalidate()
                 raise
             self._stamp = self._file_stamp()
+
+    def write_results(
+        self,
+        results: list[dict],
+        *,
+        our_jersey_color: Optional[str] = None,
+        team_id: Optional[str] = None,
+        import_status: str = "complete",
+        run_settings: Optional[dict] = None,
+    ) -> None:
+        """Replace this album's entire payload with a freshly-built one and
+        save it -- the only place the top-level payload is assembled from
+        scratch (the normal import path, "import more images", and a deep
+        regrade; see 1_prep_review.py). *results* must already include
+        whatever prior entries the caller wants carried forward -- this
+        does not merge with what's currently on disk.
+        """
+        with self._lock:
+            self._payload = {
+                "team_id": team_id,
+                "our_jersey_color": our_jersey_color,
+                "import_status": import_status,
+                "run_settings": run_settings or {},
+                "results": results,
+            }
+            self._entries = None
+            self._images = None
+            self._source_index = None
+            self.save()
+
+    def mark_import_complete(self) -> None:
+        """Flip ``import_status`` to "complete". Called once the full
+        pipeline (analysis + FaceReco + LLM culling) has finished, so a
+        crash in between leaves the album correctly marked "in_progress"
+        instead of falsely looking finished."""
+        with self._lock:
+            payload = self.payload
+            payload["import_status"] = "complete"
+            self.save()
+
+    def update_settings(self, *, our_jersey_color: Optional[str] = None, run_settings: Optional[dict] = None) -> None:
+        """Patch metadata only known once processing finished (e.g. the
+        jersey colour polled from this run's photos), without touching
+        `results`."""
+        with self._lock:
+            payload = self.payload
+            if our_jersey_color is not None:
+                payload["our_jersey_color"] = our_jersey_color
+            if run_settings is not None:
+                payload["run_settings"] = run_settings
+            self.save()
+
+    # -- merging another album in ---------------------------------------- #
+    def import_from(self, other: "Album") -> ImportSummary:
+        """Merge *other* (typically a temp staging album produced by one
+        "import more images" run -- see 1_prep_review.py) into this album:
+        appends its `results` entries (renaming the bookkeeping ``key`` --
+        and the preview/thumbnail/edited-image files derived from it --
+        only on collision with an entry already in THIS album), and folds
+        its ``.FaceReco`` clusters into this album's own. *other* is left
+        untouched on disk; the caller deletes its directory afterward.
+        """
+        with self._lock:
+            used_keys: dict[str, Path] = {
+                key: Path(entry["file"]).resolve()
+                for key, entry in self.entries.items() if entry.get("file")
+            }
+            key_renames: dict[str, str] = {}
+            merged_entries: list[dict] = []
+            for entry in other.results:
+                new_entry = dict(entry)
+                old_key = entry_key(entry)
+                file_path = new_entry.get("file")
+                new_key = (
+                    make_unique_import_key(Path(file_path).name, used_keys, Path(file_path).resolve())
+                    if file_path else old_key
+                )
+                if new_key != old_key:
+                    new_entry["key"] = new_key
+                    key_renames[old_key] = new_key
+                self._copy_entry_files(other, new_entry, old_key, new_key)
+                merged_entries.append(new_entry)
+
+            facereco_merged, facereco_added = self._merge_facereco(other, key_renames)
+
+            payload = self.payload
+            payload.setdefault("results", []).extend(merged_entries)
+            self._entries = None
+            self._images = None
+            self._source_index = None
+            self.save()
+
+        return ImportSummary(
+            added=len(merged_entries), renamed=len(key_renames),
+            facereco_clusters_added=facereco_added, facereco_clusters_merged=facereco_merged,
+        )
+
+    def _copy_entry_files(self, other: "Album", entry: dict, old_key: str, new_key: str) -> None:
+        """Copy *entry*'s preview/thumbnail/edited-image files from *other*
+        into this album, renaming them to match *new_key* when it differs
+        from *old_key*, and updating *entry*'s path fields in place."""
+        renamed = new_key != old_key
+        preview_rel = entry.get("preview_path")
+        if preview_rel:
+            src = other.path / preview_rel
+            if src.is_file():
+                dest_name = f"{Path(new_key).stem}{Path(preview_rel).suffix}" if renamed else Path(preview_rel).name
+                previews_dir = self.path / "previews"
+                previews_dir.mkdir(parents=True, exist_ok=True)
+                dest = unique_path(previews_dir, dest_name)
+                shutil.copy2(src, dest)
+                entry["preview_path"] = f"previews/{dest.name}"
+                # The thumbnail is looked up BY the preview's own filename
+                # (see AlbumImage.thumbnail_path) so it must share dest.name,
+                # not go through its own unique_path resolution.
+                thumb_src = other.path / THUMBNAILS_SUBDIR / Path(preview_rel).name
+                if thumb_src.is_file():
+                    thumb_dir = self.path / THUMBNAILS_SUBDIR
+                    thumb_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(thumb_src, thumb_dir / dest.name)
+
+        edited_rel = entry.get("edited_image")
+        if edited_rel:
+            src = other.path / edited_rel
+            if src.is_file():
+                dest_dir = self.path / EDITEDIMAGES_SUBDIR
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = unique_path(dest_dir, Path(edited_rel).name)
+                shutil.copy2(src, dest)
+                entry["edited_image"] = f"{EDITEDIMAGES_SUBDIR}/{dest.name}"
+
+    # -- FaceReco merging -------------------------------------------------- #
+    def _merge_facereco(self, other: "Album", key_renames: dict[str, str]) -> tuple[int, int]:
+        """Fold *other*'s ``.FaceReco`` clusters into this album's own.
+        Numeric (unmatched) clusters are renumbered past this album's
+        highest existing id; named (matched) clusters are merged into an
+        existing same-named cluster if present, else copied over as-is.
+        Returns ``(clusters_merged, clusters_added)``."""
+        other_facereco = other.path / ".FaceReco"
+        if not other_facereco.is_dir():
+            return (0, 0)
+        self_facereco = self.path / ".FaceReco"
+        self_facereco.mkdir(parents=True, exist_ok=True)
+
+        existing_numeric_ids = [
+            int(d.name) for d in self_facereco.iterdir()
+            if d.is_dir() and d.name.isdigit()
+        ]
+        next_numeric = (max(existing_numeric_ids) + 1) if existing_numeric_ids else 0
+
+        merged = added = 0
+        for cluster_dir in sorted(other_facereco.iterdir()):
+            # Dot-prefixed dirs (.AllFaces, .debug) are diagnostic-only, not
+            # consumed by any reader -- left behind rather than merged.
+            if not cluster_dir.is_dir() or cluster_dir.name.startswith("."):
+                continue
+            if cluster_dir.name.isdigit():
+                dest_name = f"{next_numeric:04d}"
+                next_numeric += 1
+                shutil.copytree(cluster_dir, self_facereco / dest_name)
+                self._rewrite_facereco_origfilenames(self_facereco / dest_name / "face.json", key_renames)
+                added += 1
+                continue
+            target_cluster_dir = self_facereco / cluster_dir.name
+            if target_cluster_dir.is_dir():
+                self._merge_facereco_cluster(cluster_dir, target_cluster_dir, key_renames)
+                merged += 1
+            else:
+                shutil.copytree(cluster_dir, target_cluster_dir)
+                self._rewrite_facereco_origfilenames(target_cluster_dir / "face.json", key_renames)
+                added += 1
+        return (merged, added)
+
+    @staticmethod
+    def _rewrite_facereco_origfilenames(face_json_path: Path, key_renames: dict[str, str]) -> None:
+        if not key_renames or not face_json_path.is_file():
+            return
+        with open(face_json_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        changed = False
+        for face in payload.get("faces", []):
+            renamed = key_renames.get(face.get("origFilename"))
+            if renamed:
+                face["origFilename"] = renamed
+                changed = True
+        if changed:
+            with open(face_json_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+
+    @staticmethod
+    def _merge_facereco_cluster(src_dir: Path, dest_dir: Path, key_renames: dict[str, str]) -> None:
+        """Combine a same-named cluster from another album into *dest_dir*
+        (crop files copied over -- renamed on filename collision -- and
+        *src_dir*'s face.json entries appended to dest's own)."""
+        crop_renames: dict[str, str] = {}
+        src_face_dir = src_dir / "Face"
+        if src_face_dir.is_dir():
+            dest_face_dir = dest_dir / "Face"
+            dest_face_dir.mkdir(parents=True, exist_ok=True)
+            for crop in sorted(src_face_dir.iterdir()):
+                if not crop.is_file():
+                    continue
+                dest = unique_path(dest_face_dir, crop.name)
+                shutil.copy2(crop, dest)
+                crop_renames[crop.name] = dest.name
+
+        src_annotated_dir = src_dir / "Face.annotated"
+        if src_annotated_dir.is_dir():
+            dest_annotated_dir = dest_dir / "Face.annotated"
+            for annotated in sorted(src_annotated_dir.iterdir()):
+                if not annotated.is_file():
+                    continue
+                dest_annotated_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(annotated, dest_annotated_dir / crop_renames.get(annotated.name, annotated.name))
+
+        src_face_json = src_dir / "face.json"
+        if not src_face_json.is_file():
+            return
+        with open(src_face_json, encoding="utf-8") as fh:
+            src_payload = json.load(fh)
+        dest_face_json = dest_dir / "face.json"
+        dest_payload: dict = {}
+        if dest_face_json.is_file():
+            with open(dest_face_json, encoding="utf-8") as fh:
+                dest_payload = json.load(fh)
+        dest_faces = dest_payload.setdefault("faces", [])
+        dest_payload.setdefault("provider", src_payload.get("provider", ""))
+        dest_payload.setdefault("aligned", src_payload.get("aligned", False))
+        for face in src_payload.get("faces", []):
+            face = dict(face)
+            renamed = key_renames.get(face.get("origFilename"))
+            if renamed:
+                face["origFilename"] = renamed
+            if face.get("cropFileName") in crop_renames:
+                face["cropFileName"] = crop_renames[face["cropFileName"]]
+            dest_faces.append(face)
+        with open(dest_face_json, "w", encoding="utf-8") as fh:
+            json.dump(dest_payload, fh, indent=2)
 
 
 # --------------------------------------------------------------------------- #

@@ -31,6 +31,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -46,9 +47,10 @@ except ImportError:  # pragma: no cover - non-Windows platforms
     msvcrt = None
 
 from algo.config import AppConfig, app_config
+from algo.album import Album
 from algo.frame import Frame
 from algo.models import Body, Box, ColorLab, Face, Point, PredictedKeyPoint
-from algo.results import NumpyEncoder, baseline_stars, build_result_entries
+from algo.results import baseline_stars, build_result_entries
 from algo.stage import ProcessStage
 from algo.stages.annotation import AnnotationStage
 from algo.stages.auto_adjust import AutoAdjustStage
@@ -80,7 +82,6 @@ from algo.utils import (
     _color_from_label,
     _matches_allowed_jersey_color,
     _narrow_face_box,
-    atomic_save_and_backup,
     cap_long_edge,
     make_unique_import_key,
 )
@@ -1235,52 +1236,7 @@ def write_blur_lst(frames: list[Frame], lst_path: Path, *, append: bool = False)
     log.info("Blur list written to:     %s", lst_path)
 
 
-def write_results_json(
-    frames: list[Frame],
-    json_path: Path,
-    *,
-    our_jersey_color: str | None = None,
-    team_id: str | None = None,
-    existing_entries: list[dict] | None = None,
-    import_status: str = "complete",
-    imports_history: list[dict] | None = None,
-    run_settings: dict | None = None,
-) -> None:
-    """Write full per-image analytic results (scores, bboxes, keypoints) to JSON.
-
-    When importing more images into an existing album, pass the previous
-    album.json's ``results`` list as *existing_entries* -- new entries are
-    appended after them so already-processed images/clusters/reviews are
-    never disturbed.
-    """
-    serializable = list(existing_entries or []) + build_result_entries(frames)
-    payload = {
-        "team_id": team_id,
-        "our_jersey_color": our_jersey_color,
-        "import_status": import_status,
-        "imports": imports_history or [],
-        "run_settings": run_settings or {},
-        "results": serializable,
-    }
-    atomic_save_and_backup(json.dumps(payload, indent=2, cls=NumpyEncoder), json_path)
-    log.info("Results JSON written to:  %s", json_path)
-
-
-def _mark_import_complete(json_path: Path) -> None:
-    """Flip ``import_status`` to ``"complete"`` in an already-written
-    album.json. Called once the full pipeline (analysis + FaceReco + LLM
-    culling) has finished, so a crash in between leaves the album correctly
-    marked ``"in_progress"`` instead of falsely looking finished."""
-    if not json_path.is_file():
-        return
-    with open(json_path, encoding="utf-8") as fh:
-        payload = json.load(fh)
-    payload["import_status"] = "complete"
-    atomic_save_and_backup(json.dumps(payload, indent=2, cls=NumpyEncoder), json_path)
-    log.debug("Import marked complete: %s", json_path)
-
-
-# Fields written onto an album.json entry AFTER the analysis pipeline (by the
+# Fields written onto an Album entry AFTER the analysis pipeline (by the
 # Review page's Apply step, the LLM burst-culling stage, and the image-editing
 # workflow). A deep regrade rebuilds every entry from freshly-computed
 # detections, so these have to be carried over explicitly or the user's
@@ -1691,7 +1647,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Compute a simple auto-exposure (brightness) correction per image, "
-            "shown in the annotated previews and written to album.json. "
+            "shown in the annotated previews and stored on the Album. "
             "Off by default."
         ),
     )
@@ -1710,7 +1666,7 @@ def main() -> None:
         "--team-id",
         default=None,
         metavar="ID",
-        help="Id of the team (from team.json) this album was processed for. Stored in album.json.",
+        help="Id of the team (from team.json) this album was processed for. Stored on the Album.",
     )
     parser.add_argument(
         "--enable-long-paths",
@@ -1740,7 +1696,7 @@ def main() -> None:
         help=(
             "Skip image analysis/grading/annotation/LLM-culling entirely and "
             "just re-run face recognition clustering against an existing "
-            "album's already-written album.json (requires --output pointing "
+            "album's already-written Album (requires --output pointing "
             "at that album; no positional path needed). Re-run reclusters "
             "from scratch but replays manual_overrides.json on top, same as "
             "any other FaceRecoStage run."
@@ -1794,26 +1750,22 @@ def main() -> None:
 
     # --- Import-into-existing-album detection -----------------------------
     # Merge mode: --output points at a directory that already has an
-    # album.json (i.e. "import more images" into an existing album). Load
+    # Album (i.e. "import more images" into an existing album). Load
     # its prior state now so settings can be locked and new images
     # deduplicated before any expensive model inference runs.
     output_root = Path(args.output).resolve() if args.output else None
-    merge_mode = output_root is not None and (output_root / "album.json").is_file()
+    merge_album = Album(output_root) if output_root is not None else None
+    merge_mode = merge_album is not None and merge_album.exists
 
-    existing_payload: dict = {}
     existing_info: dict = {}
     existing_entries: list[dict] = []
-    imports_history: list[dict] = []
     run_settings: dict = {}
     already_imported: frozenset[Path] = frozenset()
     used_keys: dict[str, Path] = {}
 
     if merge_mode:
-        with open(output_root / "album.json", encoding="utf-8") as fh:
-            existing_payload = json.load(fh)
-        existing_entries = list(existing_payload.get("results", []))
-        imports_history = list(existing_payload.get("imports", []))
-        run_settings = dict(existing_payload.get("run_settings") or {})
+        existing_entries = list(merge_album.results)
+        run_settings = dict(merge_album.run_settings)
         info_path = output_root / "info.json"
         if info_path.is_file():
             with open(info_path, encoding="utf-8") as fh:
@@ -1822,11 +1774,6 @@ def main() -> None:
         already_imported = frozenset(
             Path(e["file"]).resolve() for e in existing_entries if e.get("file")
         )
-        for e in existing_entries:
-            if not e.get("file"):
-                continue
-            key = e.get("key") or Path(e["file"]).name
-            used_keys[key] = Path(e["file"]).resolve()
 
         log.info(
             "Importing into existing album %s — %d image(s) already present",
@@ -1863,7 +1810,7 @@ def main() -> None:
     # lookup. Prefer the album's own already-recorded team_id on merge
     # (covers albums written before run_settings existed, where
     # args.team_id was never locked above).
-    team_id = existing_payload.get("team_id") if merge_mode and existing_payload.get("team_id") else args.team_id
+    team_id = merge_album.team_id if merge_mode and merge_album.team_id else args.team_id
     if not team_id:
         parser.error("--team-id is required (must match a team registered in team.json)")
     registered_team = _load_registered_team(team_id)
@@ -1921,7 +1868,7 @@ def main() -> None:
 
     if args.rerun_facereco_only:
         if not merge_mode:
-            log.error("--rerun-facereco-only requires an existing album.json under --output: %s", output_dir)
+            log.error("--rerun-facereco-only requires an existing Album under --output: %s", output_dir)
             sys.exit(1)
         facereco_input_path = input_path or Path(existing_info.get("SrcDir") or output_dir)
         face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, facereco_input_path)
@@ -1946,14 +1893,14 @@ def main() -> None:
 
     # Deep regrade: re-analyse the album's ALREADY-imported photos instead of
     # discovering new ones. Everything downstream (grading, jersey counting,
-    # annotation, album.json serialization) runs through the exact same
+    # annotation, Album serialization) runs through the exact same
     # stages an import uses -- only the input file list and the final merge
     # differ.
     regrade_paths: list[Path] | None = None
     regrade_keys: dict[Path, str] = {}
     if args.regrade_only:
         if not merge_mode:
-            log.error("--regrade-only requires an existing album.json under --output: %s", output_dir)
+            log.error("--regrade-only requires an existing Album under --output: %s", output_dir)
             sys.exit(1)
         regrade_paths = []
         missing = 0
@@ -1973,6 +1920,27 @@ def main() -> None:
         if not regrade_paths:
             log.error("Deep regrade: none of this album's source images are reachable on disk.")
             sys.exit(1)
+
+    # A normal "import more images" run stages the new photos in a temp
+    # album under the target directory first (its own previews/.FaceReco/
+    # results, with a clean local key namespace) -- Album.import_from folds
+    # that staging album into the real target once the whole pipeline below
+    # succeeds, resolving any bookkeeping-key collision with the target's
+    # existing entries at that point. Deep regrade re-analyses the target's
+    # OWN already-imported photos in place, so it never stages anything.
+    use_temp_staging = merge_mode and not args.regrade_only
+    working_dir = (output_dir / f".import_tmp_{ts}") if use_temp_staging else output_dir
+    run_settings_out = run_settings or {
+        "sensitivity": args.sensitivity,
+        "jerseycolor": args.jerseycolor,
+        "engine": args.engine,
+        "noteam": args.noteam,
+        "team_id": args.team_id,
+        "autoadjust": args.autoadjust,
+    }
+    working_album = None if args.regrade_only else Album.create(
+        working_dir, team_id=team_id, run_settings=run_settings_out, import_status="in_progress",
+    )
 
     log.info("Loading models … (engine=%s)", args.engine)
     # A deep regrade re-analyses an explicit file list and must NOT skip
@@ -2000,8 +1968,10 @@ def main() -> None:
         )
 
     # Not needed by a deep regrade (it returns before the FaceReco stage) and
-    # input_path is allowed to be None in that mode.
-    face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, output_dir, input_path)
+    # input_path is allowed to be None in that mode. Resolved against
+    # working_dir (not output_dir) so a temp staging album -- nested under
+    # the target -- still finds the target's own .FaceReco via ancestry walk.
+    face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, working_dir, input_path)
 
     # Run image analysis first (on its own) so each newly-discovered frame
     # can be assigned its disambiguated bookkeeping key -- see
@@ -2026,7 +1996,7 @@ def main() -> None:
     ]
     if args.autoadjust:
         stages.append(AutoAdjustStage())
-    stages.append(AnnotationStage(output_dir))
+    stages.append(AnnotationStage(working_dir))
     for stage in stages:
         frames = stage.process(frames, app_config)
 
@@ -2036,25 +2006,19 @@ def main() -> None:
         run_settings_out = dict(run_settings)
         run_settings_out["sensitivity"] = args.sensitivity
         run_settings_out["team_color_override"] = team_color_override
-        write_results_json(
-            frames, output_dir / "album.json",
+        # Preserved fields (stars, keep, edited_image, ...) are merged into
+        # the freshly-built entries before the single Album write below --
+        # a deep regrade never needs more than one write.
+        merged_results = _merge_preserved_fields(
+            build_result_entries(frames), existing_entries, sensitivity_threshold
+        )
+        Album(output_dir).write_results(
+            merged_results,
             our_jersey_color=our_jersey_color, team_id=team_id,
-            existing_entries=None,
             import_status="complete",
-            imports_history=imports_history,
             run_settings=run_settings_out,
         )
-        # Re-read and re-merge rather than threading the preserved fields
-        # through write_results_json -- keeps that writer identical for the
-        # import path, which has nothing to preserve.
-        with open(output_dir / "album.json", encoding="utf-8") as fh:
-            regraded_payload = json.load(fh)
-        regraded_payload["results"] = _merge_preserved_fields(
-            regraded_payload.get("results", []), existing_entries, sensitivity_threshold
-        )
-        atomic_save_and_backup(
-            json.dumps(regraded_payload, indent=2, cls=NumpyEncoder), output_dir / "album.json"
-        )
+        log.info("Results written to album:  %s", output_dir)
 
         # Anno_* lists describe THIS full re-analysis, so they're rebuilt
         # from scratch; SrcDir/SrcDirs/Timestamp are carried over.
@@ -2082,26 +2046,10 @@ def main() -> None:
     if merge_mode and not frames:
         log.info("No new images found to import — album is already up to date.")
 
-    new_import_record = {"src": str(input_path), "timestamp": ts, "image_count": len(frames)}
-    run_settings_out = run_settings or {
-        "sensitivity": args.sensitivity,
-        "jerseycolor": args.jerseycolor,
-        "engine": args.engine,
-        "noteam": args.noteam,
-        "team_id": args.team_id,
-        "autoadjust": args.autoadjust,
-    }
-    # A pending FaceReco/LLM-culling pass still needs to run against these
-    # new frames, so the album is provisionally "in_progress" until those
-    # complete (see the import_status flip near the end of this function).
-    # When there's nothing new to write, leave the existing status alone.
-    provisional_status = "in_progress" if frames else (existing_payload.get("import_status") or "complete")
-    write_results_json(
-        frames, output_dir / "album.json",
+    working_album.write_results(
+        build_result_entries(frames),
         our_jersey_color=our_jersey_color, team_id=team_id,
-        existing_entries=existing_entries,
-        import_status=provisional_status,
-        imports_history=imports_history + ([new_import_record] if frames else []),
+        import_status="in_progress" if frames else "complete",
         run_settings=run_settings_out,
     )
 
@@ -2130,7 +2078,7 @@ def main() -> None:
             log.info("Face recognition skipped: no face DB found.")
         else:
             FaceRecoStage(
-                output_dir,
+                working_dir,
                 face_db_dir=face_db_dir,
                 face_db_allowed_names=roster_names,
                 face_db_match_threshold=args.face_db_match_threshold,
@@ -2149,13 +2097,8 @@ def main() -> None:
         try:
             from algo.llm.culling_provider import OpenAIProvider
             provider = OpenAIProvider(api_key=openai_api_key, model=args.llm_model)
-            # Only frames processed THIS run — when merging into an existing
-            # album, this restricts (re-)ranking to just the bursts/images
-            # that touch a newly-imported photo, instead of re-ranking (and
-            # re-billing) the whole album's LLM culling every import.
-            new_keys = frozenset(f.output_key or f.path.name for f in frames)
             LLMCullingStage(
-                output_dir, provider=provider, threshold=sensitivity_threshold, new_keys=new_keys,
+                working_dir, provider=provider, threshold=sensitivity_threshold,
             ).process(frames, app_config)
         except Exception as exc:
             log.error("LLM-assisted burst culling failed: %s", exc, exc_info=True)
@@ -2167,7 +2110,20 @@ def main() -> None:
         # whichever ran) -- flip the provisional "in_progress" flag written
         # earlier so consumers (culling_app.py's album list, etc.) can tell
         # a finished import apart from one interrupted mid-run.
-        _mark_import_complete(output_dir / "album.json")
+        working_album.mark_import_complete()
+        if use_temp_staging:
+            summary = merge_album.import_from(working_album)
+            merge_album.update_settings(our_jersey_color=our_jersey_color, run_settings=run_settings_out)
+            merge_album.mark_import_complete()
+            log.info(
+                "Import complete — %d photo(s) merged into %s (%d renamed on key "
+                "collision, %d FaceReco cluster(s) added, %d merged)",
+                summary.added, output_dir, summary.renamed,
+                summary.facereco_clusters_added, summary.facereco_clusters_merged,
+            )
+
+    if use_temp_staging:
+        shutil.rmtree(working_dir, ignore_errors=True)
 
     if frames:
         log.info("When done, run:  python culling_app.py")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import math
 from pathlib import Path
@@ -14,7 +13,7 @@ from algo.frame import Frame
 from algo.llm.culling_provider import BurstFrameInput, BurstRankingResult, CullingProvider
 from algo.stage import ProcessStage
 from algo.stages.image_analysis import _read_image
-from algo.utils import atomic_save_and_backup, cap_long_edge, image_capture_timestamp
+from algo.utils import cap_long_edge, image_capture_timestamp
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -101,19 +100,18 @@ def _is_qualifying_sequence(
 
 
 def load_qualifying_bursts(
-    results_path: Path,
+    album_dir: Path,
     burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
     min_sequence_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
     min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
 ) -> list[list[dict]]:
-    """Read *results_path* (read-only — nothing is written back) and return
-    the bursts of consecutive sharp frames that qualify as sequences (see
-    :func:`_is_qualifying_sequence`) for LLM group-ranking. Shared by
+    """Read *album_dir*'s `Album` (read-only — nothing is written back) and
+    return the bursts of consecutive sharp frames that qualify as sequences
+    (see :func:`_is_qualifying_sequence`) for LLM group-ranking. Shared by
     :meth:`LLMCullingStage.process` and pre-flight cost estimates (e.g.
     RerunLLMCulling.py) so the two can never drift out of sync with each
     other's burst definition."""
-    with open(results_path, encoding="utf-8") as fh:
-        payload = json.load(fh)
+    payload = Album(album_dir).payload
     sharp_entries = _sorted_sharp_entries(payload)
     bursts = _group_bursts(sharp_entries, burst_gap_seconds)
     return [b for b in bursts if _is_qualifying_sequence(b, min_sequence_seconds, min_sequence_frames)]
@@ -124,9 +122,10 @@ class LLMCullingStage(ProcessStage):
     the best shot in each burst as a keeper.
 
     Like :class:`~algo.stages.face_reco.FaceRecoStage`, this stage reads and
-    rewrites ``album.json`` directly rather than operating purely on the
-    in-memory ``Frame`` list — it is meant to run as a post-processing step
-    (after face recognition) once ``album.json`` already exists on disk.
+    rewrites the `Album` (see algo/album.py) directly rather than operating
+    purely on the in-memory ``Frame`` list — it is meant to run as a
+    post-processing step (after face recognition) once the Album already
+    exists on disk.
 
     Only entries with ``status == "sharp"`` participate. A burst is a run of
     sharp images whose capture timestamps are each within
@@ -160,7 +159,7 @@ class LLMCullingStage(ProcessStage):
     :meth:`_assign_star_ratings`.
 
     A token-usage/cost summary (``provider.get_cost_summary()``) is logged
-    and written to ``album.json`` as ``llm_cost_summary`` once processing
+    and written to the `Album` as ``llm_cost_summary`` once processing
     finishes.
     """
 
@@ -207,7 +206,7 @@ class LLMCullingStage(ProcessStage):
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         album = Album(self.output_dir)
         if not album.exists:
-            log.warning("[LLMCullingStage] album.json not found at %s — skipping", album.album_json)
+            log.warning("[LLMCullingStage] no Album found at %s — skipping", album.path)
             return frames
 
         self._album = album
@@ -312,7 +311,7 @@ class LLMCullingStage(ProcessStage):
         )
 
         album.save()
-        log.info("[LLMCullingStage] album.json updated: %s", album.album_json)
+        log.info("[LLMCullingStage] Album updated: %s", album.path)
 
         return frames
 

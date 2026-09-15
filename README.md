@@ -58,7 +58,7 @@ Image → normalize size (long edge = 1800 px)
       → grade sharpness of each person's face crop
       → poll jersey colours → keep only your team (+ forced colours)
       → annotate preview image
-      → write album.json / info.json / blurry.csv / blur.lst
+      → write the album's Album data (see algo/album.py) / info.json / blurry.csv / blur.lst
       → (optional) cluster faces into .FaceReco/
 ```
 
@@ -133,7 +133,7 @@ Scores every image and writes an output folder:
 ```
 <output_dir>/
     previews/         ← annotated previews for every image (blur/sharp/skipped alike)
-    album.json      ← full per-body data (used by face recognition); each result also carries a "preview_path" pointing into previews/
+    album.json      ← the Album's data (see algo/album.py; full per-body data used by face recognition); each result also carries a "preview_path" pointing into previews/
     info.json         ← classification results (used by step 2)
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
@@ -200,7 +200,7 @@ Face recognition runs automatically at the end of Step 1 (unless `--skip-facerec
 
 **What it does:**
 
-1. Loads per-body data from `album.json`.
+1. Loads per-body data from the Album (see algo/album.py).
 2. Extracts face embeddings from qualifying bodies (via the selected provider), skipping crops smaller than `--min-face-crop-px`.
 3. Optionally matches faces against a face DB and names matched clusters (see **How face-DB matching works** below).
 4. Clusters the remaining (unmatched) faces by cosine similarity (agglomerative, average linkage).
