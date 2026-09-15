@@ -13,7 +13,8 @@ from sklearn.cluster import AgglomerativeClustering
 
 from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model, make_alignment_debug_image
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
-from algo.album import Album
+from algo.album import Album, PersonRecord
+from algo.models import Box as ModelBox
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -619,7 +620,6 @@ class FaceRecoPipeline:
             self.config.output_dir_name,
         )
 
-        payload = album.payload
         info = self._load_json(info_path)
         src_dir = Path(info.get("SrcDir", "")).resolve() if info.get("SrcDir") else prep_output_dir
         log.debug("FaceReco: src_dir=%s", src_dir)
@@ -647,7 +647,7 @@ class FaceRecoPipeline:
         if assigned_overrides:
             log.info("FaceReco: %d manually-assigned face(s) will be pinned to their tagged person", len(assigned_overrides))
 
-        qualified = self._collect_qualified_bodies(payload, excluded=deleted_keys)
+        qualified = self._collect_qualified_bodies(album, excluded=deleted_keys)
 
         debug_dir: Path | None = None
         if self.config.debug_align:
@@ -800,40 +800,38 @@ class FaceRecoPipeline:
 
     def _collect_qualified_bodies(
         self,
-        payload: dict,
+        album: Album,
         excluded: set[tuple] | None = None,
     ) -> list[_QualifiedBody]:
         qualified: list[_QualifiedBody] = []
         excluded = excluded or set()
         excluded_count = 0
-        total_results = len(payload.get("results", []))
+        images = album.image_list
+        total_results = len(images)
         total_bodies = skipped_blurry = skipped_no_ann = 0
         # Capped at 0.5 regardless of how strict the album's own sensitivity
         # setting is -- see FaceRecoConfig.sensitivity_threshold.
         min_face_sharpness = min(self.config.sensitivity_threshold, 0.4)
         log.debug("FaceReco [collect]: scanning %d result entries  (min_face_sharpness=%.3f)",
                   total_results, min_face_sharpness)
-        for result in payload.get("results", []):
-            image_path = Path(result.get("file", ""))
-            # Disambiguated bookkeeping key (see algo/utils.py::make_unique_import_key)
-            # -- falls back to the plain filename for older albums written
-            # before multi-source-directory import support existed.
-            image_key = result.get("key") or image_path.name
-            ann = result.get("annotation_data")
-            if ann is None:
+        for image in images:
+            image_path = Path(image.source_file)
+            image_key = image.key
+            if not image.has_annotation:
                 skipped_no_ann += 1
                 log.debug("FaceReco [collect]: %s — no annotation_data, skipped", image_key)
                 continue
-            evaluated = ann.get("evaluated", [])
-            log.debug("FaceReco [collect]: %s — %d evaluated body/bodies", image_key, len(evaluated))
-            for idx, body_data in enumerate(evaluated):
+            bodies = image.bodies
+            log.debug("FaceReco [collect]: %s — %d evaluated body/bodies", image_key, len(bodies))
+            for idx, record in enumerate(bodies):
                 total_bodies += 1
-                if (image_key, _bbox_key(body_data.get("body_bbox"))) in excluded:
+                body_bbox = record.body_bbox
+                if (image_key, _bbox_key(body_bbox.to_wire() if body_bbox else None)) in excluded:
                     excluded_count += 1
                     log.debug("FaceReco [collect]: %s body#%d — excluded (previously deleted), skipped", image_key, idx)
                     continue
-                sharpness = body_data.get("sharpness_score", 0.0)
-                cloth = body_data.get("cloth_color", "N/A")
+                sharpness = record.sharpness_score
+                cloth = record.cloth_color
                 if sharpness <= min_face_sharpness:
                     skipped_blurry += 1
                     log.debug(
@@ -845,7 +843,7 @@ class FaceRecoPipeline:
                     "FaceReco [collect]: %s body#%d  score=%.3f  color=%s  → QUALIFIED",
                     image_key, idx, sharpness, cloth,
                 )
-                body = self._parse_body_record(image_key, idx, body_data)
+                body = self._parse_body_record(image_key, idx, record)
                 qualified.append(_QualifiedBody(image_path=image_path, body=body))
         if excluded_count:
             log.info("FaceReco [collect]: %d previously-deleted face(s) excluded", excluded_count)
@@ -856,29 +854,26 @@ class FaceRecoPipeline:
         )
         return qualified
 
-    def _parse_body_record(self, orig_filename: str, body_index: int, body_data: dict) -> BodyRecord:
-        def _box(box_data: dict | None) -> Box | None:
-            if box_data is None:
+    def _parse_body_record(self, orig_filename: str, body_index: int, record: PersonRecord) -> BodyRecord:
+        def _box(box: ModelBox | None) -> Box | None:
+            if box is None:
                 return None
-            return Box(
-                float(box_data["x1"]),
-                float(box_data["y1"]),
-                float(box_data["x2"]),
-                float(box_data["y2"]),
-            )
+            return Box(box.x1, box.y1, box.x2, box.y2)
 
-        face_kps = body_data.get("face_kps") or {}
         return BodyRecord(
             orig_filename=orig_filename,
             body_index=body_index,
-            body_bbox=_box(body_data["body_bbox"]),
-            face_bbox=_box(body_data.get("face_bbox")),
-            narrow_face_bbox=_box(body_data.get("narrow_face_bbox")),
-            cloth_color=str(body_data.get("cloth_color", "N/A")),
-            qualified_for_sharpness=bool(body_data.get("qualified_for_sharpness", False)),
-            is_blurry=bool(body_data.get("is_blurry", True)),
-            confidence=face_kps.get("confidence"),
-            raw_body=body_data,
+            body_bbox=_box(record.body_bbox),
+            face_bbox=_box(record.face_bbox),
+            narrow_face_bbox=_box(record.narrow_face_bbox),
+            cloth_color=record.cloth_color,
+            qualified_for_sharpness=record.qualified_for_sharpness,
+            is_blurry=record.is_blurry,
+            confidence=record.face_confidence,
+            # The album's own dict, passed through rather than rebuilt: it is
+            # written verbatim into .FaceReco/*/face.json as "Body", and face
+            # databases already on disk contain those copies.
+            raw_body=record.wire,
         )
 
     # RAW extensions that require rawpy instead of OpenCV.
@@ -1288,7 +1283,8 @@ class FaceRecoPipeline:
         for cluster in remaining.values():
             kept: list[FaceSample] = []
             for sample in cluster.samples:
-                key = (sample.body.orig_filename, _bbox_key(sample.body.raw_body.get("body_bbox")))
+                bbox = sample.body.body_bbox
+                key = (sample.body.orig_filename, _bbox_key(bbox.to_wire() if bbox else None))
                 override = assigned.get(key)
                 if override is not None:
                     by_target_name.setdefault(override["name"], []).append(sample)

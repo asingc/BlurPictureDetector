@@ -90,7 +90,7 @@ def unique_path(dest_dir: Union[str, Path], filename: str) -> Path:
         i += 1
 
 
-def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:
+def atomic_save_and_backup(content: str, path: Union[str, Path], *, backup: bool = True) -> None:
     """Atomically overwrite `path` with `content`, gzip-backing-up whatever
     was there before.
 
@@ -108,6 +108,10 @@ def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:
        into ``<path.parent>/backup/<path.stem>_<yyyymmdd-hhmmss>.gz``, where
        the timestamp is the *old* file's creation time — then delete the
        parked-aside temp copy.
+
+    Only step 4 is optional (`backup=False`, for a caller rewriting the same
+    file repeatedly in one run). Steps 1-3 are what make the overwrite safe
+    and are never skipped.
     """
     path = Path(path)
     tmp_new_path = path.with_name(path.name + ".new.tmp")
@@ -133,6 +137,9 @@ def atomic_save_and_backup(content: str, path: Union[str, Path]) -> None:
         raise
 
     if had_old:
+        if not backup:
+            tmp_old_path.unlink()
+            return
         backup_dir = path.parent / "backup"
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.fromtimestamp(old_ctime).strftime("%Y%m%d-%H%M%S")

@@ -21,11 +21,7 @@ log = logging.getLogger("BlurPictureDetector")
 # Supported extensions
 # ---------------------------------------------------------------------------
 
-IMAGE_EXTENSIONS: frozenset[str] = frozenset(
-    {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-)
-_RAW_EXTENSIONS: frozenset[str] = frozenset({".cr3", ".cr2"})
-IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
+from algo.imagefiles import IMAGE_EXTENSIONS, RAW_EXTENSIONS as _RAW_EXTENSIONS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Face model bootstrap
@@ -54,15 +50,13 @@ def _ensure_face_model() -> Path:
 # ---------------------------------------------------------------------------
 
 def collect_images(input_path: Path) -> list[Path]:
-    """Return a sorted list of supported image files at *input_path*."""
-    if input_path.is_file():
-        return [input_path] if input_path.suffix.lower() in IMAGE_EXTENSIONS else []
-    if input_path.is_dir():
-        return sorted(
-            f for f in input_path.iterdir()
-            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-        )
-    return []
+    """Deprecated alias for algo/imagefiles.py::collect_images.
+
+    Kept only so an `Album` owns the complete image set: this stage now
+    receives its file list via ``only_paths`` instead of discovering one.
+    """
+    from algo.imagefiles import collect_images as _collect_images
+    return _collect_images(input_path)
 
 
 def _read_image(path: Path) -> np.ndarray | None:

@@ -35,6 +35,9 @@ class Box:
             int(round(self.y2 * img_h)),
         )
 
+    def to_wire(self) -> dict:
+        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2}
+
 
 @dataclass
 class BodyRecord:

@@ -1147,12 +1147,11 @@ def _culling_images(album_path: Path, category: str) -> list[dict]:
         preview = image.preview_path if image else None
         if preview is None:
             continue
-        result = image.entry
         stars = image.stars
         stars = stars if stars is not None else default_stars
         keep = stars >= 3
-        burst_ranking = result.get("burst_ranking")
-        llm_grade = result.get("llm_grade")
+        burst_ranking = image.burst_ranking
+        llm_grade = image.llm_grade
         # Prefer the per-entry absolute source path (multi-source-directory
         # imports) over joining the album's single legacy SrcDir.
         src_path = Path(item["srcPath"]) if item.get("srcPath") else src_dir / src_name
@@ -1464,24 +1463,21 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
     if not album.exists:
         return
 
-    # One key can map to several entries only in malformed albums; keep the
+    # One key can map to several photos only in malformed albums; keep the
     # list form so an unexpected duplicate is still updated rather than
     # silently skipped.
-    by_name: dict[str, list[dict]] = {}
-    for entry in album.results:
-        key = entry.get("key") or Path(entry.get("file", "")).name
-        by_name.setdefault(key, []).append(entry)
+    by_name: dict[str, list] = {}
+    for image in album.image_list:
+        by_name.setdefault(image.key, []).append(image)
 
     changed = False
     for a in assignments:
-        for entry in by_name.get(a["origFilename"], []):
-            ann = entry.get("annotation_data")
-            if not ann:
-                continue
-            for body in ann.get("evaluated", []):
-                if _boxes_match(body.get("body_bbox"), a["body_bbox"]):
-                    body["player_name"] = a["name"]
-                    body["player_number"] = a["playernum"]
+        for image in by_name.get(a["origFilename"], []):
+            for body in image.bodies:
+                bbox = body.body_bbox
+                if bbox and _boxes_match(bbox.to_wire(), a["body_bbox"]):
+                    body.player_name = a["name"]
+                    body.player_number = a["playernum"]
                     changed = True
 
     if changed:
@@ -2011,27 +2007,27 @@ def api_culling_apply(req: CullingApplyRequest) -> dict:
     with open(album_path / "info.json", encoding="utf-8") as fh:
         info = json.load(fh)
     album = album_for(album_path)
-    results_by_name = album.entries
+    album_images = album.images
 
     for category in CULLING_CATEGORIES:
         default_stars = _CULLING_DEFAULT_STARS[category]
         for item in info.get(_CULLING_INFO_KEY[category], []):
             src_name = item.get("src")
-            result = results_by_name.get(src_name)
-            if result is None:
+            image = album_images.get(src_name)
+            if image is None:
                 continue
-            current_stars = result.get("stars")
-            current_stars = int(current_stars) if current_stars is not None else default_stars
+            current_stars = image.stars
+            current_stars = current_stars if current_stars is not None else default_stars
             stars = int(req.starOverrides.get(src_name, current_stars))
-            result["stars"] = stars
-            result["keep"] = stars >= 3
+            image.stars = stars
+            image.keep = stars >= 3
             # Marks a rating the user actually chose, so a later regrade can
             # re-baseline everyone else's stars without discarding it. Only
             # keys present in starOverrides were genuinely touched -- every
             # other entry is rewritten above merely to persist its current
             # effective value.
             if src_name in req.starOverrides:
-                result["stars_manual"] = True
+                image.stars_manual = True
 
     album.save()
     log.info("Review changes applied: %s (%d star overrides)",
@@ -2363,12 +2359,10 @@ def api_album_tools_summary() -> dict:
     clusters = _build_clusters(album_path)
 
     album = album_for(album_path)
-    results = album.results
     star_breakdown = {str(n): 0 for n in range(5, 0, -1)}
     unrated = 0
-    for entry in results:
-        stars = entry.get("stars")
-        key = str(stars)
+    for image in album.image_list:
+        key = str(image.stars)
         if key in star_breakdown:
             star_breakdown[key] += 1
         else:

@@ -3,11 +3,12 @@ from __future__ import annotations
 import base64
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 
-from algo.album import Album, AlbumImage, entry_key
+from algo.album import Album, AlbumImage
 from algo.config import AppConfig
 from algo.frame import Frame
 from algo.llm.culling_provider import BurstFrameInput, BurstRankingResult, CullingProvider
@@ -58,33 +59,49 @@ SEQUENCE_STAR_4_QUOTA_SECONDS = 0.5
 SEQUENCE_STAR_3_TOP_FRACTION = 0.30
 
 
-def _sorted_sharp_entries(payload: dict) -> list[dict]:
-    """Sharp entries from *payload*, sorted chronologically. Each entry gets
-    a transient "_timestamp" key added (caller is responsible for popping it
-    before writing the payload back, if it intends to)."""
-    entries = payload.get("results", [])
-    sharp_entries = [e for e in entries if e.get("status") == "sharp"]
-    for entry in sharp_entries:
-        entry["_timestamp"] = image_capture_timestamp(Path(entry["file"]))
-    sharp_entries.sort(key=lambda e: (e["_timestamp"], e["file"]))
-    return sharp_entries
+@dataclass(frozen=True)
+class TimedImage:
+    """An album photo paired with its capture time — burst grouping's unit
+    of work.
+
+    The timestamp is derived (EXIF, else file times) rather than stored, so
+    it lives here instead of on the photo's album entry, where it used to be
+    injected as a transient ``_timestamp`` key that every writer then had to
+    remember to strip before saving.
+    """
+    image: AlbumImage
+    timestamp: float
+
+    @property
+    def key(self) -> str:
+        return self.image.key
 
 
-def _group_bursts(sharp_entries: list[dict], burst_gap_seconds: float) -> list[list[dict]]:
-    """Group chronologically-sorted *sharp_entries* (as returned by
-    :func:`_sorted_sharp_entries`) into bursts, splitting wherever the gap to
+def _sorted_sharp_images(album: Album) -> list[TimedImage]:
+    """Every sharp photo in *album*, chronologically."""
+    timed = [
+        TimedImage(image, image_capture_timestamp(Path(image.source_file)))
+        for image in album.image_list if image.is_sharp
+    ]
+    timed.sort(key=lambda t: (t.timestamp, t.image.source_file))
+    return timed
+
+
+def _group_bursts(sharp_images: list[TimedImage], burst_gap_seconds: float) -> list[list[TimedImage]]:
+    """Group chronologically-sorted *sharp_images* (as returned by
+    :func:`_sorted_sharp_images`) into bursts, splitting wherever the gap to
     the previous frame exceeds *burst_gap_seconds*."""
-    bursts: list[list[dict]] = []
-    for entry in sharp_entries:
-        if bursts and entry["_timestamp"] - bursts[-1][-1]["_timestamp"] <= burst_gap_seconds:
-            bursts[-1].append(entry)
+    bursts: list[list[TimedImage]] = []
+    for timed in sharp_images:
+        if bursts and timed.timestamp - bursts[-1][-1].timestamp <= burst_gap_seconds:
+            bursts[-1].append(timed)
         else:
-            bursts.append([entry])
+            bursts.append([timed])
     return bursts
 
 
 def _is_qualifying_sequence(
-    burst: list[dict],
+    burst: list[TimedImage],
     min_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
     min_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
 ) -> bool:
@@ -95,7 +112,7 @@ def _is_qualifying_sequence(
     *min_seconds*, OR its frame count to exceed *min_frames*."""
     if len(burst) < 2:
         return False
-    duration = burst[-1]["_timestamp"] - burst[0]["_timestamp"]
+    duration = burst[-1].timestamp - burst[0].timestamp
     return duration > min_seconds or len(burst) > min_frames
 
 
@@ -104,16 +121,15 @@ def load_qualifying_bursts(
     burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
     min_sequence_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
     min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
-) -> list[list[dict]]:
+) -> list[list[TimedImage]]:
     """Read *album_dir*'s `Album` (read-only — nothing is written back) and
     return the bursts of consecutive sharp frames that qualify as sequences
     (see :func:`_is_qualifying_sequence`) for LLM group-ranking. Shared by
     :meth:`LLMCullingStage.process` and pre-flight cost estimates (e.g.
     RerunLLMCulling.py) so the two can never drift out of sync with each
     other's burst definition."""
-    payload = Album(album_dir).payload
-    sharp_entries = _sorted_sharp_entries(payload)
-    bursts = _group_bursts(sharp_entries, burst_gap_seconds)
+    sharp_images = _sorted_sharp_images(Album(album_dir))
+    bursts = _group_bursts(sharp_images, burst_gap_seconds)
     return [b for b in bursts if _is_qualifying_sequence(b, min_sequence_seconds, min_sequence_frames)]
 
 
@@ -197,11 +213,6 @@ class LLMCullingStage(ProcessStage):
         # default) disables this filter so a fresh, non-merge run still
         # ranks every qualifying sequence as before.
         self.new_keys = new_keys
-        self._album: Album | None = None  # set for the duration of process()
-
-    @staticmethod
-    def _entry_key(entry: dict) -> str:
-        return entry_key(entry)
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         album = Album(self.output_dir)
@@ -209,11 +220,8 @@ class LLMCullingStage(ProcessStage):
             log.warning("[LLMCullingStage] no Album found at %s — skipping", album.path)
             return frames
 
-        self._album = album
-        payload = album.payload
-
-        sharp_entries = _sorted_sharp_entries(payload)
-        bursts = _group_bursts(sharp_entries, self.burst_gap_seconds)
+        sharp_images = _sorted_sharp_images(album)
+        bursts = _group_bursts(sharp_images, self.burst_gap_seconds)
 
         sequences = [
             b for b in bursts
@@ -222,14 +230,14 @@ class LLMCullingStage(ProcessStage):
         log.info(
             "[LLMCullingStage] %d sharp frame(s) -> %d burst(s), %d qualify as sequences "
             "(duration > %.1fs or > %d frames)",
-            len(sharp_entries), len(bursts), len(sequences),
+            len(sharp_images), len(bursts), len(sequences),
             self.min_sequence_seconds, self.min_sequence_frames,
         )
 
         to_rank = sequences
         if self.new_keys is not None:
             before = len(to_rank)
-            to_rank = [b for b in to_rank if any(self._entry_key(e) in self.new_keys for e in b)]
+            to_rank = [b for b in to_rank if any(t.key in self.new_keys for t in b)]
             log.info(
                 "[LLMCullingStage] import-more: %d/%d qualifying sequence(s) touch a newly-imported "
                 "photo -- only those will be (re-)ranked",
@@ -240,14 +248,14 @@ class LLMCullingStage(ProcessStage):
         # can all be handed to the provider in one batch call — this is what
         # lets a concurrency-capable provider (OpenAIProvider) fan the LLM
         # calls out in parallel instead of waiting on each burst serially.
-        prepared: list[tuple[str, list[dict]]] = []
+        prepared: list[tuple[str, list[TimedImage]]] = []
         burst_inputs_batch: list[list[BurstFrameInput]] = []
         if to_rank:
             log.info("[LLMCullingStage] preparing %d qualifying sequence(s) for ranking …", len(to_rank))
         for idx, burst in enumerate(to_rank):
             group_id = f"burst-{idx:04d}"
             burst_inputs = [
-                inp for inp in (self._build_frame_input(e) for e in burst) if inp is not None
+                inp for inp in (self._build_frame_input(t.image) for t in burst) if inp is not None
             ]
             if len(burst_inputs) < 2:
                 log.debug(
@@ -270,34 +278,31 @@ class LLMCullingStage(ProcessStage):
                 self._apply_rankings(burst, group_id, result)
             log.info("[LLMCullingStage] sequence ranking complete: %d sequence(s) processed", len(prepared))
 
-        standalone_entries = [
-            e for b in bursts
+        standalone_images = [
+            t for b in bursts
             if not _is_qualifying_sequence(b, self.min_sequence_seconds, self.min_sequence_frames)
-            for e in b
+            for t in b
         ]
         if self.new_keys is not None:
-            before = len(standalone_entries)
-            standalone_entries = [e for e in standalone_entries if self._entry_key(e) in self.new_keys]
+            before = len(standalone_images)
+            standalone_images = [t for t in standalone_images if t.key in self.new_keys]
             if before:
                 log.info(
                     "[LLMCullingStage] import-more: %d/%d standalone image(s) are newly-imported -- "
                     "only those will be graded",
-                    len(standalone_entries), before,
+                    len(standalone_images), before,
                 )
-        if standalone_entries:
-            log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_entries))
-            self._grade_standalone_entries(standalone_entries)
+        if standalone_images:
+            log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_images))
+            self._grade_standalone_images([t.image for t in standalone_images])
 
-        all_entries = payload.get("results", [])
-        blurry_entries = [e for e in all_entries if e.get("status") == "blurry"]
-        skipped_entries = [e for e in all_entries if e.get("status") in ("skipped", "error")]
-        self._assign_star_ratings(sharp_entries, blurry_entries, skipped_entries, sequences)
-
-        for entry in sharp_entries:
-            entry.pop("_timestamp", None)
+        all_images = album.image_list
+        blurry_images = [i for i in all_images if i.is_blurry]
+        skipped_images = [i for i in all_images if i.status in ("skipped", "error")]
+        self._assign_star_ratings(sharp_images, blurry_images, skipped_images, sequences)
 
         cost_summary = self.provider.get_cost_summary()
-        payload["llm_cost_summary"] = {
+        album.llm_cost_summary = {
             "session_count": cost_summary.session_count,
             "total_input_tokens": cost_summary.total_input_tokens,
             "total_output_tokens": cost_summary.total_output_tokens,
@@ -317,10 +322,10 @@ class LLMCullingStage(ProcessStage):
 
     def _assign_star_ratings(
         self,
-        sharp_entries: list[dict],
-        blurry_entries: list[dict],
-        skipped_entries: list[dict],
-        sequences: list[list[dict]],
+        sharp_images: list[TimedImage],
+        blurry_images: list[AlbumImage],
+        skipped_images: list[AlbumImage],
+        sequences: list[list[TimedImage]],
     ) -> None:
         """Assign a 1-5 star rating to every analysed entry (sharp, blurry,
         or skipped) so the whole album can be ranked on one scale:
@@ -349,41 +354,42 @@ class LLMCullingStage(ProcessStage):
         - 5 stars: top ``STAR_5_TOP_FRACTION`` by that same percentile.
         """
         low_cutoff = min(self.threshold, 0.4)
-        for entry in skipped_entries:
-            entry["stars"] = 1
-        for entry in blurry_entries:
-            score = entry.get("sharpness_score")
-            entry["stars"] = 1 if score is None or score < low_cutoff else 2
+        for image in skipped_images:
+            image.stars = 1
+        for image in blurry_images:
+            score = image.sharpness_score
+            image.stars = 1 if score is None or score < low_cutoff else 2
 
-        for entry in sharp_entries:
-            entry["stars"] = 3
+        for timed in sharp_images:
+            timed.image.stars = 3
 
         for burst in sequences:
             self._assign_sequence_stars(burst)
 
-        sequence_keys = {self._entry_key(e) for burst in sequences for e in burst}
-        non_sequence_sharp = [e for e in sharp_entries if self._entry_key(e) not in sequence_keys]
+        sequence_keys = {t.key for burst in sequences for t in burst}
+        non_sequence_sharp = [t.image for t in sharp_images if t.key not in sequence_keys]
 
-        graded = [e for e in non_sequence_sharp if e.get("llm_grade") is not None]
-        graded.sort(key=lambda e: e["llm_grade"], reverse=True)
+        graded = [i for i in non_sequence_sharp if i.llm_grade is not None]
+        graded.sort(key=lambda i: i.llm_grade, reverse=True)
         top_4_count = math.ceil(len(graded) * STAR_4_TOP_FRACTION)
         top_5_count = math.ceil(len(graded) * STAR_5_TOP_FRACTION)
-        for entry in graded[:top_4_count]:
-            entry["stars"] = 4
-        for entry in graded[:top_5_count]:
-            entry["stars"] = 5
+        for image in graded[:top_4_count]:
+            image.stars = 4
+        for image in graded[:top_5_count]:
+            image.stars = 5
 
+        sharp = [t.image for t in sharp_images]
         log.info(
             "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605, %d5\u2605 (%d sharp/%d blurry/%d skipped)",
-            sum(1 for e in skipped_entries + blurry_entries if e["stars"] == 1),
-            sum(1 for e in blurry_entries if e["stars"] == 2),
-            sum(1 for e in sharp_entries if e["stars"] == 3),
-            sum(1 for e in sharp_entries if e["stars"] == 4),
-            sum(1 for e in sharp_entries if e["stars"] == 5),
-            len(sharp_entries), len(blurry_entries), len(skipped_entries),
+            sum(1 for i in skipped_images + blurry_images if i.stars == 1),
+            sum(1 for i in blurry_images if i.stars == 2),
+            sum(1 for i in sharp if i.stars == 3),
+            sum(1 for i in sharp if i.stars == 4),
+            sum(1 for i in sharp if i.stars == 5),
+            len(sharp), len(blurry_images), len(skipped_images),
         )
 
-    def _assign_sequence_stars(self, burst: list[dict]) -> None:
+    def _assign_sequence_stars(self, burst: list[TimedImage]) -> None:
         """Star tiers for one qualifying burst sequence, scored independently
         per-sequence (never pooled against other sequences or the rest of
         the album):
@@ -399,81 +405,80 @@ class LLMCullingStage(ProcessStage):
         all (e.g. the LLM call failed), it's left at the baseline 3 stars
         every sharp frame already got, rather than guessing.
         """
-        graded = [e for e in burst if e.get("llm_grade") is not None]
+        graded = [t for t in burst if t.image.llm_grade is not None]
         if not graded:
             return
-        graded.sort(key=lambda e: e["llm_grade"], reverse=True)
+        graded.sort(key=lambda t: t.image.llm_grade, reverse=True)
 
-        duration = burst[-1]["_timestamp"] - burst[0]["_timestamp"]
+        duration = burst[-1].timestamp - burst[0].timestamp
         four_star_count = min(
             max(math.floor(duration / SEQUENCE_STAR_4_QUOTA_SECONDS), 1),
             len(graded),
         )
-        four_star_keys = {self._entry_key(e) for e in graded[:four_star_count]}
+        four_star_keys = {t.key for t in graded[:four_star_count]}
 
         remaining = graded[four_star_count:]
         three_star_count = math.ceil(len(remaining) * SEQUENCE_STAR_3_TOP_FRACTION)
-        three_star_keys = {self._entry_key(e) for e in remaining[:three_star_count]}
+        three_star_keys = {t.key for t in remaining[:three_star_count]}
 
-        for entry in burst:
-            key = self._entry_key(entry)
-            if key in four_star_keys:
-                entry["stars"] = 4
-            elif key in three_star_keys:
-                entry["stars"] = 3
+        for timed in burst:
+            if timed.key in four_star_keys:
+                timed.image.stars = 4
+            elif timed.key in three_star_keys:
+                timed.image.stars = 3
             else:
-                entry["stars"] = 2
+                timed.image.stars = 2
 
-    def _apply_rankings(self, burst: list[dict], group_id: str, result: BurstRankingResult) -> None:
+    def _apply_rankings(self, burst: list[TimedImage], group_id: str, result: BurstRankingResult) -> None:
         rank_by_file = {r.file: r for r in result.rankings}
         if not rank_by_file:
             log.warning("[LLMCullingStage] %s: provider returned no usable ranking — leaving as-is", group_id)
             return
 
-        by_name = {self._entry_key(e): e for e in burst}
-        for filename, entry in by_name.items():
-            ranked = rank_by_file.get(filename)
+        for timed in burst:
+            image = timed.image
+            ranked = rank_by_file.get(timed.key)
             if ranked is not None:
-                entry["keep"] = ranked.rank == 1
-                entry["burst_ranking"] = {
+                image.keep = ranked.rank == 1
+                image.burst_ranking = {
                     "rank": ranked.rank,
                     "reason": ranked.reason,
                     "group_id": group_id,
                 }
             else:
-                entry["keep"] = False
-            grade = result.grades.get(filename)
+                image.keep = False
+            grade = result.grades.get(timed.key)
             if grade is not None:
-                entry["llm_grade"] = grade
+                image.llm_grade = grade
             if result.caption:
-                entry["burst_caption"] = result.caption
+                image.burst_caption = result.caption
 
         top = next((r.file for r in result.rankings if r.rank == 1), "n/a")
         log.info("[LLMCullingStage] %s: %d frame(s) ranked, top pick=%s", group_id, len(result.rankings), top)
 
-    def _grade_standalone_entries(self, entries: list[dict]) -> None:
+    def _grade_standalone_images(self, images: list[AlbumImage]) -> None:
         """Grade sharp frames that don't belong to a qualifying burst
-        (``entries``) individually via ``provider.grade_image_batches``.
-        Entries are chunked into ``singleton_batch_size``-sized groups purely
+        (``images``) individually via ``provider.grade_image_batches``.
+        Images are chunked into ``singleton_batch_size``-sized groups purely
         to amortize each request's fixed overhead across multiple images —
         the LLM still grades each one independently, never comparing them.
 
-        Every entry that gets a grade back has its ``llm_grade`` recorded.
-        The top ``singleton_keep_fraction`` of *graded* entries (by grade,
+        Every image that gets a grade back has its ``llm_grade`` recorded.
+        The top ``singleton_keep_fraction`` of *graded* images (by grade,
         highest first) are marked ``keep=True``, the rest ``keep=False`` —
-        every graded entry keeps its ``llm_grade`` regardless, so the score
-        stays visible for manual review even when dropped. Entries whose
+        every graded image keeps its ``llm_grade`` regardless, so the score
+        stays visible for manual review even when dropped. Images whose
         batch fails (no grade returned) are left untouched.
         """
         batches: list[list[BurstFrameInput]] = []
-        by_name_per_batch: list[dict[str, dict]] = []
-        for i in range(0, len(entries), self.singleton_batch_size):
-            chunk = entries[i:i + self.singleton_batch_size]
-            inputs = [inp for inp in (self._build_frame_input(e) for e in chunk) if inp is not None]
+        by_name_per_batch: list[dict[str, AlbumImage]] = []
+        for i in range(0, len(images), self.singleton_batch_size):
+            chunk = images[i:i + self.singleton_batch_size]
+            inputs = [inp for inp in (self._build_frame_input(im) for im in chunk) if inp is not None]
             if not inputs:
                 continue
             batches.append(inputs)
-            by_name_per_batch.append({self._entry_key(e): e for e in chunk})
+            by_name_per_batch.append({im.key: im for im in chunk})
             log.debug(
                 "[LLMCullingStage] standalone: prepared batch %d (%d image(s))",
                 len(batches), len(inputs),
@@ -484,7 +489,7 @@ class LLMCullingStage(ProcessStage):
 
         log.info(
             "[LLMCullingStage] sending %d standalone batch(es) (%d image(s)) to LLM provider for grading …",
-            len(batches), len(entries),
+            len(batches), len(images),
         )
         try:
             grade_results = self.provider.grade_image_batches(batches)
@@ -492,34 +497,34 @@ class LLMCullingStage(ProcessStage):
             log.error("[LLMCullingStage] provider.grade_image_batches failed: %s", exc, exc_info=True)
             grade_results = [{} for _ in batches]
 
-        graded_entries: list[dict] = []
+        graded_images: list[AlbumImage] = []
         for by_name, grades in zip(by_name_per_batch, grade_results):
             for filename, grade in grades.items():
-                entry = by_name.get(filename)
-                if entry is None:
+                image = by_name.get(filename)
+                if image is None:
                     continue
-                entry["llm_grade"] = grade
-                graded_entries.append(entry)
+                image.llm_grade = grade
+                graded_images.append(image)
 
-        if not graded_entries:
+        if not graded_images:
             log.warning(
-                "[LLMCullingStage] standalone grading returned no usable grade for any of %d entr(y/ies)",
-                len(entries),
+                "[LLMCullingStage] standalone grading returned no usable grade for any of %d image(s)",
+                len(images),
             )
             return
 
-        graded_entries.sort(key=lambda e: e["llm_grade"], reverse=True)
-        keep_count = round(len(graded_entries) * self.singleton_keep_fraction)
-        for idx, entry in enumerate(graded_entries):
-            entry["keep"] = idx < keep_count
+        graded_images.sort(key=lambda i: i.llm_grade, reverse=True)
+        keep_count = round(len(graded_images) * self.singleton_keep_fraction)
+        for idx, image in enumerate(graded_images):
+            image.keep = idx < keep_count
 
         log.info(
             "[LLMCullingStage] standalone: %d/%d image(s) graded, top %d (%.0f%%) marked keep",
-            len(graded_entries), len(entries), keep_count, self.singleton_keep_fraction * 100,
+            len(graded_images), len(images), keep_count, self.singleton_keep_fraction * 100,
         )
 
-    def _build_frame_input(self, entry: dict) -> BurstFrameInput | None:
-        file_path = AlbumImage(self._album, entry).original_path
+    def _build_frame_input(self, album_image: AlbumImage) -> BurstFrameInput | None:
+        file_path = album_image.original_path
         image = _read_image(file_path) if file_path else None
         if image is None:
             log.warning("[LLMCullingStage] could not read %s — excluding from burst", file_path)
@@ -532,22 +537,17 @@ class LLMCullingStage(ProcessStage):
             return None
         image_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
-        ann = entry.get("annotation_data") or {}
-        evaluated = ann.get("evaluated", [])
-        best_body = max(
-            (b for b in evaluated if not b.get("is_blurry", True)),
-            key=lambda b: b.get("sharpness_score", 0.0),
-            default=None,
-        )
+        passing = [b for b in album_image.bodies if b.passed]
+        best_body = max(passing, key=lambda b: b.sharpness_score, default=None)
         face_bbox = None
         if best_body is not None:
-            box = best_body.get("narrow_face_bbox") or best_body.get("face_bbox")
+            box = best_body.narrow_face_bbox or best_body.face_bbox
             if box is not None:
-                face_bbox = (box["x1"], box["y1"], box["x2"], box["y2"])
+                face_bbox = (box.x1, box.y1, box.x2, box.y2)
 
         return BurstFrameInput(
-            file=self._entry_key(entry),
+            file=album_image.key,
             image_b64=image_b64,
             face_bbox=face_bbox,
-            sharpness_score=float(entry.get("sharpness_score", 0.0)),
+            sharpness_score=album_image.sharpness_score or 0.0,
         )

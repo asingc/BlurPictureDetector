@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover - non-Windows platforms
     msvcrt = None
 
 from algo.config import AppConfig, app_config
+from algo import album
 from algo.album import Album
 from algo.frame import Frame
 from algo.models import Body, Box, ColorLab, Face, Point, PredictedKeyPoint
@@ -113,13 +114,7 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-IMAGE_EXTENSIONS: frozenset[str] = frozenset(
-    {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-)
-
-# RAW formats decoded via rawpy rather than OpenCV.
-_RAW_EXTENSIONS: frozenset[str] = frozenset({".cr3", ".cr2"})
-IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | _RAW_EXTENSIONS
+from algo.imagefiles import IMAGE_EXTENSIONS, RAW_EXTENSIONS as _RAW_EXTENSIONS  # noqa: E402,F401
 
 # sharpness_score threshold per sensitivity level.
 # A file is flagged as blurry when  sharpness_score <= threshold.
@@ -1054,122 +1049,6 @@ def _resolve_face_db_dir(
     return None
 
 
-def collect_images(input_path: Path) -> list[Path]:
-    if input_path.is_file():
-        return [input_path] if input_path.suffix.lower() in IMAGE_EXTENSIONS else []
-    if input_path.is_dir():
-        return sorted(
-            f for f in input_path.iterdir()
-            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-        )
-    return []
-
-
-def process(
-    input_path: Path, sensitivity: str, output_root: Optional[Path] = None,
-    jersey_colors: frozenset[str] = frozenset(),
-) -> tuple[list[dict], list[dict], Path, str | None, float]:
-    """
-    Process all images at *input_path*.
-
-    Annotated copies are always saved, sorted into <output_dir>/anno_blur/,
-    <output_dir>/anno_sharp/, and <output_dir>/anno_skipped/ sub-folders.
-
-    output_root : if provided, use it directly as the output directory;
-                  otherwise a timestamped sub-folder is created under ./albums/.
-
-    Returns (all_results, blurry_results, output_directory).
-    """
-    try:
-        threshold = float(sensitivity)
-    except ValueError:
-        threshold = SENSITIVITY_THRESHOLDS[sensitivity]
-    files      = collect_images(input_path)
-    ts         = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = output_root if output_root is not None else Path("albums") / _build_album_dir_name(ts, input_path.stem)
-
-    if not files:
-        log.warning("No supported image files found in: %s", input_path)
-        return [], [], output_dir
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _add_file_logging(output_dir / "run.log")
-    log.debug("Output directory: %s", output_dir.resolve())
-
-    width     = len(str(len(files)))  # for aligned progress numbers
-    boxes_dir = output_dir
-
-    log.info("Loading models …")
-    pose_model = YOLO("yolov8n-pose.pt")
-    face_model = YOLO(_ensure_face_model())
-    log.debug("pose model: yolov8n-pose.pt | face model: %s", _FACE_MODEL_PATH.name)
-
-    log.info(
-        "Processing %d image(s)  |  sensitivity=%s  |  blur threshold=%.2f  |  annotations → %s",
-        len(files), sensitivity, threshold, boxes_dir,
-    )
-    log.debug("Config: face_coverage_min_visible=%d  face_coverage_conf_threshold=%.2f"
-              "  face_min_size_fraction=%.3f  normalized_img_max_long_edge=%d",
-              app_config.face_coverage_min_visible,
-              app_config.face_coverage_conf_threshold,
-              app_config.face_min_size_fraction,
-              app_config.normalized_img_max_long_edge)
-
-    all_results: list[dict] = []
-    skip_count = error_count = 0
-
-    # ── Phase 1: extract data for all images ────────────────────────────────
-    log.info("Phase 1/3 — extraction (detect + measure + color votes) …")
-    for idx, image_path in enumerate(files, 1):
-        tag = f"[{idx:>{width}}/{len(files)}] {image_path.name}"
-        result = analyse_image(image_path, pose_model, face_model)
-        all_results.append(result)
-
-        if result["status"] == "skipped":
-            skip_count += 1
-            log.info("%s  →  Skipped  (%s)", tag, result.get("reason", ""))
-
-        elif result["status"] == "error":
-            error_count += 1
-            log.error("%s  →  Error    (%s)", tag, result.get("error", ""))
-
-        else:
-            log.info("%s  →  Analysed  extracted_score=%.3f",
-                     tag, result.get("sharpness_score", 0.0))
-
-    analysed_count = sum(1 for r in all_results if r.get("status") == "analysed")
-    log.info("Extraction summary —  Analysed: %d  |  Skipped: %d  |  Errors: %d",
-             analysed_count, skip_count, error_count)
-
-    jersey_color_filter = ";".join(sorted(jersey_colors)) if jersey_colors else None
-    log.info("Jersey colour filter: %s", jersey_color_filter or "(none)")
-
-    # Poll dominant jersey color between extraction and verdict phases.
-    polled_jersey_color = _compute_jersey_color(all_results)
-    log.info("Polled jersey colour (all evaluated bodies): %s", polled_jersey_color)
-
-    # ── Phase 2: assign final sharp/blurry verdicts from extracted data ─────
-    log.info("Phase 2/3 — verdicts from extracted data …")
-    blurry = _recompute_verdicts(
-        all_results,
-        our_jersey_color=polled_jersey_color,
-        threshold=threshold,
-        jersey_colors=jersey_colors,
-    )
-    sharp_count = sum(1 for r in all_results if r.get("status") == "sharp")
-
-    log.info("Summary —  Blurry: %d  |  Sharp: %d  |  Skipped: %d  |  Errors: %d",
-             len(blurry), sharp_count, skip_count, error_count)
-
-    # ── Phase 3: write annotated previews ────────────────────────────────────
-    log.info("Phase 3/3 — writing annotated previews …")
-    for idx, result in enumerate(all_results, 1):
-        log.debug("[annotate] [%d/%d] %s", idx, len(all_results), Path(result["file"]).name)
-        annotate_image(result, boxes_dir, jersey_colors)
-
-    return all_results, blurry, output_dir, polled_jersey_color, threshold
-
-
 # ---------------------------------------------------------------------------
 # CSV output
 # ---------------------------------------------------------------------------
@@ -1265,7 +1144,9 @@ def _merge_preserved_fields(
         # that no longer reflects it, so reset to the baseline unless the
         # user rated it by hand (culling_app.py's "stars_manual" marker).
         if old.get("status") != entry.get("status") and not entry.get("stars_manual"):
-            entry["stars"] = baseline_stars(entry, entry.get("status", "blurry"), threshold)
+            entry["stars"] = baseline_stars(
+                entry.get("sharpness_score"), entry.get("status", "blurry"), threshold
+            )
             entry["keep"] = entry["stars"] >= 3
     return new_entries
 
@@ -1736,6 +1617,11 @@ def main() -> None:
         parser.error("the following arguments are required: path")
 
     _setup_console_logging()
+    # This script rewrites album.json several times per run (analysis, then
+    # FaceReco, then LLM culling). Backing up every intermediate version of a
+    # 30 MB file would leave a pile of gzipped copies of states the user
+    # never saw; the interactive app keeps its backups.
+    album.album_json_backups_enabled = False
     if args.enable_long_paths:
         _try_enable_windows_long_paths()
     log.debug("Arguments: path=%s sensitivity=%s output=%s jerseycolor=%s skip_facereco=%s noteam=%s face_db=%s",

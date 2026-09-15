@@ -10,45 +10,27 @@ its own drifting copy.
 
 from __future__ import annotations
 
-import json
-
-import numpy as np
-
+from algo.album import PersonRecord
 from algo.frame import Frame
-from algo.models import Box, Face, PredictedKeyPoint
+from algo.models import Box, Face, NumpyEncoder, PredictedKeyPoint
+
+__all__ = ["NumpyEncoder", "baseline_stars", "build_result_entries",
+           "serial_box", "serial_face", "serial_keypoint"]
 
 
 def serial_box(b: Box) -> dict:
-    return {"x1": b.x1, "y1": b.y1, "x2": b.x2, "y2": b.y2}
+    return b.to_wire()
 
 
 def serial_keypoint(kp: PredictedKeyPoint) -> dict:
-    return {"x": kp.point.x, "y": kp.point.y, "conf": kp.confidence, "passed": kp.passed}
+    return kp.to_wire()
 
 
 def serial_face(f: Face) -> dict:
-    return {
-        "bbox":       serial_box(f.bbox),
-        "confidence": f.confidence,
-        "landmarks":  [serial_keypoint(lm) for lm in f.landmarks],
-        "passed":     f.passed,
-    }
+    return f.to_wire()
 
 
-class NumpyEncoder(json.JSONEncoder):
-    """Encode numpy scalar types as their Python equivalents."""
-
-    def default(self, obj: object) -> object:
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
-
-
-def baseline_stars(entry: dict, status: str, threshold: float) -> int:
+def baseline_stars(sharpness_score: float | None, status: str, threshold: float) -> int:
     """Star rating for a photo whose verdict just changed.
 
     Mirrors the floor of algo/stages/llm_culling.py::_assign_star_ratings:
@@ -59,8 +41,9 @@ def baseline_stars(entry: dict, status: str, threshold: float) -> int:
     """
     if status == "sharp":
         return 3
-    score = entry.get("sharpness_score")
-    return 1 if score is None or float(score) < min(threshold, 0.4) else 2
+    if sharpness_score is None:
+        return 1
+    return 1 if float(sharpness_score) < min(threshold, 0.4) else 2
 
 
 def build_result_entries(frames: list[Frame]) -> list[dict]:
@@ -97,23 +80,7 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
                 "annotation_data": {
                     "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
                     "overall_blurry":   overall_blurry,
-                    "evaluated": [
-                        {
-                            "body_bbox":          serial_box(body.bbox),
-                            "body_keypoints":     [serial_keypoint(kp) for kp in body.keypoints],
-                            "face_bbox":          serial_box(body.best_face.bbox) if body.best_face else None,
-                            "narrow_face_bbox":   serial_box(body.best_narrow_box) if body.best_narrow_box else None,
-                            "face_kps":           serial_face(body.best_face) if body.best_face else None,
-                            "sharpness_score":    body.sharpness_score,
-                            "lap_var":            body.lap_var,
-                            "ten":                body.ten,
-                            "is_blurry":          not body.passed,
-                            "rejection_reason":   body.rejection_reason,
-                            "cloth_color":        body.cloth_color,
-                            "cloth_color_detail": body.cloth_color_detail,
-                        }
-                        for body in frame.bodies
-                    ],
+                    "evaluated": [PersonRecord.from_body(body).wire for body in frame.bodies],
                 },
             }
         serializable.append(entry)

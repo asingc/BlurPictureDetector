@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import numpy as np
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """Encode numpy scalar types as their Python equivalents."""
+
+    def default(self, obj: object) -> object:
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 @dataclass
@@ -82,6 +96,15 @@ class Box:
             self.y1 < other.y2 and self.y2 > other.y1
         )
 
+    def to_wire(self) -> dict:
+        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2}
+
+    @staticmethod
+    def from_wire(data: dict | None) -> "Box | None":
+        if not data:
+            return None
+        return Box(float(data["x1"]), float(data["y1"]), float(data["x2"]), float(data["y2"]))
+
 
 @dataclass
 class PredictedKeyPoint:
@@ -89,6 +112,15 @@ class PredictedKeyPoint:
     point:      Point
     confidence: float
     passed:     bool = True   # scorers set this to False to disqualify
+
+    def to_wire(self) -> dict:
+        return {"x": self.point.x, "y": self.point.y, "conf": self.confidence, "passed": self.passed}
+
+    @staticmethod
+    def from_wire(data: dict) -> "PredictedKeyPoint":
+        return PredictedKeyPoint(
+            Point(data["x"], data["y"]), data["conf"], bool(data.get("passed", True))
+        )
 
 
 @dataclass
@@ -102,6 +134,28 @@ class Face:
     def n_visible(self) -> int:
         """Count landmarks that have passed classification."""
         return sum(1 for lm in self.landmarks if lm.passed)
+
+    def to_wire(self) -> dict:
+        return {
+            "bbox":       self.bbox.to_wire(),
+            "confidence": self.confidence,
+            "landmarks":  [lm.to_wire() for lm in self.landmarks],
+            "passed":     self.passed,
+        }
+
+    @staticmethod
+    def from_wire(data: dict | None) -> "Face | None":
+        if not data:
+            return None
+        bbox = Box.from_wire(data.get("bbox"))
+        if bbox is None:
+            return None
+        return Face(
+            bbox=bbox,
+            confidence=float(data.get("confidence", 0.0)),
+            landmarks=[PredictedKeyPoint.from_wire(lm) for lm in data.get("landmarks", [])],
+            passed=bool(data.get("passed", True)),
+        )
 
 
 @dataclass

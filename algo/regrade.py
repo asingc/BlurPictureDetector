@@ -45,11 +45,9 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
-
 from algo.config import app_config
 from algo.frame import Frame
-from algo.models import AutoAdjustment, Body, Box, ColorLab, Face, Point, PredictedKeyPoint
+from algo.models import ColorLab
 from algo.results import baseline_stars
 from algo.stages.annotation import _annotate_frame
 from algo.stages.grading import cloth_color_predictor
@@ -59,15 +57,10 @@ from algo.stages.jersey_counting import (
     _lightness_class,
     classify_body_jersey,
 )
-from algo.album import Album, AlbumImage, entry_key
+from algo.album import Album, AlbumImage, PersonRecord
 from algo.utils import _color_from_label, atomic_save_and_backup
 
 log = logging.getLogger("BlurPictureDetector")
-
-# A body reconstructed from stored JSON has no real face crop (sharpness was
-# already scored at import time) -- cloth_color_predictor.predict() never
-# touches body.crop, so a tiny placeholder is enough.
-_DUMMY_CROP = np.zeros((1, 1, 3), dtype=np.uint8)
 
 _REVIEW_INFO_KEY = {"blurry": "Anno_Blur", "sharp": "Anno_Sharp"}
 
@@ -103,90 +96,23 @@ def _parse_jersey_colors(jerseycolor_arg: str | None) -> tuple[frozenset[str], f
     return forced, regular
 
 
-def _body_from_entry(body_dict: dict) -> Body:
-    bbox = Box(**body_dict["body_bbox"])
-    keypoints = [
-        PredictedKeyPoint(Point(kp["x"], kp["y"]), kp["conf"], kp.get("passed", True))
-        for kp in body_dict.get("body_keypoints", [])
-    ]
-    return Body(crop=_DUMMY_CROP, bbox=bbox, faces=[], keypoints=keypoints)
-
-
-def _cleared_grading_gates(body_dict: dict) -> bool:
-    """True when this body passed every gate BEFORE the sharpness threshold —
-    i.e. it has a matched face, of adequate size, with enough visible head
-    keypoints (see algo/scorers.py's short-circuiting BodyArrayScorer).
-
-    Those three gates don't depend on the threshold, so such a body is a
-    legitimate candidate to re-evaluate at any new one. A body rejected for
-    sharpness OR for jersey colour necessarily got past them; a body rejected
-    for anything else did not. Albums imported before ``rejection_reason`` was
-    persisted have no reason string, so a currently-failing body there can't
-    be shown to qualify and is conservatively left alone.
-    """
-    if not body_dict.get("is_blurry", True):
-        return True
-    reason = body_dict.get("rejection_reason") or ""
-    return reason.startswith("sharpness score") or reason.startswith("jersey ")
-
-
-def _full_body_from_dict(b: dict) -> Body:
-    """Reconstruct a Body with every field algo/stages/annotation.py's drawer
-    reads (unlike :func:`_body_from_entry`, which only carries the bbox/
-    keypoints needed for a cloth-colour re-prediction)."""
-    keypoints = [
-        PredictedKeyPoint(Point(kp["x"], kp["y"]), kp["conf"], kp.get("passed", True))
-        for kp in b.get("body_keypoints", [])
-    ]
-    best_face: Face | None = None
-    face_kps = b.get("face_kps")
-    if face_kps:
-        best_face = Face(
-            bbox=Box(**face_kps["bbox"]),
-            confidence=float(face_kps.get("confidence", 0.0)),
-            landmarks=[
-                PredictedKeyPoint(Point(lm["x"], lm["y"]), lm["conf"], lm.get("passed", True))
-                for lm in face_kps.get("landmarks", [])
-            ],
-            passed=bool(face_kps.get("passed", True)),
-        )
-    return Body(
-        crop=_DUMMY_CROP,
-        bbox=Box(**b["body_bbox"]),
-        faces=[best_face] if best_face else [],
-        keypoints=keypoints,
-        passed=not b.get("is_blurry", True),
-        rejection_reason=b.get("rejection_reason") or "",
-        sharpness_score=float(b.get("sharpness_score", 0.0)),
-        best_face=best_face,
-        best_narrow_box=Box(**b["narrow_face_bbox"]) if b.get("narrow_face_bbox") else None,
-        lap_var=float(b.get("lap_var", 0.0)),
-        ten=float(b.get("ten", 0.0)),
-        cloth_color=b.get("cloth_color", "N/A"),
-        cloth_color_detail=b.get("cloth_color_detail") or {},
-    )
-
-
-def _regenerate_preview(entry: dict, bodies: list[dict], album: Album) -> bool:
-    """Redraw <album>/previews/<key>.jpg (+ thumbnail) from the entry's
+def _regenerate_preview(image: AlbumImage, album: Album) -> bool:
+    """Redraw <album>/previews/<key>.jpg (+ thumbnail) from the photo's
     just-updated per-body verdicts, so the pass/fail badges and rejection-
     reason labels baked into the preview stay in sync with the new overall
     status. Returns False (leaving the stale preview in place) when the
     source photo can no longer be re-read."""
-    file_path = entry.get("file", "")
-    image = _read_source_image(file_path)
-    if image is None:
+    file_path = image.source_file
+    decoded = _read_source_image(file_path)
+    if decoded is None:
         return False
-
-    output_key = AlbumImage(album, entry).preview_stem
-    auto_adj = entry.get("auto_adjustment")
 
     frame = Frame(
         path=Path(file_path),
-        bodies=[_full_body_from_dict(b) for b in bodies],
-        image=image,
-        auto_adjustment=AutoAdjustment(ev=float(auto_adj["ev"])) if auto_adj else None,
-        output_key=output_key,
+        bodies=[record.to_body() for record in image.bodies],
+        image=decoded,
+        auto_adjustment=image.auto_adjustment,
+        output_key=image.preview_stem,
     )
     _annotate_frame(frame, album.path, app_config)
     return True
@@ -207,20 +133,20 @@ def _read_source_image(file_path: str):
     return _read_image(Path(file_path))
 
 
-def _stored_lab(body_dict: dict) -> tuple[float, float, float] | None:
+def _stored_lab(record: PersonRecord) -> tuple[float, float, float] | None:
     """The body's representative L*a*b*, preferring its measured median over
     the reference LAB of its predicted label — mirrors
-    algo/stages/jersey_counting.py::_body_lab, but reading persisted JSON."""
-    color = body_dict.get("cloth_color", "N/A")
+    algo/stages/jersey_counting.py::_body_lab, but reading persisted data."""
+    color = record.cloth_color
     if color in ("N/A", "Unknown"):
         return None
-    mean = (body_dict.get("cloth_color_detail") or {}).get("mean_lab")
+    mean = record.cloth_color_detail.get("mean_lab")
     if mean and len(mean) == 3:
         return (float(mean[0]), float(mean[1]), float(mean[2]))
     return _REF_LAB_BY_LABEL.get(color)
 
 
-def _poll_jersey(candidates: list[dict], config, pinned_label: str | None = None) -> tuple[
+def _poll_jersey(candidates: list[PersonRecord], config, pinned_label: str | None = None) -> tuple[
     str | None, tuple[float, float, float] | None, str | None
 ]:
     """Determine the team's jersey colour across every body eligible for the
@@ -240,12 +166,12 @@ def _poll_jersey(candidates: list[dict], config, pinned_label: str | None = None
     bucket_counts: dict[str, int] = {}
     labs_by_label: dict[str, list[tuple[float, float, float]]] = {}
 
-    for body_dict in candidates:
-        color = body_dict.get("cloth_color", "N/A")
+    for record in candidates:
+        color = record.cloth_color
         if color in ("N/A", "Unknown"):
             continue
         label_counts[color] = label_counts.get(color, 0) + 1
-        lab = _stored_lab(body_dict)
+        lab = _stored_lab(record)
         if lab is None:
             continue
         labs_by_label.setdefault(color, []).append(lab)
@@ -302,7 +228,6 @@ def regrade_sensitivity(
     album = Album(album_path)
     payload = album.payload
 
-    results: list[dict] = payload.get("results", [])
     run_settings: dict = payload.get("run_settings") or {}
     no_team = bool(run_settings.get("noteam"))
     summary = RegradeSummary(threshold=new_threshold)
@@ -323,22 +248,21 @@ def regrade_sensitivity(
     # threshold-independent grading gates, and whether it clears the new
     # threshold. Eligible bodies are exactly the population
     # JerseyCountingStage evaluates.
-    gradable: list[tuple[dict, list[bool], list[bool]]] = []
-    candidates: list[dict] = []
-    for entry in results:
-        if entry.get("status") not in ("blurry", "sharp"):
+    gradable: list[tuple[AlbumImage, list[PersonRecord], list[bool], list[bool]]] = []
+    candidates: list[PersonRecord] = []
+    for image in album.image_list:
+        if image.status not in ("blurry", "sharp"):
             continue
-        ann = entry.get("annotation_data")
-        bodies = ann.get("evaluated", []) if ann else []
+        bodies = image.bodies
         if not bodies:
             continue
         summary.images_considered += 1
-        cleared = [_cleared_grading_gates(b) for b in bodies]
+        cleared = [b.cleared_grading_gates for b in bodies]
         eligible = [
-            c and float(b.get("sharpness_score", 0.0)) > new_threshold
+            c and b.sharpness_score > new_threshold
             for b, c in zip(bodies, cleared)
         ]
-        gradable.append((entry, cleared, eligible))
+        gradable.append((image, bodies, cleared, eligible))
         candidates.extend(b for b, e in zip(bodies, eligible) if e)
 
     # ---- Pass 1: make sure every candidate has a measured cloth colour ----
@@ -347,25 +271,23 @@ def regrade_sensitivity(
     # measured from pixels now. Bodies that got as far as the jersey check
     # already carry one and are reused as-is.
     if not no_team:
-        for entry, _cleared, eligible in gradable:
-            bodies = entry["annotation_data"]["evaluated"]
+        for image, bodies, _cleared, eligible in gradable:
             needs_color = [
                 b for b, e in zip(bodies, eligible)
-                if e and b.get("cloth_color", "N/A") in ("N/A", None)
+                if e and b.cloth_color in ("N/A", None)
             ]
             if not needs_color:
                 continue
-            file_path = entry.get("file", "")
-            image = _read_source_image(file_path)
-            if image is None:
+            file_path = image.source_file
+            decoded = _read_source_image(file_path)
+            if decoded is None:
                 summary.jersey_recheck_unreadable += len(needs_color)
                 log.warning("[regrade] cannot re-read source photo for jersey colour: %s", file_path)
                 continue
-            for body_dict in needs_color:
-                body = _body_from_entry(body_dict)
-                body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(body, image)
-                body_dict["cloth_color"] = body.cloth_color
-                body_dict["cloth_color_detail"] = body.cloth_color_detail
+            for record in needs_color:
+                record.cloth_color, record.cloth_color_detail = cloth_color_predictor.predict(
+                    record.to_body(), decoded
+                )
                 summary.jersey_rechecked += 1
 
     # ---- Pass 2: re-poll the team's jersey colour from those candidates ----
@@ -393,59 +315,51 @@ def regrade_sensitivity(
             if src:
                 info_items_by_key[src] = item
 
-    for entry, cleared, eligible in gradable:
-        old_status = entry["status"]
-        ann = entry["annotation_data"]
-        bodies = ann["evaluated"]
+    for image, bodies, cleared, eligible in gradable:
+        old_status = image.status
 
-        for body_dict, was_cleared, is_eligible in zip(bodies, cleared, eligible):
-            score = float(body_dict.get("sharpness_score", 0.0))
+        for record, was_cleared, is_eligible in zip(bodies, cleared, eligible):
+            score = record.sharpness_score
             if not is_eligible:
-                body_dict["is_blurry"] = True
+                record.is_blurry = True
                 if was_cleared:
                     # Only the threshold pushed it out; say so explicitly.
-                    body_dict["rejection_reason"] = (
+                    record.rejection_reason = (
                         f"sharpness score {score:.4f} <= threshold {new_threshold:.2f}"
                     )
                 continue
 
             if not apply_jersey_filter:
-                body_dict["is_blurry"] = False
-                body_dict["rejection_reason"] = ""
+                record.is_blurry = False
+                record.rejection_reason = ""
                 continue
 
-            body = _body_from_entry(body_dict)
-            body.cloth_color = body_dict.get("cloth_color", "N/A")
-            body.cloth_color_detail = body_dict.get("cloth_color_detail") or {}
+            body = record.to_body()
             classify_body_jersey(
                 body, forced_colors, regular_colors, forced_labs, allowed_labs,
                 team_target_lab, team_bucket, our_color, app_config,
-                log_prefix=Path(entry.get("file", "")).name,
+                log_prefix=Path(image.source_file).name,
             )
-            body_dict["is_blurry"] = not body.passed
-            body_dict["rejection_reason"] = body.rejection_reason
+            record.passed = body.passed
+            record.rejection_reason = body.rejection_reason
 
-        new_overall_blurry = all(b.get("is_blurry", True) for b in bodies)
+        new_overall_blurry = all(b.is_blurry for b in bodies)
         new_status = "blurry" if new_overall_blurry else "sharp"
 
-        passing_scores = [
-            float(b.get("sharpness_score", 0.0)) for b in bodies if not b.get("is_blurry", True)
-        ]
+        passing_scores = [b.sharpness_score for b in bodies if not b.is_blurry]
         best_score = max(passing_scores) if passing_scores else max(
-            (float(b.get("sharpness_score", 0.0)) for b in bodies), default=0.0
+            (b.sharpness_score for b in bodies), default=0.0
         )
-        entry["sharpness_score"] = round(best_score, 4)
-        entry["sharpness_grade"] = round(best_score * 100, 1)
-        ann["overall_blurry"] = new_overall_blurry
-        entry["status"] = new_status
+        image.set_sharpness_score(best_score)
+        image.overall_blurry = new_overall_blurry
+        image.status = new_status
 
         if new_status != old_status:
             if new_status == "sharp":
                 summary.recovered += 1
             else:
                 summary.demoted += 1
-            key = entry_key(entry)
-            item = info_items_by_key.get(key)
+            item = info_items_by_key.get(image.key)
             if item is not None:
                 old_list = info.get(_REVIEW_INFO_KEY[old_status], [])
                 if item in old_list:
@@ -456,17 +370,17 @@ def regrade_sensitivity(
             # rating that no longer reflects it (LLM culling rated it under
             # the old verdict). Reset to the baseline unless the user rated
             # it by hand -- see culling_app.py's "stars_manual" marker.
-            if not entry.get("stars_manual"):
-                entry["stars"] = baseline_stars(entry, new_status, new_threshold)
-                entry["keep"] = entry["stars"] >= 3
+            if image.apply_auto_rating(
+                baseline_stars(image.sharpness_score, new_status, new_threshold)
+            ):
                 summary.stars_rebaselined += 1
 
-            if _regenerate_preview(entry, bodies, album):
+            if _regenerate_preview(image, album):
                 summary.previews_regenerated += 1
             else:
                 summary.previews_regen_failed += 1
                 log.warning("[regrade] verdict changed but preview could not be regenerated (source unreadable): %s",
-                            entry.get("file"))
+                            image.source_file)
 
     # The team colour (polled or pinned) can move, so persist it alongside
     # the verdicts it just produced.

@@ -44,7 +44,7 @@ except ImportError:  # optional — star-rating metadata is skipped without it
     piexif = None
     _PIEXIF_AVAILABLE = False
 
-from algo.album import Album
+from algo.album import Album, AlbumImage
 
 log = logging.getLogger("apply_export")
 
@@ -100,7 +100,7 @@ def _setup_logging() -> None:
     log.addHandler(handler)
 
 
-def _kept_image_basenames(info: dict, results_by_name: dict[str, dict], min_stars: int = 3) -> set[str]:
+def _kept_image_basenames(info: dict, images_by_key: dict[str, AlbumImage], min_stars: int = 3) -> set[str]:
     """Basenames of every image at or above *min_stars* — the explicit "stars"
     value written by the Review page's Apply step if present, else the
     per-category default. Matches culling_app.py's _kept_image_basenames()."""
@@ -111,10 +111,9 @@ def _kept_image_basenames(info: dict, results_by_name: dict[str, dict], min_star
             src_name = item.get("src")
             if not src_name:
                 continue
-            result = results_by_name.get(src_name)
-            stars = result.get("stars") if result else None
-            stars = int(stars) if stars is not None else default_stars
-            if stars >= min_stars:
+            image = images_by_key.get(src_name)
+            stars = image.stars if image else None
+            if (stars if stars is not None else default_stars) >= min_stars:
                 kept.add(src_name)
     return kept
 
@@ -160,7 +159,7 @@ def _export_photos(info: dict, kept: set[str], dest_dir: Path, source_index: dic
     return copied
 
 
-def _write_star_ratings(dest_dir: Path, kept: set[str], results_by_name: dict[str, dict]) -> int:
+def _write_star_ratings(dest_dir: Path, kept: set[str], images_by_key: dict[str, AlbumImage]) -> int:
     """Embed each kept photo's culling "stars" rating (assigned by
     algo/stages/llm_culling.py's ``_assign_star_ratings``) into the exported
     copy's EXIF metadata, as the standard Windows/Adobe "Rating" (0-5) and
@@ -179,8 +178,8 @@ def _write_star_ratings(dest_dir: Path, kept: set[str], results_by_name: dict[st
 
     tagged = 0
     for name in sorted(kept):
-        result = results_by_name.get(name)
-        stars = result.get("stars") if result else None
+        image = images_by_key.get(name)
+        stars = image.stars if image else None
         if not stars:
             continue
         dest_file = dest_dir / name
@@ -278,14 +277,14 @@ def main() -> None:
     with open(info_path, encoding="utf-8") as fh:
         info = json.load(fh)
 
-    results_by_name = album.entries
-    kept = _kept_image_basenames(info, results_by_name, args.min_stars)
+    images_by_key = album.images
+    kept = _kept_image_basenames(info, images_by_key, args.min_stars)
     source_index = album.source_index
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     _export_photos(info, kept, dest_dir, source_index)
-    _write_star_ratings(dest_dir, kept, results_by_name)
+    _write_star_ratings(dest_dir, kept, images_by_key)
 
     rows = _collect_player_rows(album_dir, kept) if args.export_face_tagging else []
     csv_path = _write_players_csv(dest_dir, rows)
