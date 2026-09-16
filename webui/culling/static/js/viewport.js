@@ -161,35 +161,57 @@ const Viewport = (function () {
   // zoom to actual). Clicking anywhere outside the image, the close button,
   // or any other key (including Esc) closes the window immediately.
   //
-  // `opts.originalPath` / `opts.aiEditKey` (both optional, faces.js is
-  // the only caller that passes them) add a toolbar below the image: a
-  // readonly path box plus an "AI edit" button (see static/js/ai-edit.js).
-  // Clicks/keystrokes inside that toolbar are excluded from the "anything
-  // closes this window" behavior below, so the path can actually be
-  // selected/copied and the button clicked without the window vanishing
-  // first.
-  function showImageWindow(imageUrl, opts) {
-    opts = opts || {};
+  // `images` is an array of `{url, originalPath, aiEditKey}` (the latter two
+  // optional; faces.js is the only caller and always passes them). `index`
+  // is which one to show first. When there's more than one image, Prev/Next
+  // buttons + a counter let the caller's whole group be paged through
+  // in-place instead of closing/reopening the window per image — arrow keys
+  // work too. Clicks/keystrokes inside the toolbar (path box / AI edit
+  // button / nav buttons) are excluded from the "anything closes this
+  // window" behavior below, so the path can be selected/copied and the
+  // buttons clicked without the window vanishing first.
+  function showImageWindow(images, index) {
+    images = images || [];
+    let current = Math.max(0, Math.min(images.length - 1, index || 0));
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
 
     const $viewport = $("<div>", { class: "image-window-viewport" });
-    const $img = $("<img>", { src: imageUrl, alt: "" });
+    const $img = $("<img>", { src: (images[current] || {}).url || "", alt: "" });
     $viewport.append($img);
     const $closeBtn = $("<button>", { type: "button", class: "image-window-close", "aria-label": "Close" }).html("&times;");
     const $backdrop = $("<div>", { class: "image-window-backdrop" }).append($viewport, $closeBtn);
-    if (opts.originalPath) {
-      const $toolbar = $("<div>", { class: "image-window-toolbar" });
+
+    const hasToolbar = images.some((it) => it.originalPath || it.aiEditKey);
+    let $toolbar = null;
+    let $pathInput = null;
+    let currentAiEditKey = null;
+    if (hasToolbar) {
+      $toolbar = $("<div>", { class: "image-window-toolbar" });
+      $pathInput = $("<input>", { type: "text", class: "image-window-path", readonly: true });
+      $toolbar.append($pathInput);
       $toolbar.append(
-        $("<input>", { type: "text", class: "image-window-path", readonly: true }).val(opts.originalPath)
+        $("<button>", { type: "button", class: "btn btn-sm" }).text("AI edit")
+          .on("click", () => { if (currentAiEditKey) AiEdit.run(currentAiEditKey); })
       );
-      if (opts.aiEditKey) {
-        $toolbar.append(
-          $("<button>", { type: "button", class: "btn btn-sm" }).text("AI edit")
-            .on("click", () => AiEdit.run(opts.aiEditKey))
-        );
-      }
       $backdrop.append($toolbar);
     }
+
+    let $prevBtn = null;
+    let $nextBtn = null;
+    let $counter = null;
+    if (images.length > 1) {
+      $prevBtn = $("<button>", { type: "button", class: "image-window-nav-prev", "aria-label": "Previous photo" }).html("&lsaquo;");
+      $nextBtn = $("<button>", { type: "button", class: "image-window-nav-next", "aria-label": "Next photo" }).html("&rsaquo;");
+      // Keep focus off the nav buttons so a stray Enter/Space after a click
+      // doesn't re-trigger them via the generic keydown-closes handler.
+      $prevBtn.add($nextBtn).on("mousedown", (e) => e.preventDefault());
+      $prevBtn.on("click", () => goTo(current - 1));
+      $nextBtn.on("click", () => goTo(current + 1));
+      $viewport.append($prevBtn, $nextBtn);
+      $counter = $("<span>", { class: "image-window-nav-counter" });
+      ($toolbar || $backdrop).append($counter);
+    }
+
     $("body").append($backdrop).addClass("image-window-open");
 
     function imgs() {
@@ -200,8 +222,48 @@ const Viewport = (function () {
       const box = computeContainFit($img[0].naturalWidth, $img[0].naturalHeight, window.innerWidth * 0.9, window.innerHeight * 0.9);
       if (box) $viewport.css({ width: box.width + "px", height: box.height + "px" });
     }
+
+    function updateToolbar() {
+      const item = images[current] || {};
+      if ($pathInput) $pathInput.val(item.originalPath || "");
+      currentAiEditKey = item.aiEditKey || null;
+    }
+
+    function updateNavUI() {
+      if (!$counter) return;
+      $counter.text(`${current + 1} / ${images.length}`);
+      $prevBtn.prop("disabled", current === 0);
+      $nextBtn.prop("disabled", current === images.length - 1);
+    }
+
+    // Clamped, no wrap-around. Preserves the current zoom/pan across
+    // navigation when the new image is the same size as the old one (the
+    // common case — same camera, same burst) since the transform is still
+    // valid for it; resets to fit only when the size actually changes.
+    // Neighbours are prefetched since /api/original serves full-resolution
+    // files.
+    function goTo(newIndex) {
+      newIndex = Math.max(0, Math.min(images.length - 1, newIndex));
+      if (newIndex === current) return;
+      const priorW = $img[0].naturalWidth;
+      const priorH = $img[0].naturalHeight;
+      current = newIndex;
+      $img.off("load").one("load", function () {
+        lock();
+        if (this.naturalWidth !== priorW || this.naturalHeight !== priorH) zoomCtl.resetToFit(imgs());
+      });
+      $img.attr("src", images[current].url);
+      updateToolbar();
+      updateNavUI();
+      [current - 1, current + 1].forEach((i) => {
+        if (images[i]) new Image().src = images[i].url;
+      });
+    }
+
+    updateToolbar();
+    updateNavUI();
     if ($img[0].complete) lock();
-    else $img.on("load", lock);
+    else $img.one("load", lock);
     $(window).on("resize.imageWindow", lock);
 
     // Drag-to-pan while zoomed in. `dragging` tracks whether a drag started
@@ -245,10 +307,11 @@ const Viewport = (function () {
     });
     $closeBtn.on("click", close);
 
-    // Any keydown closes the window, except '1' which zooms to actual size
-    // (matching the shared viewport hotkey) — captured ahead of any other
-    // page-level keydown handler (e.g. the cluster page's Delete-key
-    // handler) so it never also fires while the window is open.
+    // Any keydown closes the window, except '1' (zoom to actual, matching
+    // the shared viewport hotkey) and Left/A / Right/D (navigate, when
+    // there's a group) — captured ahead of any other page-level keydown
+    // handler (e.g. the cluster page's Delete-key handler) so it never also
+    // fires while the window is open.
     function onKeydown(e) {
       // Let normal typing/selection (e.g. Ctrl+A/Ctrl+C on the readonly path
       // box) work while focus is in the toolbar, instead of closing the
@@ -258,6 +321,17 @@ const Viewport = (function () {
       if (e.key === "1") {
         zoomCtl.zoomToActual(imgs(), $img[0]);
         return;
+      }
+      const key = e.key.toLowerCase();
+      if (images.length > 1) {
+        if (key === "arrowleft" || key === "a") {
+          goTo(current - 1);
+          return;
+        }
+        if (key === "arrowright" || key === "d") {
+          goTo(current + 1);
+          return;
+        }
       }
       e.preventDefault();
       close();
@@ -274,6 +348,7 @@ const Viewport = (function () {
 
     return { close };
   }
+
 
   // A modal "compare" window: two labelled viewports side by side sharing a
   // SINGLE zoom controller, so zooming/panning either pane moves both in

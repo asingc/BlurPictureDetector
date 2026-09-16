@@ -1070,6 +1070,33 @@ body.image-window-open { overflow: hidden; }
 }
 .image-window-viewport img.zoomed { cursor: grab; }
 .image-window-viewport img.zoomed:active { cursor: grabbing; }
+.image-window-nav-prev, .image-window-nav-next {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-size: 24px;
+  line-height: 38px;
+  text-align: center;
+  cursor: pointer;
+  z-index: 2;
+}
+.image-window-nav-prev:hover, .image-window-nav-next:hover { background: rgba(255, 255, 255, 0.3); }
+.image-window-nav-prev:disabled, .image-window-nav-next:disabled { opacity: 0.25; cursor: default; }
+.image-window-nav-prev:disabled:hover, .image-window-nav-next:disabled:hover { background: rgba(255, 255, 255, 0.15); }
+.image-window-nav-prev { left: 12px; }
+.image-window-nav-next { right: 12px; }
+.image-window-nav-counter {
+  font-size: 12px;
+  color: #fff;
+  opacity: 0.75;
+  margin-left: auto;
+}
 .image-window-close {
   position: fixed;
   top: 18px;

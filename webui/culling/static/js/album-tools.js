@@ -344,6 +344,52 @@ let jerseyColorOptions = [];
 let selectedJerseyColor = "";
 let jerseyColorControlsDisabled = false;
 
+let jerseyColorPollTimer = null;
+let jerseyColorPollSince = 0;
+
+// Non-closable modal streaming this operation's output (mirrors deep
+// regrade) — auto-dismisses on success, stays open with [x] enabled if it
+// fails so the user can read the error.
+function initJerseyColorDialog() {
+  $("#jerseyColorDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 720,
+  });
+}
+
+function openJerseyColorDialog() {
+  const $dialog = $("#jerseyColorDialog");
+  $("#jerseyColorOutput").val("");
+  $dialog.dialog("option", "title", "Applying jersey colour…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function appendJerseyColorLines(lines) {
+  if (!lines || !lines.length) return;
+  const box = document.getElementById("jerseyColorOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function closeJerseyColorDialog() {
+  $("#jerseyColorDialog").dialog("close");
+}
+
+function failJerseyColorDialog(message) {
+  appendJerseyColorLines([message]);
+  const $dialog = $("#jerseyColorDialog");
+  $dialog.dialog("option", "title", "Jersey colour apply failed");
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+}
+
 function renderJerseyColorChips() {
   const $container = $("#jerseyColorPicker").empty();
   const makeChip = (label, value) => {
@@ -378,30 +424,37 @@ async function loadJerseyOptions() {
   }
 }
 
-// Number of images that will be exported at the currently-selected minimum
-// star rating, computed client-side from the star breakdown already loaded
-// by loadSummary() — no extra round-trip needed when the selector changes.
-async function pollJerseyLlmRerun() {
+async function pollJerseyLlmRerunOutput() {
   let data;
   try {
-    data = await apiGet("/api/processing-output?since=0");
+    data = await apiGet(`/api/processing-output?since=${jerseyColorPollSince}`);
   } catch (err) {
-    setTimeout(pollJerseyLlmRerun, 500);
-    return;
+    return; // transient — try again on the next tick
   }
-  if (data.running) {
-    setTimeout(pollJerseyLlmRerun, 500);
-    return;
-  }
-  $("#jerseyColorStatus").text(
-    data.returnCode === 0 ? "Team colour applied; LLM re-cull complete." : `LLM re-cull exited with code ${data.returnCode}.`
-  );
+  appendJerseyColorLines(data.lines);
+  jerseyColorPollSince = data.next;
+  if (data.running) return;
+
+  clearInterval(jerseyColorPollTimer);
+  jerseyColorPollTimer = null;
   $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
   jerseyColorControlsDisabled = false;
   renderJerseyColorChips();
   setRegradeUIEnabled(true);
+  if (data.returnCode === 0) {
+    $("#jerseyColorStatus").text("Team colour applied; LLM re-cull complete.");
+    closeJerseyColorDialog();
+  } else {
+    const msg = `LLM re-cull exited with code ${data.returnCode}.`;
+    $("#jerseyColorStatus").text(msg);
+    failJerseyColorDialog(msg);
+  }
   loadSummary();
 }
+
+// Number of images that will be exported at the currently-selected minimum
+// star rating, computed client-side from the star breakdown already loaded
+// by loadSummary() — no extra round-trip needed when the selector changes.
 
 function updateExportCount() {
   const minStars = parseInt($("#minStarsInput").val(), 10) || 3;
@@ -535,6 +588,7 @@ $(function () {
   initImportMoreDialog();
   initRerunFacerecoDialog();
   initDeepRegradeDialog();
+  initJerseyColorDialog();
   initBurstVideoDialog();
   refreshBurstSummary();
 
@@ -636,25 +690,32 @@ $(function () {
     renderJerseyColorChips();
     setRegradeUIEnabled(false);
     $("#jerseyColorStatus").text("Applying…");
+    openJerseyColorDialog();
+    appendJerseyColorLines(["Applying jersey colour…"]);
     try {
       const res = await apiPost("/api/album-tools/jersey-color", { teamColor, rerunLlmCulling });
       const parts = [];
       if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
       if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
       if (res.starsRebaselined) parts.push(`${res.starsRebaselined} star rating(s) reset`);
-      $("#jerseyColorStatus").text(
+      const summary =
         `Team colour: ${res.teamColor || "none detected"} (${res.pinned ? "pinned" : "auto"})` +
-        (parts.length ? ` — ${parts.join(", ")}.` : " — no changes.")
-      );
+        (parts.length ? ` — ${parts.join(", ")}.` : " — no changes.");
+      $("#jerseyColorStatus").text(summary);
+      appendJerseyColorLines([summary]);
       await loadSummary();
       await loadJerseyOptions();
       if (res.llmRerunStarted) {
         $("#jerseyColorStatus").append(" LLM re-cull running…");
-        pollJerseyLlmRerun();
-        return; // buttons stay disabled until the background job finishes
+        appendJerseyColorLines(["Re-running LLM burst ranking…"]);
+        jerseyColorPollSince = 0;
+        jerseyColorPollTimer = setInterval(pollJerseyLlmRerunOutput, 500);
+        return; // dialog + buttons stay until the background job finishes
       }
+      closeJerseyColorDialog();
     } catch (err) {
       $("#jerseyColorStatus").text("Failed: " + err.message);
+      failJerseyColorDialog("Error: " + err.message);
     }
     $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
     jerseyColorControlsDisabled = false;

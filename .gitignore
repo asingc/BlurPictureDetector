@@ -42,6 +42,10 @@ test[0-9]*/
 /team.json
 /.culling_state.json
 
+# Ad-hoc change-plan docs (naming convention: /.[yyyyMMdd]-[task].md) —
+# scratch planning docs reviewed before implementation, not project docs.
+/.[0-9]*.md
+
 # InitPhotoProcessing.bat run directly from the repo root (install_root
 # defaults to CWD) - local conda env / downloaded app copy / scratch files,
 # never committed. Same-named folders under test*/ are already covered by

@@ -273,15 +273,28 @@ function renderThumb(cluster, face) {
   });
 
   const thumbUrl = "/api/faces/thumb/" + encodeURIComponent(cluster.id) + "/" + encodeURIComponent(face.crop);
-  const originalUrl = "/api/original/" + encodeURIComponent(face.origFilename);
 
   const img = $("<img>").attr("data-src", thumbUrl).attr("title", face.origFilename)
     .on("click", (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return; // handled by the card-level handler below
-      Viewport.showImageWindow(originalUrl, {
-        originalPath: face.originalPath || face.origFilename,
-        aiEditKey: face.origFilename,
+      // Built lazily (not per-thumbnail) since a cluster can have hundreds
+      // of faces but this only matters once a lightbox is actually opened.
+      // Deduped by origFilename: a cluster can have MULTIPLE FACES on the
+      // SAME photo, and the gallery should page through distinct photos.
+      const seen = new Set();
+      const images = [];
+      let startIndex = 0;
+      cluster.faces.forEach((f) => {
+        if (seen.has(f.origFilename)) return;
+        seen.add(f.origFilename);
+        if (f.origFilename === face.origFilename) startIndex = images.length;
+        images.push({
+          url: "/api/original/" + encodeURIComponent(f.origFilename),
+          originalPath: f.originalPath || f.origFilename,
+          aiEditKey: f.origFilename,
+        });
       });
+      Viewport.showImageWindow(images, startIndex);
     });
   thumbLazyLoadObserver.observe(img[0]);
 
