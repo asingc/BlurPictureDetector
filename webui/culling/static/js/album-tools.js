@@ -23,6 +23,12 @@ let burstVideoPollTimer = null;
 let burstVideoPollSince = 0;
 let burstVideoRunning = false;
 
+let faceTaggingCsvPollTimer = null;
+let faceTaggingCsvPollSince = 0;
+
+let playerVideoPollTimer = null;
+let playerVideoPollSince = 0;
+
 function setExportUIEnabled(enabled) {
   $("#exportFaceTaggingInput, #minStarsInput, #exportBtn").prop("disabled", !enabled);
   // Importing more images, re-running face detection, and exporting all
@@ -581,6 +587,144 @@ async function pollBurstVideoStatus() {
   refreshBurstSummary();
 }
 
+// ------------------------------------------------------------------ //
+// Export all face tagging to CSV — write a CSV of every tagged face
+// (regardless of star rating/export status) to a user-chosen destination
+// folder via /api/album-tools/face-tagging-csv/*. Same background-job/poll
+// /modal pattern as the export & burst-video dialogs above.
+// ------------------------------------------------------------------ //
+function initFaceTaggingCsvDialog() {
+  $("#faceTaggingCsvDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openFaceTaggingCsvDialog() {
+  const $dialog = $("#faceTaggingCsvDialog");
+  $dialog.dialog("option", "title", "Exporting…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function finishFaceTaggingCsvDialog(success) {
+  const $dialog = $("#faceTaggingCsvDialog");
+  $dialog.dialog("option", "title", success ? "Export complete" : "Export failed");
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+}
+
+function appendFaceTaggingCsvLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("faceTaggingCsvOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function pollFaceTaggingCsvStatus() {
+  let data;
+  try {
+    data = await apiGet(`/api/album-tools/face-tagging-csv/status?since=${faceTaggingCsvPollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendFaceTaggingCsvLines(data.lines);
+  faceTaggingCsvPollSince = data.next;
+  if (data.running) return;
+
+  clearInterval(faceTaggingCsvPollTimer);
+  faceTaggingCsvPollTimer = null;
+  $("#faceTaggingCsvBtn").prop("disabled", false);
+  const success = !data.error;
+  finishFaceTaggingCsvDialog(success);
+  if (success) {
+    $("#faceTaggingCsvStatus").text(data.result ? `Wrote ${data.result.rows} row(s) to ${data.result.csvPath}` : "Done.");
+    $("#openFaceTaggingCsvFolderBtn").show();
+  } else {
+    $("#faceTaggingCsvStatus").text("Failed: " + data.error);
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Per-player highlight videos — one MP4 per tagged player via
+// /api/album-tools/player-video/*. Same background-job/poll/modal pattern
+// as the burst-video dialog above.
+// ------------------------------------------------------------------ //
+function initPlayerVideoDialog() {
+  $("#playerVideoDialog").dialog({
+    autoOpen: false,
+    modal: true,
+    closeOnEscape: false,
+    draggable: false,
+    resizable: false,
+    width: 640,
+  });
+}
+
+function openPlayerVideoDialog() {
+  const $dialog = $("#playerVideoDialog");
+  $dialog.dialog("option", "title", "Rendering player videos…");
+  $dialog.dialog("option", "closeOnEscape", false);
+  $dialog.dialog("open");
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+}
+
+function finishPlayerVideoDialog(success) {
+  const $dialog = $("#playerVideoDialog");
+  $dialog.dialog("option", "title", success ? "Rendering complete" : "Rendering failed");
+  $dialog.dialog("option", "closeOnEscape", true);
+  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+}
+
+function appendPlayerVideoLines(lines) {
+  if (!lines.length) return;
+  const box = document.getElementById("playerVideoOutput");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.value += (box.value ? "\n" : "") + lines.join("\n");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function refreshPlayerVideoSummary() {
+  try {
+    const data = await apiGet("/api/album-tools/player-video/summary");
+    const ffmpegNote = data.ffmpegAvailable ? "" : " (ffmpeg not found \u2014 using fallback encoder)";
+    $("#playerVideoSummaryLabel").text(`${data.playersFound} player(s), ${data.totalPhotos} tagged photo(s)${ffmpegNote}`);
+  } catch (err) {
+    $("#playerVideoSummaryLabel").text("");
+  }
+}
+
+async function pollPlayerVideoStatus() {
+  let data;
+  try {
+    data = await apiGet(`/api/album-tools/player-video/status?since=${playerVideoPollSince}`);
+  } catch (err) {
+    return; // transient — try again on the next tick
+  }
+  appendPlayerVideoLines(data.lines);
+  playerVideoPollSince = data.next;
+  if (data.running) return;
+
+  clearInterval(playerVideoPollTimer);
+  playerVideoPollTimer = null;
+  $("#renderPlayerVideosBtn").prop("disabled", false);
+  const success = !data.error;
+  finishPlayerVideoDialog(success);
+  if (success) {
+    $("#playerVideoStatus").text(data.result ? `Rendered ${data.result.rendered} video(s).` : "Done.");
+    $("#openPlayerVideoFolderBtn").show();
+  } else {
+    $("#playerVideoStatus").text("Failed: " + data.error);
+  }
+  refreshPlayerVideoSummary();
+}
+
 $(function () {
   loadSummary();
   loadJerseyOptions();
@@ -590,7 +734,10 @@ $(function () {
   initDeepRegradeDialog();
   initJerseyColorDialog();
   initBurstVideoDialog();
+  initFaceTaggingCsvDialog();
+  initPlayerVideoDialog();
   refreshBurstSummary();
+  refreshPlayerVideoSummary();
 
   $("#minStarsInput").on("change", updateExportCount);
 
@@ -808,6 +955,90 @@ $(function () {
       $("#exportDialogStatus").text("Failed: " + err.message);
       finishExportDialog(false);
       setExportUIEnabled(true);
+    }
+  });
+
+  $("#faceTaggingCsvBtn").on("click", async () => {
+    $("#faceTaggingCsvBtn").prop("disabled", true);
+    $("#faceTaggingCsvStatus").text("Choose a destination folder…");
+    $("#openFaceTaggingCsvFolderBtn").hide();
+    let res;
+    try {
+      res = await apiPost("/api/browse-folder", { title: "Select folder for face-tagging CSV", context: "export" });
+    } catch (err) {
+      $("#faceTaggingCsvStatus").text("Browse failed: " + err.message);
+      $("#faceTaggingCsvBtn").prop("disabled", false);
+      return;
+    }
+    if (!res.path) {
+      // User canceled the folder picker — quietly return to the idle state.
+      $("#faceTaggingCsvStatus").text("");
+      $("#faceTaggingCsvBtn").prop("disabled", false);
+      return;
+    }
+
+    $("#faceTaggingCsvStatus").text("");
+    $("#faceTaggingCsvDialogStatus").text("Starting export…");
+    $("#faceTaggingCsvOutput").val("");
+    faceTaggingCsvPollSince = 0;
+    openFaceTaggingCsvDialog();
+    try {
+      await apiPost("/api/album-tools/face-tagging-csv/render", { destination: res.path });
+      faceTaggingCsvPollTimer = setInterval(pollFaceTaggingCsvStatus, 500);
+    } catch (err) {
+      $("#faceTaggingCsvDialogStatus").text("Failed: " + err.message);
+      finishFaceTaggingCsvDialog(false);
+      $("#faceTaggingCsvBtn").prop("disabled", false);
+    }
+  });
+
+  $("#openFaceTaggingCsvFolderBtn").on("click", async () => {
+    try {
+      await apiPost("/api/album-tools/face-tagging-csv/open-folder", {});
+    } catch (err) {
+      $("#faceTaggingCsvStatus").text("Could not open folder: " + err.message);
+    }
+  });
+
+  $("#renderPlayerVideosBtn").on("click", async () => {
+    $("#renderPlayerVideosBtn").prop("disabled", true);
+    $("#playerVideoStatus").text("Choose a destination folder…");
+    $("#openPlayerVideoFolderBtn").hide();
+    let res;
+    try {
+      res = await apiPost("/api/browse-folder", { title: "Select folder for player highlight videos", context: "export" });
+    } catch (err) {
+      $("#playerVideoStatus").text("Browse failed: " + err.message);
+      $("#renderPlayerVideosBtn").prop("disabled", false);
+      return;
+    }
+    if (!res.path) {
+      // User canceled the folder picker — quietly return to the idle state.
+      $("#playerVideoStatus").text("");
+      $("#renderPlayerVideosBtn").prop("disabled", false);
+      return;
+    }
+
+    const fps = parseFloat($("#playerVideoFpsInput").val()) || 1;
+    $("#playerVideoStatus").text("");
+    $("#playerVideoOutput").val("");
+    playerVideoPollSince = 0;
+    openPlayerVideoDialog();
+    try {
+      await apiPost("/api/album-tools/player-video/render", { destination: res.path, fps });
+      playerVideoPollTimer = setInterval(pollPlayerVideoStatus, 500);
+    } catch (err) {
+      $("#playerVideoStatus").text("Failed to start: " + err.message);
+      $("#renderPlayerVideosBtn").prop("disabled", false);
+      $("#playerVideoDialog").dialog("close");
+    }
+  });
+
+  $("#openPlayerVideoFolderBtn").on("click", async () => {
+    try {
+      await apiPost("/api/album-tools/player-video/open-folder", {});
+    } catch (err) {
+      $("#playerVideoStatus").text("Could not open folder: " + err.message);
     }
   });
 });

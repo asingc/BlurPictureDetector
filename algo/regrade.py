@@ -280,9 +280,9 @@ def regrade_sensitivity(
                 log.warning("[regrade] cannot re-read source photo for jersey colour: %s", file_path)
                 continue
             for record in needs_color:
-                record.cloth_color, record.cloth_color_detail = cloth_color_predictor.predict(
-                    record.to_body(), decoded
-                )
+                body = record.to_body()
+                body.set_normalized_crop(cloth_color_predictor.torso_crop(body, decoded))
+                record.cloth_color, record.cloth_color_detail = cloth_color_predictor.predict(body)
                 summary.jersey_rechecked += 1
 
     # ---- Pass 2: re-poll the team's jersey colour from those candidates ----

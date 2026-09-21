@@ -25,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -53,7 +54,7 @@ from algo.regrade import regrade_sensitivity
 from algo.album import EDITEDIMAGES_SUBDIR, album_for
 from algo.album_info import CATEGORIES as CULLING_CATEGORIES
 from algo.album_info import AlbumInfo
-from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, summarize_bursts
+from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, render_player_videos, summarize_bursts
 
 try:
     from PIL import Image as _PILImage
@@ -159,6 +160,15 @@ class ExportRequest(BaseModel):
 class BurstVideoRenderRequest(BaseModel):
     minFrames: int = DEFAULT_MIN_FRAMES
     mode: str = "fps"      # "fps" | "timestamp"
+    fps: float = DEFAULT_FPS
+
+
+class FaceTaggingCsvRequest(BaseModel):
+    destination: str
+
+
+class PlayerVideoRenderRequest(BaseModel):
+    destination: str
     fps: float = DEFAULT_FPS
 
 
@@ -342,6 +352,45 @@ class BurstVideoState:
 
 
 burst_video_state = BurstVideoState()
+
+
+# --------------------------------------------------------------------------- #
+# Export all face tagging to CSV / per-player highlight MP4s (page 5 — Album
+# Tools). Same buffered-lines-for-polling background-job pattern as
+# BurstVideoState — both write to a user-chosen destination folder.
+# --------------------------------------------------------------------------- #
+class FaceTaggingCsvState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.running = False
+        self.done = False
+        self.error: Optional[str] = None
+        self.lines: list[str] = []
+        self.result: Optional[dict] = None
+        self.output_dir: Optional[str] = None
+
+
+face_tagging_csv_state = FaceTaggingCsvState()
+
+
+class PlayerVideoState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.running = False
+        self.done = False
+        self.error: Optional[str] = None
+        self.lines: list[str] = []
+        self.result: Optional[dict] = None
+        self.output_dir: Optional[str] = None
+
+
+player_video_state = PlayerVideoState()
 
 
 # --------------------------------------------------------------------------- #
@@ -1708,6 +1757,68 @@ def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
     return processed
 
 
+_FACE_TAGGING_CSV_HEADER = ["Player Name", "Player Number", "Image Path"]
+
+
+def _collect_all_face_tagging_rows(album_path: Path) -> list[list[str]]:
+    """One row per tagged face across the ENTIRE album, sourced from its own
+    .FaceReco database the same way as apply_export.py's players.csv rows —
+    but with no "kept"/star-rating filter, since this is the complete
+    face-tagging record rather than a photo-export side effect."""
+    rows: list[list[str]] = []
+    fr = _facereco_dir(album_path)
+    if fr is None:
+        return rows
+    for cluster_dir in sorted(fr.iterdir()):
+        if not cluster_dir.is_dir() or cluster_dir.name.startswith("."):
+            continue
+        if _is_pending_cluster(cluster_dir.name):
+            continue  # unnamed cluster -- nobody to tag
+        payload = _load_face_json(cluster_dir)
+        name = (payload.get("name") or "").strip()
+        if not name:
+            continue
+        playernum = payload.get("playernum")
+        number_str = "" if playernum is None else str(playernum)
+        for face in payload.get("faces", []):
+            rows.append([name, number_str, face.get("origFilename", "")])
+    rows.sort(key=lambda row: (row[0], row[2]))
+    return rows
+
+
+def _collect_player_frame_paths(album_path: Path) -> dict[str, list[Path]]:
+    """{player name: every distinct photo they're tagged in}, resolved to
+    on-disk paths via the Album (accepted-edit-or-original, same preference
+    as algo/burst_video.py's detect_bursts) — the source data for rendering
+    one highlight MP4 per player. Faces on clusters sharing the same name
+    (e.g. after a merge) are pooled and de-duplicated by resolved path."""
+    fr = _facereco_dir(album_path)
+    if fr is None:
+        return {}
+    album = album_for(album_path)
+    by_name: dict[str, dict[str, Path]] = {}
+    for cluster_dir in sorted(fr.iterdir()):
+        if not cluster_dir.is_dir() or cluster_dir.name.startswith("."):
+            continue
+        if _is_pending_cluster(cluster_dir.name):
+            continue  # unnamed cluster -- nobody to tag
+        payload = _load_face_json(cluster_dir)
+        name = (payload.get("name") or "").strip()
+        if not name:
+            continue
+        bucket = by_name.setdefault(name, {})
+        for face in payload.get("faces", []):
+            orig = face.get("origFilename", "")
+            if not orig:
+                continue
+            image = album.image(orig)
+            path = image.image_path if image else None
+            if path is None or not path.is_file():
+                continue
+            bucket[str(path)] = path
+    return {name: list(paths.values()) for name, paths in by_name.items()}
+
+
 def _open_in_file_explorer(path: Path) -> None:
     """Open *path* in the OS's native file explorer. Only meaningful when the
     server and browser run on the same machine (see api_browse_folder's
@@ -1793,6 +1904,58 @@ def _run_burst_video(album_path: Path, min_frames: int, mode: str, fps: float) -
     finally:
         with burst_video_state.lock:
             burst_video_state.running = False
+
+
+def _run_face_tagging_csv_export(album_path: Path, dest_dir: Path) -> None:
+    def _log_line(msg: str) -> None:
+        with face_tagging_csv_state.lock:
+            face_tagging_csv_state.lines.append(msg)
+        log.info("[FaceTaggingCSV] %s", msg)
+
+    try:
+        _log_line("Collecting tagged faces from .FaceReco...")
+        rows = _collect_all_face_tagging_rows(album_path)
+        _log_line(f"Found {len(rows)} tagged face row(s).")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = dest_dir / f"{album_path.name}_face_tagging.csv"
+        _log_line(f"Writing {csv_path}...")
+        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(_FACE_TAGGING_CSV_HEADER)
+            writer.writerows(rows)
+        _log_line("Done.")
+        with face_tagging_csv_state.lock:
+            face_tagging_csv_state.output_dir = str(dest_dir)
+            face_tagging_csv_state.result = {"rows": len(rows), "csvPath": str(csv_path)}
+            face_tagging_csv_state.done = True
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        log.exception("[FaceTaggingCSV] failed")
+        with face_tagging_csv_state.lock:
+            face_tagging_csv_state.error = str(exc)
+    finally:
+        with face_tagging_csv_state.lock:
+            face_tagging_csv_state.running = False
+
+
+def _run_player_video(album_path: Path, dest_dir: Path, fps: float) -> None:
+    def _on_line(line: str) -> None:
+        with player_video_state.lock:
+            player_video_state.lines.append(line)
+
+    try:
+        player_frames = _collect_player_frame_paths(album_path)
+        result = render_player_videos(player_frames, dest_dir, fps=fps, on_line=_on_line)
+        with player_video_state.lock:
+            player_video_state.output_dir = str(dest_dir)
+            player_video_state.result = result
+            player_video_state.done = True
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        log.exception("[PlayerVideo] failed")
+        with player_video_state.lock:
+            player_video_state.error = str(exc)
+    finally:
+        with player_video_state.lock:
+            player_video_state.running = False
 
 
 # --------------------------------------------------------------------------- #
@@ -2571,6 +2734,115 @@ def api_export_status(since: int = 0) -> dict:
             "processedPlayers": export_state.processed_players,
             "destDir": export_state.dest_dir,
         }
+
+
+@app.post("/api/album-tools/face-tagging-csv/render")
+def api_face_tagging_csv_render(req: FaceTaggingCsvRequest) -> dict:
+    """Write a CSV of every tagged face in the current album's .FaceReco
+    database to a user-chosen destination folder — unlike players.csv
+    (written only for kept/exported photos during a folder export), this
+    covers the complete face-tagging record regardless of star rating."""
+    album_path = _current_album_path()
+    destination = req.destination.strip()
+    if not destination:
+        raise HTTPException(status_code=400, detail="Destination folder is required.")
+    dest_path = Path(destination)
+    if dest_path.is_file():
+        raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
+
+    with face_tagging_csv_state.lock:
+        if face_tagging_csv_state.running:
+            raise HTTPException(status_code=409, detail="A face-tagging CSV export is already running.")
+        face_tagging_csv_state.reset()
+        face_tagging_csv_state.running = True
+
+    thread = threading.Thread(target=_run_face_tagging_csv_export, args=(album_path, dest_path), daemon=True)
+    thread.start()
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/face-tagging-csv/status")
+def api_face_tagging_csv_status(since: int = 0) -> dict:
+    with face_tagging_csv_state.lock:
+        new_lines = face_tagging_csv_state.lines[since:]
+        return {
+            "lines": new_lines,
+            "next": since + len(new_lines),
+            "running": face_tagging_csv_state.running,
+            "done": face_tagging_csv_state.done,
+            "error": face_tagging_csv_state.error,
+            "result": face_tagging_csv_state.result,
+        }
+
+
+@app.post("/api/album-tools/face-tagging-csv/open-folder")
+def api_face_tagging_csv_open_folder() -> dict:
+    with face_tagging_csv_state.lock:
+        output_dir = face_tagging_csv_state.output_dir
+    if not output_dir or not Path(output_dir).is_dir():
+        raise HTTPException(status_code=400, detail="No output folder yet — export at least once first.")
+    _open_in_file_explorer(Path(output_dir))
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/player-video/summary")
+def api_player_video_summary() -> dict:
+    album_path = _current_album_path()
+    player_frames = _collect_player_frame_paths(album_path)
+    return {
+        "playersFound": len(player_frames),
+        "totalPhotos": sum(len(v) for v in player_frames.values()),
+        "ffmpegAvailable": shutil.which("ffmpeg") is not None,
+    }
+
+
+@app.post("/api/album-tools/player-video/render")
+def api_player_video_render(req: PlayerVideoRenderRequest) -> dict:
+    album_path = _current_album_path()
+    destination = req.destination.strip()
+    if not destination:
+        raise HTTPException(status_code=400, detail="Destination folder is required.")
+    dest_path = Path(destination)
+    if dest_path.is_file():
+        raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
+
+    with player_video_state.lock:
+        if player_video_state.running:
+            raise HTTPException(status_code=409, detail="Player-video rendering is already running.")
+        player_video_state.reset()
+        player_video_state.running = True
+
+    thread = threading.Thread(
+        target=_run_player_video,
+        args=(album_path, dest_path, max(0.1, req.fps)),
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/player-video/status")
+def api_player_video_status(since: int = 0) -> dict:
+    with player_video_state.lock:
+        new_lines = player_video_state.lines[since:]
+        return {
+            "lines": new_lines,
+            "next": since + len(new_lines),
+            "running": player_video_state.running,
+            "done": player_video_state.done,
+            "error": player_video_state.error,
+            "result": player_video_state.result,
+        }
+
+
+@app.post("/api/album-tools/player-video/open-folder")
+def api_player_video_open_folder() -> dict:
+    with player_video_state.lock:
+        output_dir = player_video_state.output_dir
+    if not output_dir or not Path(output_dir).is_dir():
+        raise HTTPException(status_code=400, detail="No output folder yet — render at least once first.")
+    _open_in_file_explorer(Path(output_dir))
+    return {"ok": True}
 
 
 @app.post("/api/album-tools/open-destination")

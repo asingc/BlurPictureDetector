@@ -9,7 +9,7 @@ import numpy as np
 from algo.config import app_config
 from algo.models import Body, Box, Face
 from algo.sharpness import sharpness_evaluator
-from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, _narrow_face_box, clamp_long_edge
+from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, clamp_long_edge
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -25,14 +25,18 @@ class BodyArrayScorerBase(ABC):
 
     Parameters
     ----------
-    normalized_image : normalised BGR image used as context (e.g. for cropping).
-    bodies           : body objects as produced by the detection phase.
+    img_w, img_h : pixel size of the normalised frame the bodies were detected
+                   in, used to map their normalised (0-1) coordinates back to
+                   pixels.  The frame itself is not passed: scorers that need
+                   pixels read the cached crop off the Body/Face instead, so a
+                   whole album's images never have to be held in memory.
+    bodies       : body objects as produced by the detection phase.
 
     Returns the (possibly modified or filtered) body list.
     """
 
     @abstractmethod
-    def process(self, normalized_image: np.ndarray, bodies: list[Body]) -> list[Body]:
+    def process(self, img_w: int, img_h: int, bodies: list[Body]) -> list[Body]:
         ...
 
 
@@ -45,7 +49,7 @@ class BodyScorerBase(ABC):
     """
 
     @abstractmethod
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         ...
 
 
@@ -57,11 +61,11 @@ class MatchedFaceScorer(BodyScorerBase):
     """Rule 5 — body must have at least one matched face.
     Should run first: bodies with no face cannot be sharpness-scored."""
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         if not body.faces:
             body.passed = False
             body.rejection_reason = "no matched face"
-            bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(img_w, img_h)
             log.debug("[scorer:matched_face] body bbox=(%d,%d,%d,%d): no matched face → fail",
                       bx1, by1, bx2, by2)
         return body
@@ -76,10 +80,10 @@ class FaceSizeScorer(BodyScorerBase):
         self.min_fraction = min_fraction if min_fraction is not None \
                             else app_config.face_min_size_fraction
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         if self.min_fraction <= 0:
             return body
-        h, w   = normalized_image.shape[:2]
+        h, w   = img_h, img_w
         for face in body.faces:
             face_long = max(face.bbox.width, face.bbox.height)
             if face_long < self.min_fraction:
@@ -108,7 +112,7 @@ class BodyHeadKPVisibilityScorer(BodyScorerBase):
         self.conf_threshold = conf_threshold if conf_threshold is not None \
                               else app_config.face_kp_conf_threshold
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         if self.min_visible <= 0:
             return body
         for i in _HEAD_KP_INDICES:
@@ -122,7 +126,7 @@ class BodyHeadKPVisibilityScorer(BodyScorerBase):
         if n_vis < self.min_visible:
             body.passed = False
             body.rejection_reason = f"only {n_vis}/{len(_HEAD_KP_INDICES)} head keypoints visible (need {self.min_visible})"
-            bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(img_w, img_h)
             log.debug("[scorer:head_kp] body bbox=(%d,%d,%d,%d): %d/%d head KPs visible (need %d) → fail",
                       bx1, by1, bx2, by2,
                       n_vis, len(_HEAD_KP_INDICES), self.min_visible)
@@ -145,7 +149,7 @@ class FaceLandmarkVisibilityScorer(BodyScorerBase):
         self.conf_threshold = conf_threshold if conf_threshold is not None \
                               else app_config.face_coverage_conf_threshold
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         if self.min_visible <= 0:
             return body
         for face in body.faces:
@@ -157,7 +161,7 @@ class FaceLandmarkVisibilityScorer(BodyScorerBase):
             n_vis = face.n_visible()
             if n_vis < self.min_visible:
                 face.passed = False
-                fx1, fy1, fx2, fy2 = face.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
+                fx1, fy1, fx2, fy2 = face.bbox.as_px_ints(img_w, img_h)
                 log.debug("[scorer:face_landmark] face bbox=(%d,%d,%d,%d): %d/%d landmarks visible (need %d) → fail",
                           fx1, fy1, fx2, fy2,
                           n_vis, len(face.landmarks), self.min_visible)
@@ -175,9 +179,8 @@ class FaceSharpnessScorer(BodyScorerBase):
     def __init__(self, threshold: float) -> None:
         self.threshold = threshold
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
-        h, w        = normalized_image.shape[:2]
-        narrow_pad  = round(0.005 * max(h, w))
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
+        h, w        = img_h, img_w
         best_score  = 0.0
         best_face:   Face | None = None
         best_narrow: Box  | None = None
@@ -187,12 +190,11 @@ class FaceSharpnessScorer(BodyScorerBase):
         for face in body.faces:
             if not face.passed:
                 continue
-            narrow_box = _narrow_face_box(face, pad=narrow_pad, img_w=w, img_h=h) \
-                         if app_config.use_narrow_face_box else None
-            score_box  = narrow_box or face.bbox
-            fx1, fy1, fx2, fy2 = score_box.as_px_ints(w, h)
-            crop = normalized_image[fy1:fy2, fx1:fx2]
-            if crop.size == 0:
+            # Cropped during analysis from exactly this region, so the scoring
+            # input is unchanged from the pre-cache behaviour.
+            narrow_box = face.narrow_box if app_config.use_narrow_face_box else None
+            crop = face.get_normalized_crop()
+            if crop is None or crop.size == 0:
                 continue
             crop = clamp_long_edge(crop, app_config.face_crop_min_long_edge_px, app_config.face_crop_max_long_edge_px)
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -213,7 +215,7 @@ class FaceSharpnessScorer(BodyScorerBase):
         if best_score <= self.threshold:
             body.passed = False
             body.rejection_reason = f"sharpness score {best_score:.4f} <= threshold {self.threshold:.2f}"
-            bx1, by1, bx2, by2 = body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0])
+            bx1, by1, bx2, by2 = body.bbox.as_px_ints(w, h)
             log.debug("[scorer:sharpness] body bbox=(%d,%d,%d,%d): best_score=%.4f <= threshold=%.2f → fail",
                       bx1, by1, bx2, by2,
                       best_score, self.threshold)
@@ -230,7 +232,7 @@ class JerseyColorScorer(BodyScorerBase):
     def __init__(self, allowed_colors: frozenset[str]) -> None:
         self.allowed_colors = allowed_colors
 
-    def binary_classify(self, body: Body, normalized_image: np.ndarray) -> Body:
+    def binary_classify(self, body: Body, img_w: int, img_h: int) -> Body:
         if not self.allowed_colors:
             return body
         color = _color_from_label(body.cloth_color)
@@ -239,7 +241,7 @@ class JerseyColorScorer(BodyScorerBase):
             body.rejection_reason = f"jersey color '{color}' not in allowed set {sorted(self.allowed_colors)}"
             log.debug(
                 "[scorer:jersey_color] body bbox=(%d,%d,%d,%d): cloth_color=%s not in %s → fail",
-                    *body.bbox.as_px_ints(normalized_image.shape[1], normalized_image.shape[0]),
+                    *body.bbox.as_px_ints(img_w, img_h),
                 color, sorted(self.allowed_colors),
             )
         return body
@@ -248,8 +250,8 @@ class JerseyColorScorer(BodyScorerBase):
 class BodyArrayScorer(BodyArrayScorerBase):
     """Runs a sequence of BodyScorerBase scorers over every body in the list.
 
-    normalized_image is forwarded to every binary_classify call so scorers
-    that need to crop from it receive it directly.
+    normalized_image is no longer forwarded: scorers that need pixels read
+    their own cached crop off the Body/Face they are scoring.
 
     Short-circuits per body: once a body is marked passed=False no further
     scorers are called on it (avoids expensive work on already-failed bodies).
@@ -261,10 +263,10 @@ class BodyArrayScorer(BodyArrayScorerBase):
     def __init__(self, scorers: list[BodyScorerBase]) -> None:
         self._scorers = scorers
 
-    def process(self, normalized_image: np.ndarray, bodies: list[Body]) -> list[Body]:
+    def process(self, img_w: int, img_h: int, bodies: list[Body]) -> list[Body]:
         for body in bodies:
             for scorer in self._scorers:
-                body = scorer.binary_classify(body, normalized_image)
+                body = scorer.binary_classify(body, img_w, img_h)
                 if not body.passed:
                     break  # short-circuit: no point scoring a disqualified body
         return bodies

@@ -69,8 +69,8 @@ class ClothColorPredictor:
     _SKIN_LAB:         tuple[float, float, float] = (65.0, 18.0, 22.0)
     _SKIN_DIST_THRESH: float                      = 35.0
 
-    def predict(self, body: Body, normalized_image: np.ndarray) -> tuple[str, dict]:
-        torso = self._torso_crop(body, normalized_image)
+    def predict(self, body: Body) -> tuple[str, dict]:
+        torso = body.get_normalized_crop()
         if torso is None or torso.size == 0:
             return "N/A", {}
         sample = cv2.resize(torso, (24, 24), interpolation=cv2.INTER_AREA)
@@ -111,7 +111,9 @@ class ClothColorPredictor:
         votes_by_label = {colors[k].label: v for k, v in votes.items()}
         return winner.label, {"votes": votes_by_label, "mean_lab": mean_lab}
 
-    def _torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
+    def torso_crop(self, body: Body, image: np.ndarray) -> np.ndarray | None:
+        """Torso region used for colour prediction. Called during analysis to
+        fill the body's pixel cache, while *image* is still decoded."""
         h_img, w_img = image.shape[:2]
         kps = body.keypoints
         pts = [
@@ -177,23 +179,16 @@ class GradingStage(ProcessStage):
         total_bodies = 0
 
         for idx, frame in enumerate(frames, 1):
-            if frame.normalized_image is None:
-                continue
-
             try:
-                frame.bodies = scorer.process(frame.normalized_image, frame.bodies)
+                frame.bodies = scorer.process(frame.img_w, frame.img_h, frame.bodies)
 
                 for body in frame.bodies:
                     total_bodies += 1
                     if not body.passed:
                         continue
                     passed_bodies += 1
-                    body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(
-                        body, frame.normalized_image
-                    )
-                    bx1, by1, bx2, by2 = body.bbox.as_px_ints(
-                        frame.normalized_image.shape[1], frame.normalized_image.shape[0]
-                    )
+                    body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(body)
+                    bx1, by1, bx2, by2 = body.bbox.as_px_ints(frame.img_w, frame.img_h)
                     log.debug("[GradingStage] %s — body bbox=(%d,%d,%d,%d) score=%.4f cloth=%s",
                               frame.path.name, bx1, by1, bx2, by2,
                               body.sharpness_score, body.cloth_color)

@@ -51,7 +51,6 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
     bboxes, keypoints)."""
     serializable = []
     for frame in frames:
-        norm_img = frame.normalized_image
         auto_adj = frame.auto_adjustment
         auto_adj_entry = {"ev": auto_adj.ev} if auto_adj is not None else None
         key = frame.output_key or frame.path.name
@@ -78,7 +77,7 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
                 "auto_adjustment":    auto_adj_entry,
                 "preview_path":       f"previews/{frame.key_stem}.jpg",
                 "annotation_data": {
-                    "processing_shape": list(norm_img.shape[:2]) if norm_img is not None else [0, 0],
+                    "processing_shape": [frame.img_h, frame.img_w],
                     "overall_blurry":   overall_blurry,
                     "evaluated": [PersonRecord.from_body(body).wire for body in frame.bodies],
                 },

@@ -119,7 +119,16 @@ class FaceRecoStage(ProcessStage):
                 sensitivity_threshold=self.sensitivity_threshold,
             )
             pipeline = FaceRecoPipeline(provider=provider, config=facereco_config, cpu_only=self.cpu_only)
-            facereco_dir = pipeline.run(self.output_dir)
+            # Album entries are written in frame.bodies order (see
+            # results.py::build_result_entries), so (key, index) addresses the
+            # same body on both sides.
+            face_crop_lookup = {
+                (frame.output_key or frame.path.name, idx): body.best_face
+                for frame in frames
+                for idx, body in enumerate(frame.bodies)
+                if body.best_face is not None and body.best_face.cache_original_path
+            }
+            facereco_dir = pipeline.run(self.output_dir, face_crop_lookup or None)
             log.info("[FaceRecoStage] face recognition complete: %s", facereco_dir)
         except Exception as exc:
             log.error("[FaceRecoStage] face recognition failed: %s", exc, exc_info=True)

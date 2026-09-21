@@ -48,7 +48,8 @@ def test_entry_shape_and_key_order_are_unchanged():
     frame = Frame(
         path=Path("C:/photos/IMG_0001.jpg"),
         bodies=[_body()],
-        normalized_image=np.zeros((1080, 1920, 3), dtype=np.uint8),
+        img_w=1920,
+        img_h=1080,
         auto_adjustment=AutoAdjustment(ev=0.5),
         output_key="IMG_0001.jpg",
     )

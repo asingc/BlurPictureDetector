@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-import cv2
 import numpy as np
 
 from algo.config import AppConfig
@@ -11,14 +10,6 @@ from algo.models import AutoAdjustment, Body
 from algo.stage import ProcessStage
 
 log = logging.getLogger("BlurPictureDetector")
-
-
-def _mean_brightness(image: np.ndarray | None) -> float:
-    """Return mean gray-level brightness of *image*, normalised to [0, 1]."""
-    if image is None or image.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return float(np.mean(gray)) / 255.0
 
 
 def _main_body(frame: Frame) -> Body | None:
@@ -39,17 +30,17 @@ def compute_auto_adjustment(frame: Frame, config: AppConfig) -> AutoAdjustment:
     the subject alone, then rounds the result to simple steps (e.g. EV +0.5)
     so the prescription stays easy to reason about and re-apply later purely
     from the stored number.
+
+    Both brightness measurements are taken during analysis (see
+    populate_frame_cache) so this stage never needs the pixels.
     """
-    image = frame.normalized_image
-    if image is None or image.size == 0:
+    overall_brightness = frame.overall_brightness
+    if overall_brightness <= 0.0:
         return AutoAdjustment()
 
-    overall_brightness = _mean_brightness(image)
-
     body = _main_body(frame)
-    face_crop = body.crop if body is not None else None
-    if face_crop is not None and face_crop.size > 0:
-        face_brightness = _mean_brightness(face_crop)
+    if body is not None and body.crop_brightness > 0.0:
+        face_brightness = body.crop_brightness
     else:
         # No usable subject crop — fall back to whole-image measurement so
         # the 50/50 blend degrades to a plain whole-image correction.

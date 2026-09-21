@@ -11,9 +11,10 @@ from ultralytics import YOLO
 
 from algo.config import AppConfig, app_config
 from algo.frame import Frame
+from algo.image_cache import FACE_ORIGINAL_BUFFER_RATIO, ImageCache
 from algo.models import Body, Box, Face, Point, PredictedKeyPoint
 from algo.stage import ProcessStage
-from algo.utils import _HEAD_KP_INDICES, cap_long_edge
+from algo.utils import _HEAD_KP_INDICES, _narrow_face_box, cap_long_edge
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -265,8 +266,6 @@ def detect_qualified_persons(
 
     for body in bodies:
         if body.faces:
-            fx1, fy1, fx2, fy2 = body.faces[0].bbox.as_px_ints(image.shape[1], image.shape[0])
-            body.crop = image[fy1:fy2, fx1:fx2]
             bx1, by1, bx2, by2 = body.bbox.as_px_ints(image.shape[1], image.shape[0])
             log.debug("[detect]   body bbox=(%d,%d,%d,%d): %d face(s), crop %.0fx%.0f",
                       bx1, by1, bx2, by2,
@@ -280,6 +279,83 @@ def detect_qualified_persons(
 
     log.debug("[detect] result: %d body(ies) returned", len(bodies))
     return bodies, True
+
+
+# ---------------------------------------------------------------------------
+# Pixel cache population
+# ---------------------------------------------------------------------------
+
+def _mean_brightness(image: np.ndarray | None) -> float:
+    if image is None or image.size == 0:
+        return 0.0
+    return float(np.mean(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))) / 255.0
+
+
+def populate_frame_cache(
+    frame: Frame,
+    cache: "ImageCache | None",
+    config: AppConfig,
+    *,
+    cache_face_originals: bool = False,
+) -> None:
+    """Extract every pixel region later stages will ask for and hand it to the
+    scratch cache, so the caller can release this frame's full-size buffers.
+
+    Anything that only needs a summary of the pixels (frame/body brightness)
+    is reduced to a number here for the same reason.
+    """
+    from algo.stages.grading import cloth_color_predictor
+
+    normalized = frame.normalized_image
+    if normalized is None:
+        return
+    h, w = normalized.shape[:2]
+    frame.img_w, frame.img_h = w, h
+    frame.overall_brightness = _mean_brightness(normalized)
+
+    original = frame.image
+    oh, ow = (original.shape[:2] if original is not None else (0, 0))
+    stem = frame.key_stem or frame.path.stem
+    narrow_pad = round(0.005 * max(h, w))
+
+    for body in frame.bodies:
+        if body.faces:
+            fx1, fy1, fx2, fy2 = body.faces[0].bbox.as_px_ints(w, h)
+            body.crop_brightness = _mean_brightness(normalized[fy1:fy2, fx1:fx2])
+
+        torso = cloth_color_predictor.torso_crop(body, normalized)
+        if cache is not None:
+            body.cache_normalized_path = cache.store(stem, torso)
+        else:
+            body.set_normalized_crop(None if torso is None else torso.copy())
+
+        for face in body.faces:
+            # Mirrors FaceSharpnessScorer's own choice of scoring region, so
+            # the cached crop is exactly what it would have cropped itself.
+            face.narrow_box = (
+                _narrow_face_box(face, pad=narrow_pad, img_w=w, img_h=h)
+                if config.use_narrow_face_box else None
+            )
+            sx1, sy1, sx2, sy2 = (face.narrow_box or face.bbox).as_px_ints(w, h)
+            score_crop = normalized[sy1:sy2, sx1:sx2]
+
+            orig_crop = None
+            if cache_face_originals and original is not None:
+                pad_x = face.bbox.width * FACE_ORIGINAL_BUFFER_RATIO
+                pad_y = face.bbox.height * FACE_ORIGINAL_BUFFER_RATIO
+                ox1 = max(0, int(round((face.bbox.x1 - pad_x) * ow)))
+                oy1 = max(0, int(round((face.bbox.y1 - pad_y) * oh)))
+                ox2 = min(ow, int(round((face.bbox.x2 + pad_x) * ow)))
+                oy2 = min(oh, int(round((face.bbox.y2 + pad_y) * oh)))
+                if ox2 > ox1 and oy2 > oy1:
+                    orig_crop = original[oy1:oy2, ox1:ox2]
+
+            if cache is not None:
+                face.cache_normalized_path = cache.store(stem, score_crop)
+                face.cache_original_path = cache.store(stem, orig_crop)
+            else:
+                face.set_normalized_crop(score_crop.copy() if score_crop.size else None)
+                face.set_original_crop(orig_crop.copy() if orig_crop is not None else None)
 
 
 # ---------------------------------------------------------------------------
@@ -298,11 +374,15 @@ class ImageAnalysisStage(ProcessStage):
         self, input_path: Path, pose_model: YOLO, face_model: YOLO,
         skip_paths: frozenset[Path] | None = None,
         only_paths: list[Path] | None = None,
+        cache: ImageCache | None = None,
+        cache_face_originals: bool = False,
     ) -> None:
         self.input_path = input_path
         self.pose_model = pose_model
         self.face_model = face_model
         self.skip_paths = skip_paths or frozenset()
+        self.cache = cache
+        self.cache_face_originals = cache_face_originals
         # Explicit file list (deep regrade re-analysing an album's already-
         # recorded sources, which may span several directories) -- bypasses
         # the input_path directory scan entirely when set.
@@ -333,12 +413,19 @@ class ImageAnalysisStage(ProcessStage):
             if not had_persons:
                 log.debug("[ImageAnalysisStage] %s — no person detected", path.name)
 
-            result.append(Frame(
+            frame = Frame(
                 path=path,
                 bodies=bodies,
                 image=image,
                 normalized_image=normalized,
-            ))
+            )
+            populate_frame_cache(frame, self.cache, config,
+                                 cache_face_originals=self.cache_face_originals)
+            # Released here: holding these for the whole album is what used to
+            # exhaust memory on large imports.
+            frame.image = None
+            frame.normalized_image = None
+            result.append(frame)
 
         log.info("[ImageAnalysisStage] %d frame(s) constructed from %d file(s)",
                  len(result), len(files))
@@ -395,8 +482,6 @@ def detect_qualified_persons_mp(
         face = detect_face_for_body_mp(image, body, face_landmarker, scan_box=box)
         if face is not None:
             body.faces = [face]
-            fx1, fy1, fx2, fy2 = face.bbox.as_px_ints(w, h)
-            body.crop = image[fy1:fy2, fx1:fx2]
             bx1, by1, bx2, by2 = body.bbox.as_px_ints(w, h)
             log.debug("[detect:mp]   body bbox=(%d,%d,%d,%d): face found, crop %.0fx%.0f",
                       bx1, by1, bx2, by2,
@@ -434,12 +519,16 @@ class MediaPipeImageAnalysisStage(ProcessStage):
         self, input_path: Path, person_detector, pose_landmarker, face_landmarker,
         skip_paths: frozenset[Path] | None = None,
         only_paths: list[Path] | None = None,
+        cache: ImageCache | None = None,
+        cache_face_originals: bool = False,
     ) -> None:
         self.input_path = input_path
         self.person_detector = person_detector
         self.pose_landmarker = pose_landmarker
         self.face_landmarker = face_landmarker
         self.skip_paths = skip_paths or frozenset()
+        self.cache = cache
+        self.cache_face_originals = cache_face_originals
         # See ImageAnalysisStage.only_paths.
         self.only_paths = only_paths
 
@@ -470,12 +559,18 @@ class MediaPipeImageAnalysisStage(ProcessStage):
             if not had_persons:
                 log.debug("[MediaPipeImageAnalysisStage] %s — no person detected", path.name)
 
-            result.append(Frame(
+            frame = Frame(
                 path=path,
                 bodies=bodies,
                 image=image,
                 normalized_image=normalized,
-            ))
+            )
+            populate_frame_cache(frame, self.cache, config,
+                                 cache_face_originals=self.cache_face_originals)
+            # See ImageAnalysisStage.process.
+            frame.image = None
+            frame.normalized_image = None
+            result.append(frame)
 
         log.info("[MediaPipeImageAnalysisStage] %d frame(s) constructed from %d file(s)",
                  len(result), len(files))

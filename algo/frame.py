@@ -16,6 +16,12 @@ class Frame:
     image:            np.ndarray | None    = None  # original image (BGR)
     normalized_image: np.ndarray | None    = None  # normalised image (BGR)
     auto_adjustment:  AutoAdjustment | None = None  # exposure/WB correction prescription
+    # Retained after the pixel buffers above are released at the end of
+    # analysis, so later stages keep the geometry they need to map the
+    # normalised (0-1) coordinates on Body/Face back to pixels.
+    img_w:            int   = 0
+    img_h:            int   = 0
+    overall_brightness: float = 0.0  # mean grey level [0,1] of the normalised frame
     # Disambiguated bookkeeping key (preview filename, Album/info.json
     # entries, FaceReco origFilename) -- see algo/utils.py::make_unique_import_key.
     # Empty means "use path.stem" (single-source-dir album, the common case).

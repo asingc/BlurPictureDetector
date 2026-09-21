@@ -46,17 +46,19 @@ DEFAULT_SINGLETON_KEEP_FRACTION = 0.6
 
 # Star-rating thresholds for standalone (non-sequence) sharp frames —
 # fraction of all LLM-graded standalone frames, by llm_grade, highest
-# first — see _assign_star_ratings.
-STAR_4_TOP_FRACTION = 0.4
-STAR_5_TOP_FRACTION = 0.1
+# first — see _assign_star_ratings. No 5-star tier: top STAR_4_TOP_FRACTION
+# get 4 stars, the next slice up to STAR_3_TOP_FRACTION get 3 stars, the
+# rest get 2.
+STAR_4_TOP_FRACTION = 0.1
+STAR_3_TOP_FRACTION = 0.3
 
 # Star-rating tiers for frames inside a qualifying sequence (see
-# _assign_sequence_stars): one 4-star pick per this many seconds of burst
-# duration, then the top SEQUENCE_STAR_3_TOP_FRACTION of what's left get 3
-# stars, everything else gets 2 stars. No 5-star tier applies within a
-# sequence.
-SEQUENCE_STAR_4_QUOTA_SECONDS = 0.5
-SEQUENCE_STAR_3_TOP_FRACTION = 0.30
+# _assign_sequence_stars): round(SEQUENCE_STAR_4_ROUND_OFFSET + duration)
+# frames get 4 stars, then max(1, SEQUENCE_STAR_3_TOP_FRACTION) of what's
+# left get 3 stars, everything else gets 1 star. No 5-star tier applies
+# within a sequence.
+SEQUENCE_STAR_4_ROUND_OFFSET = 0.5
+SEQUENCE_STAR_3_TOP_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
@@ -327,8 +329,9 @@ class LLMCullingStage(ProcessStage):
         skipped_images: list[AlbumImage],
         sequences: list[list[TimedImage]],
     ) -> None:
-        """Assign a 1-5 star rating to every analysed entry (sharp, blurry,
-        or skipped) so the whole album can be ranked on one scale:
+        """Assign a 1-4 star rating to every analysed entry (sharp, blurry,
+        or skipped) so the whole album can be ranked on one scale (5 stars
+        is reserved for manual review — see ``apply_auto_rating``):
 
         - 1 star:  no face detected (``skipped``/``error``), or a blurry
           frame whose sharpness_score is below ``min(threshold, 0.4)`` —
@@ -340,18 +343,19 @@ class LLMCullingStage(ProcessStage):
           as a keeper).
 
         Sharp frames belonging to a qualifying *sequence* (see
-        :func:`_is_qualifying_sequence`) then get their 2/3/4-star tier
+        :func:`_is_qualifying_sequence`) then get their 1/3/4-star tier
         overridden by :meth:`_assign_sequence_stars` instead — sequences
         never compete against the rest of the album on one global
         percentile, and have no 5-star tier.
 
         Every OTHER sharp frame (standalone images, and frames in a burst
         too short/small to qualify as a sequence) keeps the original
-        global-percentile rule:
+        global-percentile rule, with no 5-star tier:
 
         - 4 stars: top ``STAR_4_TOP_FRACTION`` of those frames by
           ``llm_grade`` percentile.
-        - 5 stars: top ``STAR_5_TOP_FRACTION`` by that same percentile.
+        - 3 stars: the next slice, up to ``STAR_3_TOP_FRACTION``.
+        - 2 stars: everything past ``STAR_3_TOP_FRACTION``.
         """
         low_cutoff = min(self.threshold, 0.4)
         for image in skipped_images:
@@ -372,20 +376,21 @@ class LLMCullingStage(ProcessStage):
         graded = [i for i in non_sequence_sharp if i.llm_grade is not None]
         graded.sort(key=lambda i: i.llm_grade, reverse=True)
         top_4_count = math.ceil(len(graded) * STAR_4_TOP_FRACTION)
-        top_5_count = math.ceil(len(graded) * STAR_5_TOP_FRACTION)
+        top_3_count = math.ceil(len(graded) * STAR_3_TOP_FRACTION)
+        for image in graded[top_4_count:top_3_count]:
+            image.stars = 3
+        for image in graded[top_3_count:]:
+            image.stars = 2
         for image in graded[:top_4_count]:
             image.stars = 4
-        for image in graded[:top_5_count]:
-            image.stars = 5
 
         sharp = [t.image for t in sharp_images]
         log.info(
-            "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605, %d5\u2605 (%d sharp/%d blurry/%d skipped)",
-            sum(1 for i in skipped_images + blurry_images if i.stars == 1),
-            sum(1 for i in blurry_images if i.stars == 2),
+            "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605 (%d sharp/%d blurry/%d skipped)",
+            sum(1 for i in skipped_images + blurry_images + sharp if i.stars == 1),
+            sum(1 for i in blurry_images + sharp if i.stars == 2),
             sum(1 for i in sharp if i.stars == 3),
             sum(1 for i in sharp if i.stars == 4),
-            sum(1 for i in sharp if i.stars == 5),
             len(sharp), len(blurry_images), len(skipped_images),
         )
 
@@ -394,15 +399,15 @@ class LLMCullingStage(ProcessStage):
         per-sequence (never pooled against other sequences or the rest of
         the album):
 
-        - 4 stars: the top ``floor(duration / SEQUENCE_STAR_4_QUOTA_SECONDS)``
+        - 4 stars: the top ``round(SEQUENCE_STAR_4_ROUND_OFFSET + duration)``
           frames by ``llm_grade`` (clamped to at least 1, and at most every
-          graded frame in the burst) — e.g. a 1.5s sequence picks its top 3.
-        - 3 stars: the top ``SEQUENCE_STAR_3_TOP_FRACTION`` of whatever's
-          left (by ``llm_grade``).
-        - 2 stars: everything else in the sequence.
+          graded frame in the burst) — e.g. a 1.5s sequence picks its top 2.
+        - 3 stars: ``max(1, ceil(SEQUENCE_STAR_3_TOP_FRACTION * remaining))``
+          of whatever's left (by ``llm_grade``).
+        - 1 star: everything else in the sequence.
 
-        There is no 5-star tier here. If the burst has no graded frames at
-        all (e.g. the LLM call failed), it's left at the baseline 3 stars
+        There is no 2 or 5-star tier here. If the burst has no graded frames
+        at all (e.g. the LLM call failed), it's left at the baseline 3 stars
         every sharp frame already got, rather than guessing.
         """
         graded = [t for t in burst if t.image.llm_grade is not None]
@@ -412,13 +417,16 @@ class LLMCullingStage(ProcessStage):
 
         duration = burst[-1].timestamp - burst[0].timestamp
         four_star_count = min(
-            max(math.floor(duration / SEQUENCE_STAR_4_QUOTA_SECONDS), 1),
+            max(round(SEQUENCE_STAR_4_ROUND_OFFSET + duration), 1),
             len(graded),
         )
         four_star_keys = {t.key for t in graded[:four_star_count]}
 
         remaining = graded[four_star_count:]
-        three_star_count = math.ceil(len(remaining) * SEQUENCE_STAR_3_TOP_FRACTION)
+        three_star_count = min(
+            max(1, math.ceil(len(remaining) * SEQUENCE_STAR_3_TOP_FRACTION)),
+            len(remaining),
+        )
         three_star_keys = {t.key for t in remaining[:three_star_count]}
 
         for timed in burst:
@@ -427,7 +435,7 @@ class LLMCullingStage(ProcessStage):
             elif timed.key in three_star_keys:
                 timed.image.stars = 3
             else:
-                timed.image.stars = 2
+                timed.image.stars = 1
 
     def _apply_rankings(self, burst: list[TimedImage], group_id: str, result: BurstRankingResult) -> None:
         rank_by_file = {r.file: r for r in result.rankings}

@@ -230,8 +230,23 @@ class AnnotationStage(ProcessStage):
         self.output_dir = output_dir
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
+        from algo.stages.image_analysis import _read_image
+
         for idx, frame in enumerate(frames, 1):
             log.debug("[AnnotationStage] [%d/%d] %s", idx, len(frames), frame.path.name)
-            _annotate_frame(frame, self.output_dir, config)
+            # Analysis releases frame.image, so re-read it here and drop it
+            # again straight away -- only one source image is ever resident.
+            borrowed = frame.image is None
+            if borrowed:
+                frame.image = _read_image(frame.path)
+                if frame.image is None:
+                    log.warning("[AnnotationStage] %s — cannot re-read image, preview skipped",
+                                frame.path.name)
+                    continue
+            try:
+                _annotate_frame(frame, self.output_dir, config)
+            finally:
+                if borrowed:
+                    frame.image = None
         log.info("[AnnotationStage] annotated %d frame(s) → %s", len(frames), self.output_dir)
         return frames

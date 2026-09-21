@@ -603,7 +603,7 @@ class FaceRecoPipeline:
             log.warning("FaceReco: failed to read calibration file %s: %s", path, exc)
         return {}
 
-    def run(self, prep_output_dir: Path) -> Path:
+    def run(self, prep_output_dir: Path, face_crop_lookup: dict | None = None) -> Path:
         prep_output_dir = prep_output_dir.resolve()
         album = Album(prep_output_dir)
 
@@ -749,7 +749,7 @@ class FaceRecoPipeline:
             face_db = FaceDb((face_db.entries if face_db is not None else []) + local_entries)
 
         log.info("FaceReco: %d qualified bodies collected", len(qualified))
-        samples = self._predict_samples(qualified, debug_dir)
+        samples = self._predict_samples(qualified, debug_dir, face_crop_lookup)
         log.info("FaceReco: %d/%d embeddings extracted successfully", len(samples), len(qualified))
 
         # Strategy: match each face directly against the face DB first, then
@@ -895,6 +895,7 @@ class FaceRecoPipeline:
         self,
         qualified: list[_QualifiedBody],
         debug_dir: Path | None = None,
+        face_crop_lookup: dict | None = None,
     ) -> list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]]:
         predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]] = []
         total = len(qualified)
@@ -908,35 +909,48 @@ class FaceRecoPipeline:
         last_image: np.ndarray | None = None
         for index, item in enumerate(qualified, start=1):
             tag = f"{item.image_path.name} body#{item.body.body_index}"
-            if item.image_path == last_path:
-                image = last_image
-            else:
+            # Same run as the import: analysis already cropped this face at
+            # native resolution with the same buffer ratio, so skip re-decoding
+            # the whole photo. A standalone re-run passes no lookup.
+            crop = None
+            cached_face = (
+                face_crop_lookup.get((item.body.orig_filename, item.body.body_index))
+                if face_crop_lookup is not None else None
+            )
+            if cached_face is not None:
+                crop = cached_face.get_original_crop()
+                cached_face.set_original_crop(None)
+
+            if crop is None:
+                if item.image_path == last_path:
+                    image = last_image
+                else:
+                    try:
+                        image = self._load_image(item.image_path)
+                    except (MemoryError, cv2.error) as exc:
+                        skipped_oom += 1
+                        log.warning(
+                            "FaceReco [embed]: %s — out of memory decoding image, skipped: %s",
+                            tag, exc,
+                        )
+                        last_path, last_image = item.image_path, None
+                        continue
+                    last_path, last_image = item.image_path, image
+                if image is None:
+                    skipped_load += 1
+                    log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
+                    continue
+                # Crop the face area first (same "face preview" rules used for the
+                # saved crop), then re-detect landmarks on the crop and embed from
+                # it.  Embedding from the exact crop we save guarantees that a
+                # later RebuildFaceDB run reproduces this embedding, so prediction
+                # and face-DB embeddings live in the same space.
                 try:
-                    image = self._load_image(item.image_path)
+                    crop = self._crop_face_with_buffer(image, item.body)
                 except (MemoryError, cv2.error) as exc:
                     skipped_oom += 1
-                    log.warning(
-                        "FaceReco [embed]: %s — out of memory decoding image, skipped: %s",
-                        tag, exc,
-                    )
-                    last_path, last_image = item.image_path, None
+                    log.warning("FaceReco [embed]: %s — out of memory cropping face, skipped: %s", tag, exc)
                     continue
-                last_path, last_image = item.image_path, image
-            if image is None:
-                skipped_load += 1
-                log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
-                continue
-            # Crop the face area first (same "face preview" rules used for the
-            # saved crop), then re-detect landmarks on the crop and embed from
-            # it.  Embedding from the exact crop we save guarantees that a
-            # later RebuildFaceDB run reproduces this embedding, so prediction
-            # and face-DB embeddings live in the same space.
-            try:
-                crop = self._crop_face_with_buffer(image, item.body)
-            except (MemoryError, cv2.error) as exc:
-                skipped_oom += 1
-                log.warning("FaceReco [embed]: %s — out of memory cropping face, skipped: %s", tag, exc)
-                continue
             if crop is None:
                 skipped_crop += 1
                 log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)

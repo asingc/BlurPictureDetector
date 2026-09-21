@@ -10,6 +10,7 @@ verdict (the whole point is to keep the discarded frames too).
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -137,14 +138,25 @@ def _fit_to_canvas(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return canvas
 
 
-def _output_path_for_burst(bursts_dir: Path, burst: Burst) -> Path:
-    stem = burst.frames[0].name_stem
-    candidate = bursts_dir / f"{stem}.mp4"
+def _unique_path(directory: Path, stem: str, suffix: str = ".mp4") -> Path:
+    candidate = directory / f"{stem}{suffix}"
     n = 2
     while candidate.exists():
-        candidate = bursts_dir / f"{stem}_{n}.mp4"
+        candidate = directory / f"{stem}_{n}{suffix}"
         n += 1
     return candidate
+
+
+def _output_path_for_burst(bursts_dir: Path, burst: Burst) -> Path:
+    return _unique_path(bursts_dir, burst.frames[0].name_stem)
+
+
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_filename(name: str) -> str:
+    cleaned = _INVALID_FS_CHARS.sub("_", name).strip(" .")
+    return cleaned or "Unnamed"
 
 
 def _render_with_ffmpeg(
@@ -272,3 +284,82 @@ def render_album_bursts(
 
     _log(on_line, f"Done. Rendered {rendered} video(s), skipped {skipped}.")
     return {"burstsFound": len(bursts), "rendered": rendered, "skipped": skipped, "outputDir": str(bursts_dir)}
+
+
+def _render_frame_sequence(
+    frame_paths: list[Path], out_path: Path, fps: float, tmp_root: Path,
+    on_line: Optional[Callable[[str], None]],
+) -> bool:
+    """Render an already-ordered list of photos into one constant-fps MP4 --
+    the per-player counterpart of _render_burst, minus the "timestamp" mode
+    (a player's photos span the whole album, so matching real capture gaps
+    would make for a mostly-frozen video)."""
+    frame_dir = Path(tempfile.mkdtemp(prefix="seq_", dir=tmp_root))
+    try:
+        target_size: Optional[tuple[int, int]] = None
+        written = 0
+        for path in frame_paths:
+            img = _decode_frame(path)
+            if img is None:
+                _log(on_line, f"  skipping unreadable frame: {path.name}")
+                continue
+            img = cap_long_edge(img, MAX_LONG_EDGE)
+            h, w = img.shape[:2]
+            if target_size is None:
+                target_size = (w - w % 2, h - h % 2)
+            img = _fit_to_canvas(img, target_size)
+            cv2.imwrite(str(frame_dir / f"frame_{written:06d}.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            written += 1
+
+        if written < 1 or target_size is None:
+            _log(on_line, "  no readable frames, skipping")
+            return False
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if shutil.which("ffmpeg"):
+            _render_with_ffmpeg(frame_dir, written, None, fps, out_path)
+        else:
+            _render_with_opencv(frame_dir, written, None, fps, out_path, target_size)
+        return True
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+
+
+def render_player_videos(
+    player_frames: dict[str, list[Path]],
+    output_dir: Path,
+    *,
+    fps: float = DEFAULT_FPS,
+    on_line: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Render one highlight MP4 per player to *output_dir*/<player name>.mp4.
+
+    *player_frames* maps a tagged player's name to every distinct photo
+    they appear in (any order -- sorted here by capture time). Callers
+    resolve the FaceReco-tagged photos to filesystem paths; this function
+    only knows how to turn an ordered photo list into a video."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    names = sorted(player_frames.keys())
+    rendered = skipped = 0
+
+    _log(on_line, f"Found {len(names)} player(s) with tagged faces.")
+    if shutil.which("ffmpeg") is None:
+        _log(on_line, "ffmpeg not found on PATH -- falling back to a lower-quality built-in encoder.")
+
+    with tempfile.TemporaryDirectory(prefix="player_video_") as tmp:
+        tmp_root = Path(tmp)
+        for n, name in enumerate(names, 1):
+            frames = sorted(player_frames[name], key=image_capture_timestamp)
+            out_path = _unique_path(output_dir, _sanitize_filename(name))
+            _log(on_line, f"Rendering {n}/{len(names)}: {name} ({len(frames)} photo(s)) -> {out_path.name}")
+            try:
+                ok = _render_frame_sequence(frames, out_path, fps, tmp_root, on_line)
+            except Exception as exc:
+                _log(on_line, f"  failed: {exc}")
+                ok = False
+            rendered += 1 if ok else 0
+            skipped += 0 if ok else 1
+
+    _log(on_line, f"Done. Rendered {rendered} video(s), skipped {skipped}.")
+    return {"playersFound": len(names), "rendered": rendered, "skipped": skipped, "outputDir": str(output_dir)}
+

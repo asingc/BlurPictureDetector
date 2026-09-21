@@ -216,11 +216,76 @@
       <span>Export</span>
     </button>
   </div>
+
+  <hr />
+  <p class="muted">
+    Writes a CSV listing every tagged face in this album — every player
+    recognized in every photo, regardless of star rating or whether that
+    photo is ever exported — to a destination folder of your choice.
+  </p>
+  <div class="row actions">
+    <span id="faceTaggingCsvStatus" class="muted"></span>
+    <button id="openFaceTaggingCsvFolderBtn" class="btn btn-icon-text" title="Open output folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="faceTaggingCsvBtn" class="btn btn-icon-text" title="Choose destination &amp; export CSV">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="7 10 12 15 17 10"></polyline>
+        <line x1="12" y1="15" x2="12" y2="3"></line>
+      </svg>
+      <span>Export All Face Tagging (CSV)</span>
+    </button>
+  </div>
 </div>
 
 <div id="exportDialog" title="Exporting…" style="display:none">
   <p id="exportDialogStatus" class="muted"></p>
   <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div id="faceTaggingCsvDialog" title="Exporting…" style="display:none">
+  <p id="faceTaggingCsvDialogStatus" class="muted"></p>
+  <textarea id="faceTaggingCsvOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="playerVideoPanel">
+  <h3>Per-Player Highlight Videos <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Renders one MP4 per tagged player, containing every photo they're
+    recognized in (chronological order), regardless of star rating. Uses
+    ffmpeg if it's on PATH for best quality, otherwise falls back to a
+    lower-quality built-in encoder.
+  </p>
+  <div class="row">
+    <label class="inline-check">Frame rate (FPS)
+      <input type="number" id="playerVideoFpsInput" min="1" max="30" value="1" style="width:4em" />
+    </label>
+    <span id="playerVideoSummaryLabel" class="muted"></span>
+  </div>
+  <div class="row actions">
+    <span id="playerVideoStatus" class="muted"></span>
+    <button id="openPlayerVideoFolderBtn" class="btn btn-icon-text" title="Open output folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="renderPlayerVideosBtn" class="btn btn-icon-text" title="Choose destination &amp; render per-player videos">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"></polygon>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+      </svg>
+      <span>Render per-player videos</span>
+    </button>
+  </div>
+</div>
+
+<div id="playerVideoDialog" title="Rendering player videos…" style="display:none">
+  <textarea id="playerVideoOutput" class="output-box" rows="16" readonly></textarea>
 </div>
 
 <div class="panel" id="burstVideoPanel">

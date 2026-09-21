@@ -131,6 +131,40 @@ class Face:
     landmarks:  list[PredictedKeyPoint]  # 5 face-model landmarks (empty if unavailable)
     passed:     bool = True          # scorers set this to False to disqualify
 
+    # Computed during analysis (while the frame is still decoded) so the
+    # sharpness scorer can score from the cached crop alone. Transient:
+    # body.best_narrow_box is what gets persisted.
+    narrow_box: "Box | None" = None
+
+    # Scratch, per-run pixel cache (see algo/image_cache.py). Populated during
+    # analysis while the source frame is still decoded, so later stages (and
+    # FaceRecoStage) never need to keep a whole album's images in memory at
+    # once -- None until written. Never persisted to album.json.
+    cache_normalized_path: str | None = None  # face-bbox crop from the normalized frame
+    cache_original_path:   str | None = None  # face-bbox crop (padded) from the native source image
+    _normalized_crop: "np.ndarray | None" = field(default=None, repr=False, compare=False)
+    _original_crop:   "np.ndarray | None" = field(default=None, repr=False, compare=False)
+
+    def set_normalized_crop(self, crop: "np.ndarray | None") -> None:
+        """Attach an already-decoded crop in memory (e.g. a single-image
+        regrade) instead of persisting/reading it from the scratch cache."""
+        self._normalized_crop = crop
+
+    def get_normalized_crop(self) -> "np.ndarray | None":
+        """Face-bbox crop of the normalized frame, or None if never populated."""
+        if self._normalized_crop is None and self.cache_normalized_path:
+            self._normalized_crop = np.load(self.cache_normalized_path, allow_pickle=False)
+        return self._normalized_crop
+
+    def set_original_crop(self, crop: "np.ndarray | None") -> None:
+        self._original_crop = crop
+
+    def get_original_crop(self) -> "np.ndarray | None":
+        """Padded face-bbox crop of the native source image (for FaceReco), or None."""
+        if self._original_crop is None and self.cache_original_path:
+            self._original_crop = np.load(self.cache_original_path, allow_pickle=False)
+        return self._original_crop
+
     def n_visible(self) -> int:
         """Count landmarks that have passed classification."""
         return sum(1 for lm in self.landmarks if lm.passed)
@@ -174,6 +208,24 @@ class Body:
     ten:               float       = 0.0         # Tenengrad of best face crop
     cloth_color:       str         = "N/A"       # predicted jersey/cloth color
     cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean LAB
+    # Mean grey level [0,1] of this body's face crop, measured during analysis
+    # so AutoAdjustStage never needs the pixels again.
+    crop_brightness:   float       = 0.0
+
+    # Scratch, per-run pixel cache (see algo/image_cache.py) -- same contract
+    # as Face's cache_normalized_path above.
+    cache_normalized_path: str | None = None  # body-bbox crop from the normalized frame
+    _normalized_crop: "np.ndarray | None" = field(default=None, repr=False, compare=False)
+
+    def set_normalized_crop(self, crop: "np.ndarray | None") -> None:
+        """Attach an already-decoded crop in memory instead of the scratch cache."""
+        self._normalized_crop = crop
+
+    def get_normalized_crop(self) -> "np.ndarray | None":
+        """Body-bbox crop of the normalized frame, or None if never populated."""
+        if self._normalized_crop is None and self.cache_normalized_path:
+            self._normalized_crop = np.load(self.cache_normalized_path, allow_pickle=False)
+        return self._normalized_crop
 
 
 @dataclass

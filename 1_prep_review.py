@@ -42,6 +42,7 @@ from algo import album
 from algo.album import Album
 from algo.album_info import AlbumInfo
 from algo.frame import Frame
+from algo.image_cache import ImageCache
 from algo.results import baseline_stars, build_result_entries
 from algo.stage import ProcessStage
 from algo.stages.annotation import AnnotationStage
@@ -315,9 +316,8 @@ def write_csv(frames: list[Frame], csv_path: Path, *, append: bool = False) -> N
         if write_header:
             writer.writeheader()
         for frame in frames:
-            norm_img = frame.normalized_image
-            img_w = norm_img.shape[1] if norm_img is not None else 1
-            img_h = norm_img.shape[0] if norm_img is not None else 1
+            img_w = frame.img_w or 1
+            img_h = frame.img_h or 1
             if not frame.bodies:
                 verdict, score = "Skipped", None
             elif frame.is_sharp():
@@ -912,6 +912,11 @@ def main() -> None:
     )
 
     log.info("Loading models … (engine=%s)", args.engine)
+    # Per-run scratch store for the pixel regions later stages need, so the
+    # analysis loop can release each source image instead of holding the whole
+    # album in memory (see algo/image_cache.py). Removed at the end of the run.
+    image_cache = ImageCache(working_dir)
+    cache_face_originals = not args.skip_facereco and not args.regrade_only
     # A deep regrade re-analyses an explicit file list and must NOT skip
     # already-imported paths (those ARE the files it exists to reprocess).
     analysis_skip = frozenset() if args.regrade_only else already_imported
@@ -924,6 +929,7 @@ def main() -> None:
         analysis_stage: ProcessStage = ImageAnalysisStage(
             input_path, pose_model, face_model,
             skip_paths=analysis_skip, only_paths=regrade_paths,
+            cache=image_cache, cache_face_originals=cache_face_originals,
         )
     else:
         from algo.mediapipe_provider import load_face_landmarker, load_pose_landmarker
@@ -934,6 +940,7 @@ def main() -> None:
         analysis_stage = MediaPipeImageAnalysisStage(
             input_path, person_detector, pose_landmarker, face_landmarker,
             skip_paths=analysis_skip, only_paths=regrade_paths,
+            cache=image_cache, cache_face_originals=cache_face_originals,
         )
 
     # Not needed by a deep regrade (it returns before the FaceReco stage) and
@@ -1003,6 +1010,7 @@ def main() -> None:
         blurry_n = sum(1 for f in frames if f.bodies and not f.is_sharp())
         sharp_n = sum(1 for f in frames if f.bodies and f.is_sharp())
         skipped_n = sum(1 for f in frames if not f.bodies)
+        image_cache.clear()
         log.info("Deep regrade complete — Sharp: %d  |  Blurry: %d  |  No person: %d",
                  sharp_n, blurry_n, skipped_n)
         return
@@ -1084,6 +1092,8 @@ def main() -> None:
                 summary.added, output_dir, summary.renamed,
                 summary.facereco_clusters_added, summary.facereco_clusters_merged,
             )
+
+    image_cache.clear()
 
     if use_temp_staging:
         shutil.rmtree(working_dir, ignore_errors=True)
