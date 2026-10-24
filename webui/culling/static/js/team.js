@@ -106,12 +106,29 @@ async function saveTeam() {
   }
 }
 
+// An "Add" button is only usable (and styled like the Remove buttons) while
+// its paired input has something in it. Returns an updater fn the caller can
+// also invoke manually (e.g. after clearing the input on submit).
+function bindEnableOnInput(inputSelector, buttonSelector) {
+  const update = () => {
+    const hasText = $(inputSelector).val().trim().length > 0;
+    $(buttonSelector).prop("disabled", !hasText).toggleClass("btn-danger", hasText);
+  };
+  $(inputSelector).on("input change", update);
+  update();
+  return update;
+}
+
 $(function () {
+  const updateAddPlayerBtn = bindEnableOnInput("#playerBulkInput", "#addPlayerBtn");
+  bindEnableOnInput("#jerseyColorInput", "#addJerseyBtn");
+  bindEnableOnInput("#goalkeeperJerseyInput", "#addGoalkeeperJerseyBtn");
+
   $("#addJerseyBtn").on("click", () => {
     const color = $("#jerseyColorInput").val().trim();
     if (!color) return;
     Team.jerseyColors.push({ color, forced: false });
-    $("#jerseyColorInput").val("");
+    $("#jerseyColorInput").val("").trigger("change");
     renderJerseyList();
   });
   $("#jerseyColorInput").on("keydown", (e) => { if (e.key === "Enter") $("#addJerseyBtn").click(); });
@@ -124,7 +141,7 @@ $(function () {
     const color = $("#goalkeeperJerseyInput").val().trim();
     if (!color) return;
     Team.jerseyColors.push({ color, forced: true });
-    $("#goalkeeperJerseyInput").val("");
+    $("#goalkeeperJerseyInput").val("").trigger("change");
     renderJerseyList();
   });
   $("#goalkeeperJerseyInput").on("keydown", (e) => { if (e.key === "Enter") $("#addGoalkeeperJerseyBtn").click(); });
@@ -139,6 +156,7 @@ $(function () {
       if (name) Team.players.push({ name, number });
     });
     $("#playerBulkInput").val("");
+    updateAddPlayerBtn();
     renderPlayerTable();
   });
 

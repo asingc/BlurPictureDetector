@@ -415,8 +415,21 @@ player_video_state = PlayerVideoState()
 # down, since a closed/idle tab shouldn't kill an otherwise-healthy local
 # server out from under a still-running job.
 # --------------------------------------------------------------------------- #
+# Seconds without a browser heartbeat (pages ping every 10s) before the
+# watchdog prints the relaunch link. Override with --heartbeat-timeout;
+# 0 disables the watchdog.
+HEARTBEAT_TIMEOUT_SECONDS = 60.0
+
+
+class _HeartbeatAccessLogFilter(logging.Filter):
+    """Drop uvicorn access-log lines for the periodic /api/heartbeat pings."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/heartbeat" not in record.getMessage()
+
+
 class HeartbeatState:
-    def __init__(self, timeout: float = 180.0) -> None:
+    def __init__(self, timeout: float = HEARTBEAT_TIMEOUT_SECONDS) -> None:
         self.lock = threading.Lock()
         self.timeout = timeout
         self.last_heartbeat = time.time()
@@ -473,12 +486,13 @@ def _heartbeat_watchdog() -> None:
         if elapsed > heartbeat_state.timeout and not already_notified:
             log.info("=" * 70)
             log.info(
-                "No heartbeat received for %.0fs (timeout %.0fs) — the browser "
-                "tab appears to be closed or idle.", elapsed, heartbeat_state.timeout,
+                "Heartbeat stopped: no heartbeat received for %.0fs "
+                "(threshold %.0fs); the browser tab appears to be closed.",
+                elapsed, heartbeat_state.timeout,
             )
-            log.info("The server is still running. Either:")
-            log.info("  - Press Ctrl+C in this window to exit, or")
-            log.info("  - Open this URL to restart the web app: %s", heartbeat_state.url)
+            log.info("The server is still running. To relaunch the app, click the URL:")
+            log.info("  %s", heartbeat_state.url)
+            log.info("(Press Ctrl+C in this window to exit.)")
             log.info("=" * 70)
 
 
@@ -3057,14 +3071,15 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser tab")
-    parser.add_argument("--heartbeat-timeout", type=float, default=0.0,
+    parser.add_argument("--heartbeat-timeout", type=float, default=HEARTBEAT_TIMEOUT_SECONDS,
                         help="Seconds without a browser heartbeat before the "
                              "server logs a reminder (with the relaunch link) "
                              "that it's still running. Use 0 to disable "
-                             "(default: disabled for now).")
+                             f"(default: {HEARTBEAT_TIMEOUT_SECONDS:g}).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.getLogger("uvicorn.access").addFilter(_HeartbeatAccessLogFilter())
 
     url = f"http://{args.host}:{args.port}/"
     heartbeat_state.timeout = args.heartbeat_timeout
