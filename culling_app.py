@@ -98,9 +98,24 @@ class Player(BaseModel):
     number: str = ""
 
 
+def _is_uuid(value: object) -> bool:
+    """True for a canonical hyphenated UUID string."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
 class TeamData(BaseModel):
-    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # Stable identity (full UUID). `name` is display-only and may change; the
+    # system face DB folder and every album's team_id are keyed by this id.
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str = ""
+    # Pre-UUID ids this team used to have; albums created back then still
+    # store them in team_id, so lookups match these too.
+    legacyIds: list[str] = Field(default_factory=list)
     jerseyColors: list[JerseyColor] = Field(default_factory=list)
     players: list[Player] = Field(default_factory=list)
     openaiApiKey: str = ""
@@ -882,8 +897,15 @@ def _load_teams_file() -> TeamsFile:
         for i, team in enumerate(payload.get("Teams", [])):
             if not isinstance(team, dict):
                 continue
-            if not team.get("id"):
-                team["id"] = uuid.uuid4().hex[:12]
+            if not _is_uuid(team.get("id")):
+                legacy = team.get("id")
+                legacy_ids = team.get("legacyIds")
+                if not isinstance(legacy_ids, list):
+                    legacy_ids = []
+                if legacy and legacy not in legacy_ids:
+                    legacy_ids.append(legacy)
+                team["legacyIds"] = legacy_ids
+                team["id"] = str(uuid.uuid4())
                 needs_resave = True
             if not team.get("name"):
                 team["name"] = f"Team {i + 1}"
@@ -911,9 +933,18 @@ def _save_teams_file(teams_file: TeamsFile) -> None:
 
 def _find_team(teams_file: TeamsFile, team_id: str) -> Optional[TeamData]:
     for team in teams_file.Teams:
-        if team.id == team_id:
+        if team.id == team_id or team_id in team.legacyIds:
             return team
     return None
+
+
+def _canonical_team_id(team_id: str) -> str:
+    """Map a possibly pre-UUID team id (as stored in an older album or
+    state.json) to the team's current id; unknown ids pass through."""
+    if not team_id:
+        return ""
+    team = _find_team(_load_teams_file(), team_id)
+    return team.id if team is not None else team_id
 
 
 def _resolve_team(team_id: str) -> TeamData:
@@ -948,9 +979,12 @@ def _save_team(team: TeamData) -> TeamData:
     filled in if it was newly created)."""
     teams_file = _load_teams_file()
     if not team.id:
-        team.id = uuid.uuid4().hex[:12]
+        team.id = str(uuid.uuid4())
     for i, existing in enumerate(teams_file.Teams):
-        if existing.id == team.id:
+        if existing.id == team.id or team.id in existing.legacyIds:
+            # Server-owned: never let a client drop or replace the real id.
+            team.id = existing.id
+            team.legacyIds = existing.legacyIds
             teams_file.Teams[i] = team
             break
     else:
@@ -1301,13 +1335,23 @@ def _facereco_dir(album_path: Path) -> Optional[Path]:
     return None
 
 
-def _global_face_db_dir() -> Optional[Path]:
-    """Read-only name dictionary shared across albums (repo-root .FaceReco)."""
+SYSTEM_FACE_DB_NAME = ".FaceReco"
+
+
+def _system_face_db_root() -> Path:
+    """Root of the cross-album face DB (repo-root .FaceReco); holds one
+    sub-folder per team id, each of which is a self-contained face DB."""
     for name in FACE_DB_DIR_CANDIDATES:
         candidate = REPO_ROOT / name
         if candidate.is_dir():
             return candidate
-    return None
+    return REPO_ROOT / SYSTEM_FACE_DB_NAME
+
+
+def _team_face_db_dir(team_id: str) -> Path:
+    """Face DB folder for one team: <repo>/.FaceReco/<team uuid>/. The same
+    player on two teams is two independent entries, one per team folder."""
+    return _system_face_db_root() / _resolve_team(team_id).id
 
 
 def _safe_component(name: str) -> str:
@@ -1383,17 +1427,19 @@ def _build_clusters(album_path: Path) -> list[dict]:
 
 
 def _collect_names(album_path: Path) -> list[str]:
-    """Collect cluster-page autocomplete names: this album's assigned team
-    roster (team.json) unioned with whatever names are already tagged onto
-    clusters (this album's own .FaceReco plus the shared repo-root face DB)
-    — the union keeps non-roster tags (coaches, etc.) autocompleting too."""
+    """Collect cluster-page autocomplete names, limited to the album's own
+    team: its roster (team.json), the names already tagged in this album's
+    .FaceReco, and the names in that team's system face DB folder (which is
+    where tagged non-roster people such as coaches end up). Other teams'
+    folders are never read."""
     names: set[str] = set()
-    team = _resolve_team(_album_team_id(album_path))
+    team_id = _album_team_id(album_path)
+    team = _resolve_team(team_id)
     for player in team.players:
         name = (player.name or "").strip()
         if name:
             names.add(name)
-    for source in (_global_face_db_dir(), _facereco_dir(album_path)):
+    for source in (_team_face_db_dir(team_id), _facereco_dir(album_path)):
         if source is None or not source.is_dir():
             continue
         for child in source.iterdir():
@@ -1632,7 +1678,7 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
 #
 #   1. Sync every recognized/tagged player's face crops (from kept images
 #      only) into the permanent, cross-album system face database at
-#      REPO_ROOT/.FaceReco — uncapped; RebuildFaceDB.py's retire step (below)
+#      REPO_ROOT/.FaceReco/<team id>/ — uncapped; RebuildFaceDB.py's retire step (below)
 #      is what curates it, not this step.
 #   2. Run RebuildFaceDB.py against that system database to regenerate
 #      embeddings and retire redundant crops.
@@ -1673,11 +1719,14 @@ def _stream_subprocess(cmd: list[str], on_line=None) -> int:
 
 
 def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
-    """Copy every recognized/tagged player's face crops from *kept* images in
-    this album's own .FaceReco into REPO_ROOT/.FaceReco (creating a person
-    folder there the first time we see them). Copies everything uncapped —
-    RebuildFaceDB.py's retire step decides afterward what's actually worth
-    keeping. Returns the number of tagged players processed."""
+    """Copy every recognized/tagged person's face crops from *kept* images in
+    this album's own .FaceReco into the album's team folder of the system
+    face DB (REPO_ROOT/.FaceReco/<team id>/, creating a person folder there
+    the first time we see them). Any tagged name counts -- roster member or
+    not -- so coaches/guests tagged by hand are matched next time. Copies
+    everything uncapped — RebuildFaceDB.py's retire step decides afterward
+    what's actually worth keeping. Returns the number of tagged people
+    processed."""
     fr = _facereco_dir(album_path)
     if fr is None:
         _export_log("No .FaceReco folder in this album — nothing to sync.")
@@ -1691,7 +1740,7 @@ def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
         _export_log("No tagged players found in this album — nothing to sync.")
         return 0
 
-    system_fr = REPO_ROOT / ".FaceReco"
+    system_fr = _team_face_db_dir(_album_team_id(album_path))
     system_fr.mkdir(parents=True, exist_ok=True)
 
     processed = 0
@@ -1838,11 +1887,12 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool, min
             export_state.total_images = len(kept)
             export_state.dest_dir = str(dest_dir)
 
-        _export_log("Step 1/3: syncing tagged face crops into system face database (./FaceReco)...")
+        team_id = _album_team_id(album_path)
+        _export_log("Step 1/3: syncing tagged face crops into this team's face database (.FaceReco/<team id>)...")
         _sync_named_clusters_to_system_db(album_path, kept)
 
-        system_fr = REPO_ROOT / ".FaceReco"
-        if system_fr.is_dir() and any(system_fr.iterdir()):
+        system_fr = _team_face_db_dir(team_id)
+        if system_fr.is_dir() and any(p.is_dir() and not p.name.startswith("Annotated.") for p in system_fr.iterdir()):
             _export_log("Step 2/3: rebuilding face database embeddings (RebuildFaceDB.py)...")
             rc = _stream_subprocess([
                 sys.executable, str(REPO_ROOT / "RebuildFaceDB.py"), str(system_fr), "--skip-calibration",
@@ -1850,7 +1900,7 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool, min
             if rc != 0:
                 raise RuntimeError(f"RebuildFaceDB.py failed with exit code {rc}")
         else:
-            _export_log("Step 2/3: system face database is empty — skipping rebuild.")
+            _export_log("Step 2/3: team face database is empty — skipping rebuild.")
 
         _export_log(f"Step 3/3: exporting {len(kept)} kept photo(s) + players.csv to {dest_dir}...")
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -2205,7 +2255,7 @@ def api_get_import_state() -> dict:
         "sensitivityMode": state.get("sensitivityMode", "medium"),
         "sensitivityCustomValue": state.get("sensitivityCustomValue", 0.50),
         "recognizeFaces": state.get("recognizeFaces", True),
-        "selectedTeamId": state.get("selectedTeamId", ""),
+        "selectedTeamId": _canonical_team_id(state.get("selectedTeamId", "")),
     }
 
 

@@ -120,7 +120,7 @@ python 1_prep_review.py <image_or_directory> [options]
 | `--noteam` | off | Disable jersey filtering (score every detected person) |
 | `--output <dir>` | `albums/<timestamp>-<input>/` | Root output directory |
 | `--skip-facereco` | off | Don't run face-recognition clustering |
-| `--face-db <dir>` | none | Match clusters against an existing face DB |
+| `--face-db <dir>` | none | Match clusters against an existing face DB root (uses its `<team id>/` folder) or a team folder directly |
 | `--face-db-match-threshold <n>` | `0.72` | Cosine similarity required between a face and its closest-matching person prototype |
 | `--face-db-match-margin <n>` | `0.05` | Minimum similarity gap required over the best-matching different person before accepting a match |
 | `--face-db-prototype-threshold <n>` | `0.62` | Cosine similarity used to split each DB person's own photos into visual sub-clusters |
@@ -244,6 +244,23 @@ Each `face.json` stores editable person metadata (`name`, `playernum`) and a `fa
 - `algo/dlib_provider.py` — dlib implementation
 - `algo/facenet_provider.py` — FaceNet (facenet-pytorch / VGGFace2) implementation
 - `algo/face_crop_embed.py` — shared crop → detect → (optional align) → embed pipeline used by both prediction and DB rebuild
+
+### Per-team face DB
+
+The cross-album face DB at `./.FaceReco/` has one folder per team, named by the team's UUID (`team.json` → `id`; the team's display name can change freely):
+
+```
+.FaceReco/<team id>/<Player>/{face.json, Face/, Negative/}
+```
+
+A player on two teams is stored as two independent people, one per team folder. Matching during import, the Faces-page autocomplete, and the export's face-DB sync only touch the album's own team folder. Any name tagged on the Faces page (coaches, guests, …) is added to that team's folder at export, whether or not they're on the roster.
+
+To move an old flat `.FaceReco/<Player>/` DB into this layout (copies each entry into every team whose roster has that name; names on no roster are left in place; a backup is made first):
+
+```
+python MigrateFaceDB.py --dry-run
+python MigrateFaceDB.py
+```
 
 ### Rebuilding (and calibrating) a face DB
 

@@ -220,7 +220,9 @@ def _load_registered_team(team_id: str) -> dict | None:
     if not isinstance(teams, list):
         return None
     for team in teams:
-        if isinstance(team, dict) and team.get("id") == team_id:
+        if not isinstance(team, dict):
+            continue
+        if team.get("id") == team_id or team_id in (team.get("legacyIds") or []):
             return team
     return None
 
@@ -253,11 +255,17 @@ def _resolve_face_db_dir(
     explicit_path: str | None,
     output_dir: Path,
     input_path: Path,
+    team_id: str,
 ) -> Path | None:
-    """Resolve face DB path using ordered fallback search.
+    """Resolve the face DB folder for *team_id* using ordered fallback search.
+
+    A face-DB root (``.FaceReco``) holds one sub-folder per team id; the
+    returned path is that team's folder, so other teams' people are never
+    match candidates. A root without a folder for this team is skipped.
 
     Order:
-      1) explicit --face-db path (authoritative)
+      1) explicit --face-db path (authoritative; its ``<team_id>`` sub-folder
+         if present, otherwise the path itself is used as the DB)
       2) current working directory (.FaceReco/.facereco/.Facereco)
       3) walk upward from output directory
       4) walk upward from source directory (or parent for single file input)
@@ -265,25 +273,33 @@ def _resolve_face_db_dir(
     if explicit_path:
         candidate = Path(explicit_path).resolve()
         if candidate.is_dir():
+            if (candidate / team_id).is_dir():
+                candidate = candidate / team_id
             log.info("Face DB resolved (explicit): %s", candidate)
             return candidate
         log.error("--face-db directory not found: %s", candidate)
         return None
 
-    found = _find_face_db_in_directory(Path.cwd())
+    def _team_folder(directory: Path) -> Path | None:
+        root = _find_face_db_in_directory(directory)
+        if root is not None and (root / team_id).is_dir():
+            return root / team_id
+        return None
+
+    found = _team_folder(Path.cwd())
     if found is not None:
         log.info("Face DB resolved (current directory): %s", found)
         return found
 
     for directory in _walk_to_root(output_dir):
-        found = _find_face_db_in_directory(directory)
+        found = _team_folder(directory)
         if found is not None:
             log.info("Face DB resolved (target ancestry): %s", found)
             return found
 
     source_start = input_path if input_path.is_dir() else input_path.parent
     for directory in _walk_to_root(source_start):
-        found = _find_face_db_in_directory(directory)
+        found = _team_folder(directory)
         if found is not None:
             log.info("Face DB resolved (source ancestry): %s", found)
             return found
@@ -783,12 +799,10 @@ def main() -> None:
     registered_team = _load_registered_team(team_id)
     if registered_team is None:
         parser.error(f"--team-id {team_id!r} does not match any team registered in team.json")
-    # Roster names restrict face-DB matching to this team (see FaceRecoStage below).
-    roster_names: frozenset[str] | None = frozenset(
-        p.get("name", "").strip()
-        for p in (registered_team.get("players") or [])
-        if isinstance(p, dict) and p.get("name", "").strip()
-    ) or None
+    # Face-DB matching is scoped by team folder (see _resolve_face_db_dir), so
+    # people tagged by hand who aren't on the roster (coaches, guests) match
+    # too. Use the team's current id (an older album may store a pre-UUID one).
+    team_id = registered_team.get("id") or team_id
 
     # Parse the semicolon-separated jersey colour list, normalise to title-case.
     # Colours prefixed with '+' are forced-include: they are always added to the
@@ -840,13 +854,12 @@ def main() -> None:
         facereco_input_path = input_path or Path(
             (existing_info.src_dir if existing_info else "") or output_dir
         )
-        face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, facereco_input_path)
+        face_db_dir = _resolve_face_db_dir(args.face_db, output_dir, facereco_input_path, team_id)
         if face_db_dir is None:
-            log.warning("Re-running face detection without a face DB (no dictionary found) — clusters will be unnamed.")
+            log.warning("Re-running face detection without a face DB (none for this team) — clusters will be unnamed.")
         FaceRecoStage(
             output_dir,
             face_db_dir=face_db_dir,
-            face_db_allowed_names=roster_names,
             face_db_match_threshold=args.face_db_match_threshold,
             face_db_match_margin=args.face_db_match_margin,
             face_db_prototype_threshold=args.face_db_prototype_threshold,
@@ -947,7 +960,7 @@ def main() -> None:
     # input_path is allowed to be None in that mode. Resolved against
     # working_dir (not output_dir) so a temp staging album -- nested under
     # the target -- still finds the target's own .FaceReco via ancestry walk.
-    face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, working_dir, input_path)
+    face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, working_dir, input_path, team_id)
 
     # Run image analysis first (on its own) so each newly-discovered frame
     # can be assigned its disambiguated bookkeeping key -- see
@@ -1046,22 +1059,20 @@ def main() -> None:
 
     if frames and not args.skip_facereco:
         if face_db_dir is None:
-            log.info("Face recognition skipped: no face DB found.")
-        else:
-            FaceRecoStage(
-                working_dir,
-                face_db_dir=face_db_dir,
-                face_db_allowed_names=roster_names,
-                face_db_match_threshold=args.face_db_match_threshold,
-                face_db_match_margin=args.face_db_match_margin,
-                face_db_prototype_threshold=args.face_db_prototype_threshold,
-                use_face_db_calibration=not args.disable_face_db_calibration,
-                min_face_crop_px=args.min_face_crop_px,
-                debug_align=args.debug_align,
-                cpu_only=args.cpu_only,
-                engine=args.engine,
-                sensitivity_threshold=sensitivity_threshold,
-            ).process(frames, app_config)
+            log.info("No face DB for this team yet — clustering faces without name matching.")
+        FaceRecoStage(
+            working_dir,
+            face_db_dir=face_db_dir,
+            face_db_match_threshold=args.face_db_match_threshold,
+            face_db_match_margin=args.face_db_match_margin,
+            face_db_prototype_threshold=args.face_db_prototype_threshold,
+            use_face_db_calibration=not args.disable_face_db_calibration,
+            min_face_crop_px=args.min_face_crop_px,
+            debug_align=args.debug_align,
+            cpu_only=args.cpu_only,
+            engine=args.engine,
+            sensitivity_threshold=sensitivity_threshold,
+        ).process(frames, app_config)
 
     openai_api_key = args.openaikey or os.environ.get("OPENAI_API_KEY")
     if frames and not args.skip_llm_cull and openai_api_key:
