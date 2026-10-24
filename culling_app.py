@@ -51,9 +51,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
-from algo.album import EDITEDIMAGES_SUBDIR, album_for
+from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, album_for
 from algo.album_info import CATEGORIES as CULLING_CATEGORIES
-from algo.album_info import AlbumInfo
+from algo.album_info import INFO_JSON_NAME, AlbumInfo
 from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, render_player_videos, summarize_bursts
 
 try:
@@ -1023,7 +1023,7 @@ def _album_has_facereco(path: Path) -> bool:
 
 
 def _is_album_complete(path: Path) -> bool:
-    return album_for(path).is_complete
+    return _album_data(path)[0]
 
 
 # How many random sharp-image filenames to hand to the client per album for
@@ -1056,7 +1056,12 @@ def _format_created(timestamp: str) -> str:
         return timestamp
 
 
-def _read_album_summary(path: Path) -> dict:
+def _build_album_summary(path: Path) -> dict:
+    """Computes the /select-album summary from scratch — parses album.json
+    (via `album_for`) and info.json. Expensive on a large album (album.json
+    routinely reaches tens of MB, see algo/album.py's docstring); callers
+    should go through `_read_album_summary`'s persisted cache instead of
+    calling this directly."""
     summary: dict = {
         "name": path.name,  # also serves as the album's id — never the absolute path
         "displayName": _album_display_name(path.name),  # human-friendly, for UI display only
@@ -1090,13 +1095,95 @@ def _read_album_summary(path: Path) -> dict:
     return summary
 
 
+# Persisted per-album cache for `_read_album_summary`/`_is_album_complete` —
+# select-album lists every album directory on every visit, and computing a
+# summary means parsing the WHOLE album.json (tens of MB, see
+# algo/album.py's docstring) just to read a handful of counts/previews. The
+# in-process `album_for()` LRU (capped at 4 albums) doesn't help once there
+# are more albums than that, so this cache is a small JSON file written next
+# to album.json/info.json, invalidated by THEIR mtime+size (same stat-based
+# freshness idiom as `Album.refresh()`) rather than by any TTL — any writer
+# (a 1_prep_review.py subprocess, regrade, LLM culling, ...) already changes
+# album.json's mtime/size on save, so this needs no cache-busting of its own.
+# A CODE change to _build_album_summary's output shape is a separate concern
+# (album.json/info.json wouldn't change) — bump _ALBUM_SUMMARY_CACHE_VERSION
+# whenever that shape changes so stale on-disk caches are rejected instead of
+# served with missing/renamed fields.
+_ALBUM_SUMMARY_CACHE_NAME = ".summary_cache.json"
+_ALBUM_SUMMARY_CACHE_VERSION = 1
+
+
+def _album_summary_cache_path(path: Path) -> Path:
+    return path / _ALBUM_SUMMARY_CACHE_NAME
+
+
+def _album_file_stamp(path: Path, name: str) -> Optional[list]:
+    try:
+        st = (path / name).stat()
+    except OSError:
+        return None
+    return [st.st_mtime, st.st_size]
+
+
+def _read_album_summary_cache(path: Path) -> Optional[dict]:
+    """The cached ``{"complete":, "summary":}`` dict, or None on a miss —
+    missing/corrupt cache file, or album.json/info.json changed since it was
+    written."""
+    try:
+        with open(_album_summary_cache_path(path), encoding="utf-8") as fh:
+            cached = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if cached.get("version") != _ALBUM_SUMMARY_CACHE_VERSION:
+        return None
+    if cached.get("albumStamp") != _album_file_stamp(path, ALBUM_JSON_NAME):
+        return None
+    if cached.get("infoStamp") != _album_file_stamp(path, INFO_JSON_NAME):
+        return None
+    return cached
+
+
+def _write_album_summary_cache(path: Path, complete: bool, summary: dict) -> None:
+    cache = {
+        "version": _ALBUM_SUMMARY_CACHE_VERSION,
+        "albumStamp": _album_file_stamp(path, ALBUM_JSON_NAME),
+        "infoStamp": _album_file_stamp(path, INFO_JSON_NAME),
+        "complete": complete,
+        "summary": summary,
+    }
+    try:
+        with open(_album_summary_cache_path(path), "w", encoding="utf-8") as fh:
+            json.dump(cache, fh)
+    except OSError:
+        pass  # best-effort; a failed write just means the next call recomputes
+
+
+def _album_data(path: Path) -> tuple:
+    """``(is_complete, summary)`` for *path*, served from the persisted
+    cache above when it's still fresh."""
+    cached = _read_album_summary_cache(path)
+    if cached is not None:
+        return cached["complete"], cached["summary"]
+    complete = album_for(path).is_complete
+    summary = _build_album_summary(path)
+    if _album_file_stamp(path, ALBUM_JSON_NAME) is not None:
+        _write_album_summary_cache(path, complete, summary)  # skip stray dirs with no album.json
+    return complete, summary
+
+
+def _read_album_summary(path: Path) -> dict:
+    return _album_data(path)[1]
+
+
 def _list_albums() -> list[dict]:
     if not OUTPUT_DIR.is_dir():
         return []
     albums = [
-        _read_album_summary(child)
+        summary
         for child in OUTPUT_DIR.iterdir()
-        if child.is_dir() and _is_album_complete(child)
+        if child.is_dir()
+        for complete, summary in [_album_data(child)]
+        if complete
     ]
     albums.sort(key=lambda a: a["name"], reverse=True)
     return albums
