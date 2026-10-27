@@ -173,6 +173,7 @@ class ExportRequest(BaseModel):
 
 
 class BurstVideoRenderRequest(BaseModel):
+    destination: str
     minFrames: int = DEFAULT_MIN_FRAMES
     mode: str = "fps"      # "fps" | "timestamp"
     fps: float = DEFAULT_FPS
@@ -251,6 +252,52 @@ class ProcessingState:
         self.return_code: Optional[int] = None
         self.process: Optional[subprocess.Popen] = None
 
+    def claim(self) -> bool:
+        """Atomically claim the single shared processing slot (only one of
+        start-processing/import-more/rerun-facereco/deep-regrade/jersey-
+        colour LLM re-run/AI edit can run at a time); returns False if
+        something is already running (callers turn that into an HTTP 409)."""
+        with self.lock:
+            if self.running:
+                return False
+            self.running = True
+            self.return_code = None
+            self.lines = []
+            return True
+
+    def run_subprocess(self, cmd: list[str], cwd: Optional[Path] = None) -> int:
+        """Runs *cmd*, streaming its combined stdout/stderr into self.lines
+        (polled by /api/processing-output) and tracking self.process —
+        shared by every _run_* function below that reuses this job slot.
+        Returns the exit code; leaves self.running untouched so callers that
+        need to act on the result before the browser sees "done" (e.g. AI
+        edit publishing its pending-edit state) can do so first."""
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd or REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+        )
+        with self.lock:
+            self.process = proc
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            with self.lock:
+                self.lines.append(line.rstrip("\n"))
+        proc.wait()
+        with self.lock:
+            self.return_code = proc.returncode
+            self.process = None
+        return proc.returncode
+
+    def mark_stopped(self) -> None:
+        with self.lock:
+            self.running = False
+
 
 processing_state = ProcessingState()
 
@@ -325,35 +372,14 @@ ai_edit_state = AiEditState()
 
 
 # --------------------------------------------------------------------------- #
-# Export (page 5 — Album Tools) — copy "keep" images and merge tagged-player faces
-# into a .FaceReco database at a destination folder, run in a background
-# thread with the same buffered-lines-for-polling pattern as ProcessingState.
+# BackgroundJobState — shared bookkeeping for a background job that writes
+# log lines into a buffer the browser polls via a `/status?since=N` endpoint
+# (export, burst-video, face-tagging CSV, per-player videos below). Each of
+# these used to hand-roll the same lock/running/done/error/lines/result
+# fields and the same claim-or-409/status-dict boilerplate; subclasses now
+# only add whatever extra fields their feature needs.
 # --------------------------------------------------------------------------- #
-class ExportState:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.reset()
-
-    def reset(self) -> None:
-        self.running = False
-        self.done = False
-        self.error: Optional[str] = None
-        self.lines: list[str] = []
-        self.total_images = 0
-        self.copied_images = 0
-        self.total_players = 0
-        self.processed_players = 0
-        self.dest_dir: Optional[str] = None
-
-
-export_state = ExportState()
-
-
-# --------------------------------------------------------------------------- #
-# Burst → MP4 (experimental, page 5 — Album Tools) — see algo/burst_video.py.
-# Same buffered-lines-for-polling background-job pattern as ExportState.
-# --------------------------------------------------------------------------- #
-class BurstVideoState:
+class BackgroundJobState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.reset()
@@ -364,6 +390,78 @@ class BurstVideoState:
         self.error: Optional[str] = None
         self.lines: list[str] = []
         self.result: Optional[dict] = None
+
+    def claim(self) -> bool:
+        """Atomically start a fresh run, or return False if one is already
+        in flight (callers turn that into an HTTP 409)."""
+        with self.lock:
+            if self.running:
+                return False
+            self.reset()
+            self.running = True
+            return True
+
+    def log(self, msg: str) -> None:
+        with self.lock:
+            self.lines.append(msg)
+
+    def mark_stopped(self) -> None:
+        with self.lock:
+            self.running = False
+
+    def status(self, since: int) -> dict:
+        with self.lock:
+            new_lines = self.lines[since:]
+            return {
+                "lines": new_lines,
+                "next": since + len(new_lines),
+                "running": self.running,
+                "done": self.done,
+                "error": self.error,
+                "result": self.result,
+            }
+
+
+# --------------------------------------------------------------------------- #
+# Export (page 5 — Album Tools) — copy "keep" images and merge tagged-player faces
+# into a .FaceReco database at a destination folder, run in a background
+# thread with the same buffered-lines-for-polling pattern as ProcessingState.
+# --------------------------------------------------------------------------- #
+class ExportState(BackgroundJobState):
+    def reset(self) -> None:
+        super().reset()
+        self.total_images = 0
+        self.copied_images = 0
+        self.total_players = 0
+        self.processed_players = 0
+        self.dest_dir: Optional[str] = None
+
+    def status(self, since: int) -> dict:
+        payload = super().status(since)
+        with self.lock:
+            payload.update({
+                "totalImages": self.total_images,
+                "copiedImages": self.copied_images,
+                "totalPlayers": self.total_players,
+                "processedPlayers": self.processed_players,
+                "destDir": self.dest_dir,
+            })
+        return payload
+
+
+export_state = ExportState()
+
+
+# --------------------------------------------------------------------------- #
+# Burst → MP4 (experimental, page 5 — Album Tools) — see algo/burst_video.py.
+# Same buffered-lines-for-polling background-job pattern as ExportState; like
+# PlayerVideoState/FaceTaggingCsvState, writes to a user-chosen destination
+# folder (tracked here so "Open folder" knows where to point after a run).
+# --------------------------------------------------------------------------- #
+class BurstVideoState(BackgroundJobState):
+    def reset(self) -> None:
+        super().reset()
+        self.output_dir: Optional[str] = None
 
 
 burst_video_state = BurstVideoState()
@@ -374,34 +472,18 @@ burst_video_state = BurstVideoState()
 # Tools). Same buffered-lines-for-polling background-job pattern as
 # BurstVideoState — both write to a user-chosen destination folder.
 # --------------------------------------------------------------------------- #
-class FaceTaggingCsvState:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.reset()
-
+class FaceTaggingCsvState(BackgroundJobState):
     def reset(self) -> None:
-        self.running = False
-        self.done = False
-        self.error: Optional[str] = None
-        self.lines: list[str] = []
-        self.result: Optional[dict] = None
+        super().reset()
         self.output_dir: Optional[str] = None
 
 
 face_tagging_csv_state = FaceTaggingCsvState()
 
 
-class PlayerVideoState:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.reset()
-
+class PlayerVideoState(BackgroundJobState):
     def reset(self) -> None:
-        self.running = False
-        self.done = False
-        self.error: Optional[str] = None
-        self.lines: list[str] = []
-        self.result: Optional[dict] = None
+        super().reset()
         self.output_dir: Optional[str] = None
 
 
@@ -542,32 +624,11 @@ def _run_processing(path: str, album_name: str, sensitivity_mode: str, sensitivi
         cmd += ["--openaikey", team.openaiApiKey]
 
     log.info("Starting processing: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
+    returncode = processing_state.run_subprocess(cmd)
+    processing_state.mark_stopped()
+    log.info("Processing finished (exit code %s)", returncode)
 
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("Processing finished (exit code %s)", proc.returncode)
-
-    if proc.returncode == 0 and _is_album_complete(output_dir):
+    if returncode == 0 and _is_album_complete(output_dir):
         state = _load_state()
         state["currentAlbum"] = str(output_dir.resolve())
         _save_state(state)
@@ -607,30 +668,9 @@ def _run_import_more(path: str, album_dir: Path) -> None:
         cmd += ["--openaikey", team.openaiApiKey]
 
     log.info("Starting import-more: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("Import-more finished (exit code %s)", proc.returncode)
+    returncode = processing_state.run_subprocess(cmd)
+    processing_state.mark_stopped()
+    log.info("Import-more finished (exit code %s)", returncode)
 
 
 def _run_rerun_facereco(album_dir: Path) -> None:
@@ -648,30 +688,9 @@ def _run_rerun_facereco(album_dir: Path) -> None:
     ]
 
     log.info("Starting face-detection re-run: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("Face-detection re-run finished (exit code %s)", proc.returncode)
+    returncode = processing_state.run_subprocess(cmd)
+    processing_state.mark_stopped()
+    log.info("Face-detection re-run finished (exit code %s)", returncode)
 
 
 def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]:
@@ -762,26 +781,8 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Pat
     ]
 
     log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    if proc.returncode == 0 and pending_path.is_file():
+    returncode = processing_state.run_subprocess(cmd)
+    if returncode == 0 and pending_path.is_file():
         ai_edit_state.set_pending(
             album_dir=album_dir,
             key=key,
@@ -789,12 +790,8 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Pat
             pending_path=pending_path,
             final_path=final_path,
         )
-
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("AI edit finished for %s (exit code %s)", key, proc.returncode)
+    processing_state.mark_stopped()
+    log.info("AI edit finished for %s (exit code %s)", key, returncode)
 
 
 def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
@@ -813,30 +810,9 @@ def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
     ]
 
     log.info("Starting deep regrade: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("Deep regrade finished (exit code %s)", proc.returncode)
+    returncode = processing_state.run_subprocess(cmd)
+    processing_state.mark_stopped()
+    log.info("Deep regrade finished (exit code %s)", returncode)
 
 
 def _run_rerun_llm_culling(album_dir: Path) -> None:
@@ -853,30 +829,9 @@ def _run_rerun_llm_culling(album_dir: Path) -> None:
         cmd += ["--openaikey", team.openaiApiKey]
 
     log.info("Starting LLM re-cull: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-    )
-    with processing_state.lock:
-        processing_state.process = proc
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        with processing_state.lock:
-            processing_state.lines.append(line.rstrip("\n"))
-
-    proc.wait()
-    with processing_state.lock:
-        processing_state.running = False
-        processing_state.return_code = proc.returncode
-        processing_state.process = None
-    log.info("LLM re-cull finished (exit code %s)", proc.returncode)
+    returncode = processing_state.run_subprocess(cmd)
+    processing_state.mark_stopped()
+    log.info("LLM re-cull finished (exit code %s)", returncode)
 
 
 # --------------------------------------------------------------------------- #
@@ -1790,8 +1745,7 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
 #      deliverable.
 # --------------------------------------------------------------------------- #
 def _export_log(msg: str) -> None:
-    with export_state.lock:
-        export_state.lines.append(msg)
+    export_state.log(msg)
     log.info("[Export] %s", msg)
 
 
@@ -2034,18 +1988,16 @@ def _run_export(album_path: Path, dest_dir: Path, export_face_tagging: bool, min
         with export_state.lock:
             export_state.error = str(exc)
     finally:
-        with export_state.lock:
-            export_state.running = False
+        export_state.mark_stopped()
 
 
-def _run_burst_video(album_path: Path, min_frames: int, mode: str, fps: float) -> None:
-    def _on_line(line: str) -> None:
-        with burst_video_state.lock:
-            burst_video_state.lines.append(line)
-
+def _run_burst_video(album_path: Path, dest_dir: Path, min_frames: int, mode: str, fps: float) -> None:
     try:
-        result = render_album_bursts(album_path, min_frames=min_frames, mode=mode, fps=fps, on_line=_on_line)
+        result = render_album_bursts(
+            album_path, dest_dir, min_frames=min_frames, mode=mode, fps=fps, on_line=burst_video_state.log
+        )
         with burst_video_state.lock:
+            burst_video_state.output_dir = str(dest_dir)
             burst_video_state.result = result
             burst_video_state.done = True
     except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
@@ -2053,14 +2005,12 @@ def _run_burst_video(album_path: Path, min_frames: int, mode: str, fps: float) -
         with burst_video_state.lock:
             burst_video_state.error = str(exc)
     finally:
-        with burst_video_state.lock:
-            burst_video_state.running = False
+        burst_video_state.mark_stopped()
 
 
 def _run_face_tagging_csv_export(album_path: Path, dest_dir: Path) -> None:
     def _log_line(msg: str) -> None:
-        with face_tagging_csv_state.lock:
-            face_tagging_csv_state.lines.append(msg)
+        face_tagging_csv_state.log(msg)
         log.info("[FaceTaggingCSV] %s", msg)
 
     try:
@@ -2084,18 +2034,13 @@ def _run_face_tagging_csv_export(album_path: Path, dest_dir: Path) -> None:
         with face_tagging_csv_state.lock:
             face_tagging_csv_state.error = str(exc)
     finally:
-        with face_tagging_csv_state.lock:
-            face_tagging_csv_state.running = False
+        face_tagging_csv_state.mark_stopped()
 
 
 def _run_player_video(album_path: Path, dest_dir: Path, fps: float) -> None:
-    def _on_line(line: str) -> None:
-        with player_video_state.lock:
-            player_video_state.lines.append(line)
-
     try:
         player_frames = _collect_player_frame_paths(album_path)
-        result = render_player_videos(player_frames, dest_dir, fps=fps, on_line=_on_line)
+        result = render_player_videos(player_frames, dest_dir, fps=fps, on_line=player_video_state.log)
         with player_video_state.lock:
             player_video_state.output_dir = str(dest_dir)
             player_video_state.result = result
@@ -2105,8 +2050,7 @@ def _run_player_video(album_path: Path, dest_dir: Path, fps: float) -> None:
         with player_video_state.lock:
             player_video_state.error = str(exc)
     finally:
-        with player_video_state.lock:
-            player_video_state.running = False
+        player_video_state.mark_stopped()
 
 
 # --------------------------------------------------------------------------- #
@@ -2421,12 +2365,8 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
     if not path.is_dir():
         raise HTTPException(status_code=400, detail=f"Directory not found: {req.path}")
 
-    with processing_state.lock:
-        if processing_state.running:
-            raise HTTPException(status_code=409, detail="Processing is already running.")
-        processing_state.running = True
-        processing_state.return_code = None
-        processing_state.lines = []
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
 
     # Remember these choices for next time, same pattern as lastImportPath.
     state = _load_state()
@@ -2458,12 +2398,8 @@ def api_import_more(req: ImportMoreRequest) -> dict:
 
     album_dir = _current_album_path()
 
-    with processing_state.lock:
-        if processing_state.running:
-            raise HTTPException(status_code=409, detail="Processing is already running.")
-        processing_state.running = True
-        processing_state.return_code = None
-        processing_state.lines = []
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
 
     state = _load_state()
     state["lastImportPath"] = str(path.resolve())
@@ -2486,12 +2422,8 @@ def api_rerun_facereco() -> dict:
     /api/import-more — only one processing job can run at a time."""
     album_dir = _current_album_path()
 
-    with processing_state.lock:
-        if processing_state.running:
-            raise HTTPException(status_code=409, detail="Processing is already running.")
-        processing_state.running = True
-        processing_state.return_code = None
-        processing_state.lines = []
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
 
     thread = threading.Thread(
         target=_run_rerun_facereco,
@@ -2512,12 +2444,8 @@ def api_ai_edit(req: AiEditRequest) -> dict:
     album_dir = _current_album_path()
     source_path, pending_path, final_path = _resolve_ai_edit_paths(album_dir, req.file)
 
-    with processing_state.lock:
-        if processing_state.running:
-            raise HTTPException(status_code=409, detail="Processing is already running.")
-        processing_state.running = True
-        processing_state.return_code = None
-        processing_state.lines = []
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
 
     thread = threading.Thread(
         target=_run_ai_edit,
@@ -2726,12 +2654,8 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     threshold = _sensitivity_threshold(req.sensitivityMode, req.sensitivityCustomValue)
 
     if req.mode == "deep":
-        with processing_state.lock:
-            if processing_state.running:
-                raise HTTPException(status_code=409, detail="Processing is already running.")
-            processing_state.running = True
-            processing_state.return_code = None
-            processing_state.lines = []
+        if not processing_state.claim():
+            raise HTTPException(status_code=409, detail="Processing is already running.")
         threading.Thread(
             target=_run_deep_regrade,
             args=(album_path, _sensitivity_arg(req.sensitivityMode, req.sensitivityCustomValue)),
@@ -2821,12 +2745,7 @@ def api_set_jersey_color(req: JerseyColorRequest) -> dict:
 
     llm_started = False
     if req.rerunLlmCulling:
-        with processing_state.lock:
-            if not processing_state.running:
-                processing_state.running = True
-                processing_state.return_code = None
-                processing_state.lines = []
-                llm_started = True
+        llm_started = processing_state.claim()
         if llm_started:
             threading.Thread(target=_run_rerun_llm_culling, args=(album_path,), daemon=True).start()
 
@@ -2853,11 +2772,8 @@ def api_start_export(req: ExportRequest) -> dict:
     if dest_path.is_file():
         raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
 
-    with export_state.lock:
-        if export_state.running:
-            raise HTTPException(status_code=409, detail="Export is already running.")
-        export_state.reset()
-        export_state.running = True
+    if not export_state.claim():
+        raise HTTPException(status_code=409, detail="Export is already running.")
 
     min_stars = max(1, min(5, req.minStars))
     thread = threading.Thread(
@@ -2871,20 +2787,7 @@ def api_start_export(req: ExportRequest) -> dict:
 
 @app.get("/api/album-tools/export-status")
 def api_export_status(since: int = 0) -> dict:
-    with export_state.lock:
-        new_lines = export_state.lines[since:]
-        return {
-            "lines": new_lines,
-            "next": since + len(new_lines),
-            "running": export_state.running,
-            "done": export_state.done,
-            "error": export_state.error,
-            "totalImages": export_state.total_images,
-            "copiedImages": export_state.copied_images,
-            "totalPlayers": export_state.total_players,
-            "processedPlayers": export_state.processed_players,
-            "destDir": export_state.dest_dir,
-        }
+    return export_state.status(since)
 
 
 @app.post("/api/album-tools/face-tagging-csv/render")
@@ -2901,11 +2804,8 @@ def api_face_tagging_csv_render(req: FaceTaggingCsvRequest) -> dict:
     if dest_path.is_file():
         raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
 
-    with face_tagging_csv_state.lock:
-        if face_tagging_csv_state.running:
-            raise HTTPException(status_code=409, detail="A face-tagging CSV export is already running.")
-        face_tagging_csv_state.reset()
-        face_tagging_csv_state.running = True
+    if not face_tagging_csv_state.claim():
+        raise HTTPException(status_code=409, detail="A face-tagging CSV export is already running.")
 
     thread = threading.Thread(target=_run_face_tagging_csv_export, args=(album_path, dest_path), daemon=True)
     thread.start()
@@ -2914,16 +2814,7 @@ def api_face_tagging_csv_render(req: FaceTaggingCsvRequest) -> dict:
 
 @app.get("/api/album-tools/face-tagging-csv/status")
 def api_face_tagging_csv_status(since: int = 0) -> dict:
-    with face_tagging_csv_state.lock:
-        new_lines = face_tagging_csv_state.lines[since:]
-        return {
-            "lines": new_lines,
-            "next": since + len(new_lines),
-            "running": face_tagging_csv_state.running,
-            "done": face_tagging_csv_state.done,
-            "error": face_tagging_csv_state.error,
-            "result": face_tagging_csv_state.result,
-        }
+    return face_tagging_csv_state.status(since)
 
 
 @app.post("/api/album-tools/face-tagging-csv/open-folder")
@@ -2957,11 +2848,8 @@ def api_player_video_render(req: PlayerVideoRenderRequest) -> dict:
     if dest_path.is_file():
         raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
 
-    with player_video_state.lock:
-        if player_video_state.running:
-            raise HTTPException(status_code=409, detail="Player-video rendering is already running.")
-        player_video_state.reset()
-        player_video_state.running = True
+    if not player_video_state.claim():
+        raise HTTPException(status_code=409, detail="Player-video rendering is already running.")
 
     thread = threading.Thread(
         target=_run_player_video,
@@ -2974,16 +2862,7 @@ def api_player_video_render(req: PlayerVideoRenderRequest) -> dict:
 
 @app.get("/api/album-tools/player-video/status")
 def api_player_video_status(since: int = 0) -> dict:
-    with player_video_state.lock:
-        new_lines = player_video_state.lines[since:]
-        return {
-            "lines": new_lines,
-            "next": since + len(new_lines),
-            "running": player_video_state.running,
-            "done": player_video_state.done,
-            "error": player_video_state.error,
-            "result": player_video_state.result,
-        }
+    return player_video_state.status(since)
 
 
 @app.post("/api/album-tools/player-video/open-folder")
@@ -3014,21 +2893,46 @@ def api_burst_video_summary(minFrames: int = Query(DEFAULT_MIN_FRAMES)) -> dict:
     return summarize_bursts(album_path, min_frames=max(2, minFrames))
 
 
+@app.get("/api/album-tools/burst-video/settings")
+def api_burst_video_settings() -> dict:
+    """Last-used min-frames/fps/timing-mode render settings, persisted in
+    state.json (see api_burst_video_render below) so the Album Tools page
+    pre-fills them on load instead of always resetting to the hardcoded
+    defaults."""
+    state = _load_state()
+    return {
+        "minFrames": state.get("burstMinFrames", DEFAULT_MIN_FRAMES),
+        "fps": state.get("burstFps", DEFAULT_FPS),
+        "mode": state.get("burstTimingMode", "fps"),
+    }
+
+
 @app.post("/api/album-tools/burst-video/render")
 def api_burst_video_render(req: BurstVideoRenderRequest) -> dict:
     album_path = _current_album_path()
     if req.mode not in ("fps", "timestamp"):
         raise HTTPException(status_code=400, detail="mode must be 'fps' or 'timestamp'")
+    destination = req.destination.strip()
+    if not destination:
+        raise HTTPException(status_code=400, detail="Destination folder is required.")
+    dest_path = Path(destination)
+    if dest_path.is_file():
+        raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
 
-    with burst_video_state.lock:
-        if burst_video_state.running:
-            raise HTTPException(status_code=409, detail="Burst-video rendering is already running.")
-        burst_video_state.reset()
-        burst_video_state.running = True
+    min_frames = max(2, req.minFrames)
+    fps = max(0.1, req.fps)
+    state = _load_state()
+    state["burstMinFrames"] = min_frames
+    state["burstFps"] = fps
+    state["burstTimingMode"] = req.mode
+    _save_state(state)
+
+    if not burst_video_state.claim():
+        raise HTTPException(status_code=409, detail="Burst-video rendering is already running.")
 
     thread = threading.Thread(
         target=_run_burst_video,
-        args=(album_path, max(2, req.minFrames), req.mode, max(0.1, req.fps)),
+        args=(album_path, dest_path, min_frames, req.mode, fps),
         daemon=True,
     )
     thread.start()
@@ -3037,25 +2941,16 @@ def api_burst_video_render(req: BurstVideoRenderRequest) -> dict:
 
 @app.get("/api/album-tools/burst-video/status")
 def api_burst_video_status(since: int = 0) -> dict:
-    with burst_video_state.lock:
-        new_lines = burst_video_state.lines[since:]
-        return {
-            "lines": new_lines,
-            "next": since + len(new_lines),
-            "running": burst_video_state.running,
-            "done": burst_video_state.done,
-            "error": burst_video_state.error,
-            "result": burst_video_state.result,
-        }
+    return burst_video_state.status(since)
 
 
 @app.post("/api/album-tools/burst-video/open-folder")
 def api_burst_video_open_folder() -> dict:
-    album_path = _current_album_path()
-    bursts_dir = album_path / "bursts"
-    if not bursts_dir.is_dir():
-        raise HTTPException(status_code=400, detail="No bursts folder yet — render at least one burst first.")
-    _open_in_file_explorer(bursts_dir)
+    with burst_video_state.lock:
+        output_dir = burst_video_state.output_dir
+    if not output_dir or not Path(output_dir).is_dir():
+        raise HTTPException(status_code=400, detail="No output folder yet — render at least once first.")
+    _open_in_file_explorer(Path(output_dir))
     return {"ok": True}
 
 

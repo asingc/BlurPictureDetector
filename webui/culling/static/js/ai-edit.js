@@ -3,56 +3,42 @@
 // Shared "AI edit" action (autoedit.py) — triggered from both the Culling
 // page (next to the file-path box) and the Faces page (in the
 // original-image preview window, see viewport.js). Streams the script's
-// combined stdout/stderr into a non-closable jQuery UI modal, reusing the
-// same processing_state/`/api/processing-output` polling plumbing as
-// import-more/rerun-facereco/deep-regrade (see static/js/album-tools.js) — only
-// one such background job can run at a time. The dialog's DOM is built
-// once, lazily, so this file has zero footprint on pages that never use it.
+// combined stdout/stderr into a non-closable jQuery UI modal via LogDialog
+// (see common.js), reusing the same processing_state/`/api/processing-
+// output` polling plumbing as import-more/rerun-facereco/deep-regrade (see
+// static/js/album-tools.js) — only one such background job can run at a
+// time. The dialog's DOM is built once, lazily (LogDialog creates it on
+// first use since no #aiEditDialog markup exists on the page), so this
+// file has zero footprint on pages that never use it.
 //
 // On success the log modal gives way to a side-by-side before/after compare
 // window (Viewport.showCompareWindow) whose Accept/Reject buttons decide
 // whether the generated image is kept — see openCompare() below.
 const AiEdit = (function () {
-  let $dialog = null;
-  let pollTimer = null;
-  let pollSince = 0;
+  let job = null;
 
   function dialog() {
-    if ($dialog) return $dialog;
-    $dialog = $("<div>", { id: "aiEditDialog" }).append(
-      $("<textarea>", { id: "aiEditOutput", class: "output-box", rows: 16, readonly: true })
-    );
-    $("body").append($dialog);
-    $dialog.dialog({
-      autoOpen: false,
-      modal: true,
-      closeOnEscape: false,
-      draggable: false,
-      resizable: false,
-      width: 640,
-    });
-    return $dialog;
-  }
-
-  function appendLines(lines) {
-    if (!lines || !lines.length) return;
-    const box = document.getElementById("aiEditOutput");
-    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
-    box.value += (box.value ? "\n" : "") + lines.join("\n");
-    if (atBottom) box.scrollTop = box.scrollHeight;
+    if (!job) {
+      job = LogDialog.create({
+        dialogId: "aiEditDialog",
+        outputId: "aiEditOutput",
+        statusUrl: (since) => `/api/processing-output?since=${since}`,
+        pollIntervalMs: 1000,
+        label: "AI edit",
+      });
+    }
+    return job;
   }
 
   function finish(returnCode) {
-    const $d = dialog();
+    const j = dialog();
     const success = returnCode === 0;
     if (success) {
-      $d.dialog("close");
+      j.close();
       openCompare();
       return;
     }
-    $d.dialog("option", "title", `AI edit failed (exit code ${returnCode})`);
-    $d.dialog("option", "closeOnEscape", true);
-    $d.dialog("widget").find(".ui-dialog-titlebar-close").show();
+    j.setFinished(`AI edit failed (exit code ${returnCode})`);
   }
 
   // Shows the generated image next to what it was made from and waits for
@@ -89,52 +75,36 @@ const AiEdit = (function () {
   }
 
   // Reopens the log modal in a terminal (closable) state with `message`
-  // appended — used when the run ends without something to compare.
+  // appended — used when the run ends without something to compare. Goes
+  // straight to the "already finished" dialog chrome (skipping the usual
+  // non-closable-while-running state LogDialog.open() sets up), so this
+  // uses the raw jQuery UI dialog ($dialog, exposed by LogDialog) directly.
   function reopenLog(message, title) {
-    const $d = dialog();
-    appendLines([message]);
-    $d.dialog("option", "title", title);
-    $d.dialog("option", "closeOnEscape", true);
-    $d.dialog("open");
-    $d.dialog("widget").find(".ui-dialog-titlebar-close").show();
-  }
-
-  async function poll() {
-    let data;
-    try {
-      data = await apiGet(`/api/processing-output?since=${pollSince}`);
-    } catch (err) {
-      return; // transient — retry on the next tick
-    }
-    appendLines(data.lines);
-    pollSince = data.next;
-    if (!data.running) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-      finish(data.returnCode);
-    }
+    const j = dialog();
+    j.appendLines([message]);
+    j.$dialog.dialog("option", "title", title);
+    j.$dialog.dialog("option", "closeOnEscape", true);
+    j.$dialog.dialog("open");
+    j.$dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
   }
 
   // Launches autoedit.py against `key` (the Album's bookkeeping key / plain
   // filename — same identifier used by /api/original etc.).
   async function run(key) {
-    const $d = dialog();
-    $("#aiEditOutput").val("");
-    pollSince = 0;
-    $d.dialog("option", "title", "AI editing\u2026");
-    $d.dialog("option", "closeOnEscape", false);
-    $d.dialog("open");
-    $d.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+    const j = dialog();
+    j.reset();
+    j.open("AI editing\u2026");
     try {
       await apiPost("/api/edit/ai-edit", { file: key });
     } catch (err) {
-      appendLines([`Failed to start: ${err.message}`]);
+      j.appendLines([`Failed to start: ${err.message}`]);
       finish(1);
       return;
     }
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(poll, 1000);
-    poll();
+    j.startPolling((data) => {
+      if (data.running) return;
+      finish(data.returnCode);
+    });
   }
 
   return { run };

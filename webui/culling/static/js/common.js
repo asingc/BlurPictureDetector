@@ -104,6 +104,144 @@ $(function () {
 });
 
 // ------------------------------------------------------------------ //
+// LogDialog — the shared "launch a background job, stream its log into a
+// modal, react when it's done" UX used by almost every long-running action
+// in this app (initial import, import-more, re-run face detection, deep
+// regrade, jersey-colour LLM re-run, export, burst-video, face-tagging CSV,
+// per-player videos, AI edit, ...). This used to be hand-copied into every
+// page's own JS file (init*Dialog/open*Dialog/append*Lines/finish*Dialog/
+// poll*Status, ~9 nearly-identical copies) — LogDialog.create() gives one
+// implementation of the generic "dialog chrome + poll-into-textarea" parts;
+// each caller still owns its own start/completion logic (what to re-enable,
+// what message to show, whether to navigate away or open a compare window),
+// since that genuinely differs per feature.
+//
+//   const job = LogDialog.create({
+//     dialogId: "exportDialog",         // existing <div> (jQuery UI dialog target)
+//     outputId: "exportOutput",         // <textarea> inside it that the log is appended to
+//     statusUrl: (since) => `/api/album-tools/export-status?since=${since}`,
+//     pollIntervalMs: 500,              // optional, default 500
+//     dialogOptions: { width: 720 },    // optional, merged over the jQuery UI defaults
+//     label: "export",                 // optional — see job.open() below
+//   });
+//
+//   job.open("Exporting…");             // opens the (non-closable while running) dialog;
+//                                        // if `label` was given, immediately appends
+//                                        // "Starting export…" as the first log line —
+//                                        // real output can take a while to show up (the
+//                                        // launched script's own startup/library-import
+//                                        // time), so this gives instant feedback instead
+//                                        // of a dialog that just sits empty meanwhile.
+//   job.reset();                        // clears the output box + poll cursor
+//   job.startPolling((data) => {        // fires once per tick, incl. an immediate first
+//     if (data.running) return;         // check so the dialog doesn't sit empty for a
+//     job.setFinished("Export complete"); // whole poll interval before any text shows up
+//     ...react to data...
+//   });
+//
+// If `dialogId` isn't already a <div> on the page, one is created lazily
+// (with a single <textarea outputId>) the first time create() runs, so new
+// callers (like ai-edit.js) don't need to hand-author any dialog markup.
+// ------------------------------------------------------------------ //
+const LogDialog = (function () {
+  function ensureDialog(dialogId, outputId, dialogOptions) {
+    let $dialog = $("#" + dialogId);
+    if ($dialog.length === 0) {
+      $dialog = $("<div>", { id: dialogId }).append(
+        $("<textarea>", { id: outputId, class: "output-box", rows: 16, readonly: true })
+      );
+      $("body").append($dialog);
+    }
+    $dialog.dialog($.extend({
+      autoOpen: false,
+      modal: true,
+      closeOnEscape: false,
+      draggable: false,
+      resizable: false,
+      width: 640,
+    }, dialogOptions || {}));
+    return $dialog;
+  }
+
+  function create(opts) {
+    const outputId = opts.outputId;
+    const pollIntervalMs = opts.pollIntervalMs || 500;
+    const $dialog = ensureDialog(opts.dialogId, outputId, opts.dialogOptions);
+    let timer = null;
+    let since = 0;
+
+    function appendLines(lines) {
+      if (!lines || !lines.length) return;
+      const box = document.getElementById(outputId);
+      if (!box) return;
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+      box.value += (box.value ? "\n" : "") + lines.join("\n");
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    function open(title) {
+      if (title) $dialog.dialog("option", "title", title);
+      $dialog.dialog("option", "closeOnEscape", false);
+      $dialog.dialog("open");
+      // Non-closable while running: hide the titlebar's [x] button too.
+      $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+      if (opts.label) appendLines([`Starting ${opts.label}…`]);
+    }
+
+    function setFinished(title) {
+      if (title) $dialog.dialog("option", "title", title);
+      $dialog.dialog("option", "closeOnEscape", true);
+      $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+    }
+
+    function close() {
+      $dialog.dialog("close");
+    }
+
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+
+    function reset() {
+      stop();
+      since = 0;
+      const box = document.getElementById(outputId);
+      if (box) box.value = "";
+    }
+
+    // Polls opts.statusUrl(since) every pollIntervalMs, appending any new
+    // lines and invoking onData(data) with the raw response each time —
+    // the caller checks data.running/data.error/etc. to decide when (and
+    // how) to react. Fires an immediate check instead of waiting for the
+    // first interval tick, so the dialog doesn't sit empty that long.
+    // Stops itself as soon as the job is no longer running, so onData's
+    // "finished" branch fires exactly once instead of repeating forever
+    // (every caller relies on this single-fire behavior).
+    function startPolling(onData) {
+      stop();
+      async function tick() {
+        let data;
+        try {
+          data = await apiGet(opts.statusUrl(since));
+        } catch (err) {
+          return; // transient — try again next tick
+        }
+        appendLines(data.lines);
+        since = data.next;
+        if (!data.running) stop();
+        onData(data);
+      }
+      timer = setInterval(tick, pollIntervalMs);
+      tick();
+    }
+
+    return { $dialog, appendLines, open, setFinished, close, reset, startPolling, stop };
+  }
+
+  return { create };
+})();
+
+// ------------------------------------------------------------------ //
 // Publishes the topbar's real rendered height as --topbar-h so sticky
 // elements further down the page (e.g. the cluster page's toolbar) can
 // offset themselves below it without hardcoding a pixel guess.

@@ -147,8 +147,8 @@ def _unique_path(directory: Path, stem: str, suffix: str = ".mp4") -> Path:
     return candidate
 
 
-def _output_path_for_burst(bursts_dir: Path, burst: Burst) -> Path:
-    return _unique_path(bursts_dir, burst.frames[0].name_stem)
+def _output_path_for_burst(dest_dir: Path, burst: Burst) -> Path:
+    return _unique_path(dest_dir, burst.frames[0].name_stem)
 
 
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -253,6 +253,7 @@ def _render_burst(
 
 def render_album_bursts(
     album_path: Path,
+    dest_dir: Path,
     *,
     min_frames: int = DEFAULT_MIN_FRAMES,
     mode: str = "fps",
@@ -260,9 +261,11 @@ def render_album_bursts(
     on_line: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Render every burst in *album_path* with at least *min_frames* photos
-    to ``<album_path>/bursts/<first-frame-name>.mp4``."""
+    to *dest_dir*/<first-frame-name>.mp4 -- *dest_dir* is a user-chosen
+    destination folder (the per-player counterpart, render_player_videos,
+    takes the same shape of argument)."""
     bursts = [b for b in detect_bursts(album_path) if b.frame_count >= min_frames]
-    bursts_dir = album_path / "bursts"
+    dest_dir.mkdir(parents=True, exist_ok=True)
     rendered = skipped = 0
 
     _log(on_line, f"Found {len(bursts)} burst(s) with >= {min_frames} frame(s).")
@@ -272,7 +275,7 @@ def render_album_bursts(
     with tempfile.TemporaryDirectory(prefix="burst_video_") as tmp:
         tmp_root = Path(tmp)
         for n, burst in enumerate(bursts, 1):
-            out_path = _output_path_for_burst(bursts_dir, burst)
+            out_path = _output_path_for_burst(dest_dir, burst)
             _log(on_line, f"Rendering burst {n}/{len(bursts)} ({burst.frame_count} frames) -> {out_path.name}")
             try:
                 ok = _render_burst(burst, out_path, mode, fps, tmp_root, on_line)
@@ -283,7 +286,7 @@ def render_album_bursts(
             skipped += 0 if ok else 1
 
     _log(on_line, f"Done. Rendered {rendered} video(s), skipped {skipped}.")
-    return {"burstsFound": len(bursts), "rendered": rendered, "skipped": skipped, "outputDir": str(bursts_dir)}
+    return {"burstsFound": len(bursts), "rendered": rendered, "skipped": skipped, "outputDir": str(dest_dir)}
 
 
 def _render_frame_sequence(

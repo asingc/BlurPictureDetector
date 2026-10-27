@@ -293,7 +293,7 @@
   <p class="muted">
     Stitches each detected photo burst (consecutive shots within 1 second of
     each other, regardless of blur/sharp verdict) into its own MP4, saved to
-    <code>bursts/</code> inside this album. Uses ffmpeg if it's on PATH for
+    a destination folder of your choice. Uses ffmpeg if it's on PATH for
     best quality, otherwise falls back to a lower-quality built-in encoder.
   </p>
   <div class="row">
@@ -321,7 +321,7 @@
       </svg>
       <span>Open folder</span>
     </button>
-    <button id="renderBurstsBtn" class="btn btn-icon-text" title="Render all qualifying bursts to MP4">
+    <button id="renderBurstsBtn" class="btn btn-icon-text" title="Choose destination &amp; render all qualifying bursts">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polygon points="23 7 16 12 23 17 23 7"></polygon>
         <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>

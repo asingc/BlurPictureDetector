@@ -3,9 +3,9 @@
 // Add Album page — create a new album (source folder, blur sensitivity,
 // face recognition) and pick which team's settings to use for it.
 
-let pollTimer = null;
-let pollSince = 0;
-
+// Streams the import/processing run's log into a non-closable modal
+// (processingJob, created in the init block below) while a run is active;
+// becomes closable once it finishes.
 // True while a processing run is in flight — used to disable the whole
 // screen and to warn the user if they try to navigate away.
 let isProcessing = false;
@@ -191,79 +191,30 @@ function setImportUIEnabled(enabled) {
 }
 
 // ------------------------------------------------------------------ //
-// Processing log dialog — a non-closable jQuery UI modal while a run is
-// active (its dark overlay blocks every other UI element from being hit
-// by accident), becoming closable once the run finishes.
+// Processing log dialog (processingJob, created in the init block) — a
+// non-closable jQuery UI modal while a run is active (its dark overlay
+// blocks every other UI element from being hit by accident), becoming
+// closable once the run finishes.
 // ------------------------------------------------------------------ //
 let dismissTimer = null;
-
-function initProcessingDialog() {
-  $("#processingDialog").dialog({
-    autoOpen: false,
-    modal: true,
-    closeOnEscape: false,
-    draggable: false,
-    resizable: false,
-    width: 640,
-  });
-}
-
-function openProcessingDialog() {
-  const $dialog = $("#processingDialog");
-  $dialog.dialog("option", "title", "Processing…");
-  $dialog.dialog("option", "closeOnEscape", false);
-  $dialog.dialog("open");
-  // Non-closable while running: hide the titlebar's [x] button too.
-  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
-}
+let processingJob;
 
 function finishProcessingDialog(returnCode) {
-  const $dialog = $("#processingDialog");
   const success = returnCode === 0;
-  $dialog.dialog("option", "title", success ? "Processing complete" : `Processing failed (exit code ${returnCode})`);
-  $dialog.dialog("option", "closeOnEscape", true);
-  $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+  processingJob.setFinished(success ? "Processing complete" : `Processing failed (exit code ${returnCode})`);
 
   // (Re)bind the close handler for this run: navigate to Culling only on
   // success, whether the dialog is dismissed by the user or auto-closes.
-  $dialog.off("dialogclose.processing").on("dialogclose.processing", () => {
+  processingJob.$dialog.off("dialogclose.processing").on("dialogclose.processing", () => {
     if (dismissTimer) { clearTimeout(dismissTimer); dismissTimer = null; }
     if (success) window.location.href = "/culling";
   });
 
   if (success) {
     $("#importStatus").text("Processing complete. Continuing to Culling…");
-    dismissTimer = setTimeout(() => { $dialog.dialog("close"); }, 5000);
+    dismissTimer = setTimeout(() => { processingJob.close(); }, 5000);
   } else {
     $("#importStatus").text(`Processing exited with code ${returnCode}.`);
-  }
-}
-
-// ------------------------------------------------------------------ //
-// Processing output polling
-// ------------------------------------------------------------------ //
-function appendOutputLines(lines) {
-  if (!lines.length) return;
-  const box = document.getElementById("processingOutput");
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
-  box.value += (box.value ? "\n" : "") + lines.join("\n");
-  if (atBottom) box.scrollTop = box.scrollHeight;
-}
-
-async function pollProcessingOutput() {
-  let data;
-  try {
-    data = await apiGet(`/api/processing-output?since=${pollSince}`);
-  } catch (err) {
-    return; // transient — try again on the next tick
-  }
-  appendOutputLines(data.lines);
-  pollSince = data.next;
-  if (!data.running) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-    setImportUIEnabled(true);
-    finishProcessingDialog(data.returnCode);
   }
 }
 
@@ -301,9 +252,8 @@ $(function () {
     const noTeam = $("#ignoreJerseyColorInput").is(":checked");
     const teamColor = noTeam ? "" : selectedTeamColor;
     setImportUIEnabled(false);
-    $("#processingOutput").val("");
-    pollSince = 0;
-    openProcessingDialog();
+    processingJob.reset();
+    processingJob.open("Processing…");
     $("#importStatus").text("Processing…");
     try {
       await apiPost("/api/import-path", { path });
@@ -317,11 +267,15 @@ $(function () {
         teamColor,
         teamId: selectedTeamId,
       });
-      pollTimer = setInterval(pollProcessingOutput, 500);
+      processingJob.startPolling((data) => {
+        if (data.running) return;
+        setImportUIEnabled(true);
+        finishProcessingDialog(data.returnCode);
+      });
     } catch (err) {
       $("#importStatus").text("Failed: " + err.message);
       setImportUIEnabled(true);
-      $("#processingDialog").dialog("close");
+      processingJob.close();
     }
   });
 
@@ -334,7 +288,12 @@ $(function () {
   });
 
   initRecognizeFacesCheckbox();
-  initProcessingDialog();
+  processingJob = LogDialog.create({
+    dialogId: "processingDialog",
+    outputId: "processingOutput",
+    statusUrl: (since) => `/api/processing-output?since=${since}`,
+    label: "processing",
+  });
   (async () => {
     const preferredTeamId = await loadImportState().catch(() => "");
     await loadTeams(preferredTeamId).catch(() => {});
