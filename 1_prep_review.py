@@ -920,6 +920,11 @@ def main() -> None:
         "team_id": args.team_id,
         "autoadjust": args.autoadjust,
     }
+    # Persist the resolved pin/auto-detect choice (not just honour it for this
+    # run) so it survives into info.json's run_settings and is remembered by
+    # later "import more"/regrade runs and reflected back in the album-tools
+    # "Team Jersey Colour" picker.
+    run_settings_out["team_color_override"] = team_color_override
     working_album = None if args.regrade_only else Album.create(
         working_dir, team_id=team_id, run_settings=run_settings_out, import_status="in_progress",
     )

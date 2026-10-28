@@ -250,7 +250,34 @@ function syncTopbarHeight() {
   const el = document.getElementById("topbar");
   if (el) document.documentElement.style.setProperty("--topbar-h", el.offsetHeight + "px");
 }
+
+// ------------------------------------------------------------------ //
+// Reflects the currently-selected album's name in both the browser tab
+// title (e.g. "Game vs Panthers — Photo Culling") and the topbar heading
+// (e.g. "Photo Culling - Game vs Panthers"). Runs on every page since this
+// file is loaded by base.html site-wide, so both stay in sync with
+// whichever album is current without each page having to wire it up itself.
+// ------------------------------------------------------------------ //
+const BASE_TITLE = document.title;
+async function syncAlbumTitle() {
+  let name = null;
+  try {
+    const data = await apiGet("/api/current-album");
+    name = data.album && (data.album.displayName || data.album.name);
+  } catch (err) {
+    // Non-fatal — leave the default title/heading in place.
+  }
+  document.title = name ? `${name} — ${BASE_TITLE}` : BASE_TITLE;
+  const $titleAlbum = $("#titleAlbum");
+  $titleAlbum.text(name ? ` - ${name}` : "");
+  // Full un-truncated text as a native tooltip (CSS ellipsizes this span
+  // on narrow windows — see .title-album in style.css).
+  $titleAlbum.attr("title", name || "");
+  syncTopbarHeight();
+}
+
 $(function () {
   syncTopbarHeight();
   $(window).on("resize", syncTopbarHeight);
+  syncAlbumTitle();
 });

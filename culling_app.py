@@ -39,6 +39,7 @@ import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -1239,11 +1240,20 @@ _EXIF_TAG_DATETIME_ORIGINAL = 36867
 _EXIF_TAG_DATETIME_DIGITIZED = 36868
 
 
+@lru_cache(maxsize=None)
 def _image_timestamp(path: Path) -> float:
     """Best-effort capture time (as a Unix timestamp) for burst grouping:
     EXIF capture time first, falling back to min(file create time, file
     modified time) when EXIF is missing/unreadable (non-JPEG source, no
-    camera metadata, Pillow not installed, etc.)."""
+    camera metadata, Pillow not installed, etc.).
+
+    Memoized (per resolved source path, for the life of the server process):
+    this previously re-opened and re-parsed EXIF for every image in the
+    album on *every* /api/culling/summary and /api/culling/data call (two
+    full album scans per page load, repeated again on every star-filter/sort
+    change), which dominated the Culling page's load time on large albums.
+    Source photos are never modified in place after import, so the result
+    never goes stale for a given path."""
     if _PILImage is not None:
         try:
             with _PILImage.open(path) as img:
